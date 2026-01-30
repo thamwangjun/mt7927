@@ -300,6 +300,10 @@ static int test_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
     pci_set_master(pdev);
 
+    /* Disable ASPM L0s and L1 - these power states may block DMA operations */
+    pci_disable_link_state(pdev, PCIE_LINK_STATE_L0S | PCIE_LINK_STATE_L1);
+    dev_info(&pdev->dev, "ASPM L0s and L1 disabled\n");
+
     /* Safety check: verify we can read a known register */
     {
         u32 chip_id = readl(dev->regs + 0x0000);
