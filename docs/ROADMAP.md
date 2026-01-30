@@ -206,14 +206,9 @@ All initialization steps execute correctly, but the communication protocol is wr
 3. **DMA_DIDX never advances** → Because we're waiting in wrong place!
 4. **Timeout after 5 seconds** → MCU command never completes
 
-**The real blocker**: Mailbox protocol assumption, NOT hardware issue!
-
-### Invalidated Hypotheses
-
-1. ~~**L1 ASPM blocking DMA**~~ - Working driver has L1 enabled (same as ours)
-2. ~~**Ring assignment wrong**~~ - Rings 15/16 validated via MT6639
-3. ~~**DMA configuration incorrect**~~ - Working driver uses same config
-4. ~~**Missing initialization step**~~ - All init steps are correct
+**The real blockers**:
+1. Mailbox protocol assumption (ROM doesn't support it)
+2. Wrong WFDMA base address (0x2000 is MCU DMA, 0xd4000 is HOST DMA)
 
 ## Testing and Validation
 

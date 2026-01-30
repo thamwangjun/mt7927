@@ -604,11 +604,10 @@ sudo rmmod mt7927_fw_precheck
 - ⚠️ May affect chip operation
 - ⚠️ Uses real WFDMA location (BAR0+0x2000)
 
-**Key Findings:**
-- **CRITICAL:** Real WFDMA is at `BAR0 + 0x2000`, not BAR2
-- BAR2[0x208] = 0x00000000 (shadow/status only)
-- BAR0[0x2208] = 0x1010b870 (real config)
-- DMA enable must target BAR0+0x2208, not BAR2+0x208
+**Key Findings (OUTDATED):**
+- ~~Real WFDMA is at `BAR0 + 0x2000`~~ **WRONG** - This is MCU DMA, not HOST DMA
+- **CORRECT:** HOST DMA for firmware loading is at `BAR0 + 0xd4000`
+- This module was testing the wrong address space
 
 ---
 

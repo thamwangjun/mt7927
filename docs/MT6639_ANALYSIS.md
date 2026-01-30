@@ -193,17 +193,17 @@ This explains the Windows firmware analysis findings:
    - Verify BAR0 offset calculations match MT6639
    - Check for MT6639-specific register differences
 
-### What This Doesn't Change
+### What This Validates
 
-1. ~~**Current DMA Blocker**~~ **RESOLVED** (2026-01-31)
-   - ~~DIDX stuck at 0 issue still present~~
-   - ~~ASPM L1 hypothesis still primary suspect~~
-   - **Root cause found**: MT7927 ROM doesn't support mailbox protocol
-   - **Solution**: Use polling-based firmware loading (see ZOUYONGHAO_ANALYSIS.md)
+1. **DMA Blocker Resolved** (Phase 21)
+   - **Root causes found**:
+     - Wrong WFDMA base address (0x2000 is MCU DMA, 0xd4000 is HOST DMA)
+     - MT7927 ROM doesn't support mailbox protocol
+   - **Solution**: Correct address + polling-based firmware loading
 
 2. **Power Management**
    - LPCTL handshake sequence validated
-   - WFSYS reset procedure validated in Phase 5
+   - WFSYS reset procedure validated
    - MT6639 timing works correctly
 
 3. **Build Process**
@@ -211,40 +211,14 @@ This explains the Windows firmware analysis findings:
    - Test modules remain valid
    - Diagnostic tools work correctly
 
-## ~~Next Steps~~ Status Update (2026-01-31)
+## Status (Updated Phase 21)
 
-### ~~Immediate Actions~~ Completed
+- ✅ Documentation updated with MT6639 references
+- ✅ Ring 15/16 assignments confirmed via MT6639 vendor code
+- ✅ WFDMA base address corrected to 0xd4000
+- ✅ Firmware protocol identified (polling-based, no mailbox)
 
-1. ✅ **Documentation Updated**
-   - Changed references to "MT6639-based"
-   - CLAUDE.md updated with MT6639 reference
-   - MT6639 comparison added
-
-2. ✅ **Code Review Completed**
-   - MT6639 driver compared
-   - Ring 15/16 assignments confirmed
-   - Register offsets validated
-
-3. ~~**Test with ASPM L1 Disabled**~~ **HYPOTHESIS DISPROVEN**
-   - ASPM L1 tested: NOT the blocker
-   - Working zouyonghao driver has L1 enabled (same as ours)
-   - The real blocker was mailbox protocol, not ASPM
-
-### ~~Research Tasks~~ Completed/Superseded
-
-1. ~~**MT6639 ASPM Behavior**~~ **DISPROVEN as blocker**
-   - Zouyonghao working driver has L1 enabled
-   - ASPM L1 is not the DMA blocker
-
-2. ✅ **MT6639 DMA Initialization**
-   - MT6639 WFDMA setup reviewed
-   - DMA configuration is correct
-   - RST register handling validated
-
-3. ✅ **MT6639 Firmware Protocol**
-   - **ROOT CAUSE FOUND**: ROM doesn't support mailbox
-   - Solution: polling-based loading (no mailbox waits)
-   - See ZOUYONGHAO_ANALYSIS.md for implementation
+See **ZOUYONGHAO_ANALYSIS.md** for implementation details.
 
 ## References
 

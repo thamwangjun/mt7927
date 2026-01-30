@@ -64,17 +64,6 @@ Use polling-based firmware loading:
 
 See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** for complete details.
 
-## Invalidated Hypotheses
-
-The following hypotheses were investigated and **disproven**:
-
-| Hypothesis | Status | Evidence |
-|------------|--------|----------|
-| ~~ASPM L1 blocking DMA~~ | **DISPROVEN** | Working driver has L1 enabled |
-| ~~Ring 4/5 for MCU/FWDL~~ | **DISPROVEN** | MT6639 uses rings 15/16 |
-| ~~Need MT7927-specific firmware~~ | **DISPROVEN** | MT7925 firmware is correct |
-| ~~DMA hardware broken~~ | **DISPROVEN** | Works with polling protocol |
-
 ## Current Status
 
 ### Working ✅
