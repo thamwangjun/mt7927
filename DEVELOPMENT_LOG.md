@@ -2,9 +2,14 @@
 
 ## Executive Summary
 
-This document chronicles the development effort to create a Linux driver for the MediaTek MT7927 WiFi 7 chip. The key discovery was that MT7927 is architecturally similar to MT7925 (which has full Linux support), differing mainly in 320MHz channel width support.
+This document chronicles the development effort to create a Linux driver for the MediaTek MT7927 WiFi 7 chip.
 
-**Current Status**: Driver binds to hardware, DMA rings configure correctly, power management handshake works, but MCU commands timeout because DMA hardware doesn't process TX descriptors (DIDX never advances despite CIDX incrementing).
+**Key Discoveries**:
+1. MT7927 is an **MT6639 variant** (proven via MediaTek kernel modules), not MT7925
+2. MT7927 ROM bootloader does **NOT support mailbox protocol** - this was the root cause of all DMA "blocker" issues
+3. Reference zouyonghao driver has correct polling-based FW loader functions, but **wiring is broken** (firmware never called)
+
+**Current Status (Phase 18)**: Root cause fully understood. Polling-based firmware loading protocol required. Reference code analyzed; implementation path clear. Need to wire firmware loader into MCU init correctly.
 
 ---
 
@@ -1773,3 +1778,108 @@ This is analogous to waiting for an email reply from someone who only processes 
 
 **The fix is simple**: Stop waiting for responses that will never come, use polling instead.
 
+
+
+---
+
+## Phase 18: Zouyonghao Code Trace and Critical Gap Discovery (2026-01-31)
+
+### What We Did
+
+Performed a detailed line-by-line trace of the zouyonghao driver initialization sequence to understand the exact steps required for MT7927 initialization.
+
+### Complete Probe Sequence Identified
+
+Traced 13 phases of initialization:
+
+1. **PCI Setup** (pci.c:466-483) - Enable device, map BAR0, set DMA mask
+2. **Device Allocation** (pci.c:492-522) - Allocate mt76 device, set hif_ops
+3. **Custom Bus Ops** (pci.c:524-536) - Install L1/L2 address remapping
+4. **CBInfra Remap** (pci.c:538-559) - MT7927-specific PCIe remap registers
+5. **Power Control** (pci.c:564-576) - FW/DRV power handshake
+6. **WFSYS Reset** (pci.c:281-353) - GPIO, BT reset, WF reset (x2)
+7. **IRQ Setup** (pci.c:591-598) - Disable host IRQ, enable PCIe MAC INT
+8. **MCU Pre-Init** (pci_mcu.c:70-128) - Wait for MCU IDLE (0x1D1E)
+9. **PCIe MAC Config** (pci.c:607-613) - Interrupt routing
+10. **DMA Init** (pci.c:355-409) - Ring allocation and enable
+11. **Register Device** (pci.c:619) - Schedule async init_work
+12. **Async Init Work** (init.c:204-262) - Hardware init
+13. **MCU Init** (pci_mcu.c:131-237) - PCIE2AP remap, MSI config, WFDMA extensions
+
+### Critical Gap Discovered
+
+**The zouyonghao code has a critical bug: firmware is never loaded\!**
+
+In `mt7927e_mcu_init()` (pci_mcu.c:219-226):
+
+```c
+/* MT7927: Firmware was already loaded via custom polling loader during probe.
+ * Skip calling mt7925_run_firmware() which would try to reload via mailbox protocol. */
+dev_info(mdev->dev, "MT7927: Firmware already loaded via polling loader");
+set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+```
+
+**But firmware was NEVER loaded\!** The comment is misleading:
+- `mt7927_wfsys_reset()` - Just resets, no FW loading
+- `mt7927e_mcu_pre_init()` - Just waits for IDLE, no FW loading
+- `mt7925_dma_init()` - Just sets up rings, no FW loading
+- `mt7927e_mcu_init()` - Skips `mt7925_run_firmware()` entirely\!
+
+The correct functions exist in `mt7927_fw_load.c`:
+- `mt7927_load_patch()` - Polling-based patch loader
+- `mt7927_load_ram()` - Polling-based RAM loader
+
+And `mt792x_load_firmware()` in `mt792x_core.c` correctly detects MT7927 and would call them:
+```c
+if (is_mt7927(&dev->mt76)) {
+    ret = mt7927_load_patch(&dev->mt76, mt792x_patch_name(dev));
+    ret = mt7927_load_ram(&dev->mt76, mt792x_ram_name(dev));
+}
+```
+
+**But `mt7927e_mcu_init()` never calls `mt792x_load_firmware()`\!**
+
+### What This Means
+
+The zouyonghao code has the correct **components** but incorrect **wiring**:
+
+| Component | Status |
+|-----------|--------|
+| `mt7927_load_patch()` | ✅ Correctly implemented |
+| `mt7927_load_ram()` | ✅ Correctly implemented |
+| `mt792x_load_firmware()` MT7927 detection | ✅ Correctly implemented |
+| `mt7927e_mcu_init()` calling loader | ❌ **MISSING\!** |
+
+### Correct Implementation Required
+
+`mt7927e_mcu_init()` should call:
+
+```c
+// CORRECT: Call firmware loader directly
+err = mt792x_load_firmware(dev);  // This has MT7927 polling path\!
+if (err)
+    return err;
+
+// Then set MCU running (skip mailbox post-init)
+set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+```
+
+### Documentation Updated
+
+- Updated `docs/ZOUYONGHAO_ANALYSIS.md` with complete probe sequence trace and critical gap section
+- Updated `CLAUDE.md` Priority 2 reference to note the wiring issue
+
+### Key Insight
+
+The zouyonghao code is valuable as a **reference** for the correct polling protocol patterns, but cannot be used as-is because the firmware loading path is broken. Any implementation based on this code must ensure the firmware loader is actually called during MCU initialization.
+
+### Files Modified
+
+- `docs/ZOUYONGHAO_ANALYSIS.md` - Added detailed probe sequence and critical gap analysis
+- `CLAUDE.md` - Updated reference implementation notes
+
+### Next Steps
+
+1. Create a corrected test module that properly wires firmware loading
+2. Implement the complete polling-based sequence with correct call order
+3. Test firmware loading with proper initialization

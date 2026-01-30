@@ -486,21 +486,29 @@ MT7927 driver development uses three reference sources in priority order:
 
 **When to use**: Architecture, register definitions, initialization sequences, DMA configuration
 
-#### Priority 2: Zouyonghao MT7927 Driver (reference_zouyonghao_mt7927/) - **WORKING IMPLEMENTATION**
+#### Priority 2: Zouyonghao MT7927 Driver (reference_zouyonghao_mt7927/) - **REFERENCE IMPLEMENTATION**
 
-**Source**: Community working driver
+**Source**: Community driver with correct firmware loading functions
 - Repository: https://github.com/zouyonghao/mt7927 (git submodule)
-- Status: Successfully loads firmware and creates network interface
+- Status: Has correct polling-based FW loader, but **wiring is incomplete** (see below)
 
-**Why this is critical**:
-1. **Proven to work** - Firmware loading succeeds on MT7927 hardware
-2. **Root cause discovery** - Proves polling-based protocol works (no mailbox)
+**Why this is valuable**:
+1. **Correct polling protocol** - `mt7927_fw_load.c` shows NO mailbox waits
+2. **Root cause insight** - Comments explain why mailbox protocol fails
 3. **DMA validation** - Hardware works when correct protocol is used
 
-**Key files**:
-- `mt7927_fw_load.c` - Polling-based firmware loader (NO mailbox waits)
+**⚠️ CRITICAL GAP (discovered 2026-01-31)**:
+The zouyonghao code has correct firmware loading *functions* (`mt7927_load_patch`, `mt7927_load_ram`) but they are **never called**!
+- `mt7927e_mcu_init()` says "firmware already loaded" but skips `mt792x_load_firmware()`
+- The comment is misleading - no probe phase actually loads firmware
+- See `docs/ZOUYONGHAO_ANALYSIS.md` section "CRITICAL GAP IN ZOUYONGHAO CODE"
 
-**When to use**: Firmware loading protocol, polling delays, TX cleanup patterns
+**Key files**:
+- `mt7927_fw_load.c` - Polling-based firmware loader (correct patterns, use as reference)
+- `pci_mcu.c:mt7927e_mcu_init()` - **Missing call to firmware loader!**
+- `mt792x_core.c:mt792x_load_firmware()` - Has MT7927 detection, calls polling loader
+
+**When to use**: Firmware loading protocol patterns, polling delays, TX cleanup - but must fix wiring
 
 #### Priority 3: Linux Kernel MT7925 (drivers/net/wireless/mediatek/mt76/mt7925/) - **CONNAC3X PATTERNS**
 

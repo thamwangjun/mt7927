@@ -1,12 +1,16 @@
 # MT7927 WiFi 7 Linux Driver Development - Session Bootstrap
 
-## Critical Discovery
+## Critical Discoveries
 
-**MT7927 = MT7925 + 320MHz channels**. The MT7927 is architecturally identical to MT7925 (which has full Linux support since kernel 6.7). We can adapt the existing mt7925 driver rather than reverse engineering from scratch. MT7925 firmware files are compatible with MT7927.
+1. **MT7927 = MT6639 variant** (NOT MT7925 as initially assumed). MediaTek kernel modules prove this. MT7925 firmware is compatible (CONNAC3X shared firmware).
+
+2. **ROOT CAUSE FOUND (Phase 17)**: MT7927 ROM bootloader does **NOT support mailbox protocol**! DMA hardware works fine - we're using the wrong communication protocol.
+
+3. **WIRING GAP (Phase 18)**: Zouyonghao reference driver has correct polling-based FW loader functions, but they are **never called** - firmware loading is not wired into MCU init!
 
 ## Current Status
 
-**Status**: BLOCKED on DMA descriptor processing  
+**Status**: ROOT CAUSE UNDERSTOOD - Implementation needed
 **Last Updated**: January 2026
 
 ### What's Working ✅
@@ -14,24 +18,36 @@
 - Power management handshake completes (LPCTL: 0x04 → 0x00)
 - WiFi subsystem reset completes (INIT_DONE achieved)
 - DMA descriptor rings allocate and configure correctly
-- Ring base addresses verified (TX0, TX4, TX5 all correct)
+- Ring assignments validated (Ring 15: MCU, Ring 16: FWDL)
 - L0S power saving disabled
-- SWDEF_MODE set to normal
 - Firmware files load into kernel memory (1.4MB RAM code + patch)
 - Interrupts registered and enabled
+- **Root cause identified** - mailbox protocol not supported by ROM
 
-### Current Blocker 🚧
+### Next Step 🔧
 
-**The DMA hardware does not process TX descriptors:**
-- `TX Q5: CIDX=1 DIDX=0` — CPU writes descriptor (CIDX advances), but hardware never picks it up (DIDX stays 0)
-- First MCU command `PATCH_SEM_CONTROL (0x0010)` times out after 3 seconds
-- This prevents firmware activation
+**Implement polling-based firmware loading:**
 
-**The Catch-22 Situation:**
-- When `MT_WFDMA0_RST = 0x30` (reset bits SET): Ring registers are writable, but DMA doesn't process descriptors
-- When `MT_WFDMA0_RST = 0x00` (reset bits CLEAR): DMA could process, but ring configuration gets wiped immediately
+The zouyonghao driver has correct patterns but broken wiring. The fix requires:
 
-**Key Observation:** The reference MT7925 driver leaves RST=0x30 and DMA works. MT7927 behaves differently.
+```c
+// In mt7927e_mcu_init() - ADD this call (currently missing!):
+err = mt792x_load_firmware(dev);  // This calls mt7927_load_patch/ram
+if (err)
+    return err;
+
+// Then set MCU running (skip mailbox post-init):
+set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+```
+
+Key polling protocol patterns (from mt7927_fw_load.c):
+- `mt76_mcu_send_msg(dev, cmd, data, len, false)` - **false = no mailbox wait**
+- Force TX cleanup before AND after each chunk
+- 5-50ms delays between operations
+- Skip PATCH_SEM_CONTROL and FW_START commands
+- Manually set SW_INIT_DONE (0x7C000140 bit 4)
+
+See **docs/ZOUYONGHAO_ANALYSIS.md** for complete probe sequence and implementation details.
 
 ---
 

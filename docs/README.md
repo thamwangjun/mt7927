@@ -28,9 +28,10 @@ If you're new to this project, start here:
    - See ring assignment validation (rings 15/16)
 
 3. **Review Development History** → [../DEVELOPMENT_LOG.md](../DEVELOPMENT_LOG.md)
-   - Understand the journey and key discoveries (17 phases)
+   - Understand the journey and key discoveries (18 phases)
    - Phase 16: MT6639 discovery
    - Phase 17: Root cause found (mailbox protocol)
+   - Phase 18: Zouyonghao code trace, **critical wiring gap found**
 
 4. **Check the Roadmap** → [ROADMAP.md](ROADMAP.md)
    - See current status and implementation needs
@@ -71,12 +72,15 @@ Jump directly to:
 - Quick test approach (30 min)
 - Full solution approach (2-3 hours)
 - Evidence from zouyonghao working driver
+- **Complete probe sequence trace** (13 phases)
+- ⚠️ **CRITICAL GAP**: zouyonghao FW loader is never called!
 
 **When to Read:**
 - **IMMEDIATELY** - This explains everything!
 - Before implementing any fixes
 - When understanding why DMA appears stuck
 - When planning next development steps
+- When implementing firmware loader (must fix wiring!)
 
 ---
 
@@ -106,7 +110,7 @@ Jump directly to:
 - Current project status (root cause found!)
 - Complete project structure
 - Hardware architecture details
-- Development history (17 phases)
+- Development history (18 phases)
 - Implementation path forward
 - Working commands and troubleshooting
 
@@ -461,7 +465,7 @@ The driver successfully:
 **Next Step:**
 - 🔧 Implement polling-based firmware loader (validated by zouyonghao working driver)
 
-See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) for complete root cause analysis and [DEVELOPMENT_LOG.md](../DEVELOPMENT_LOG.md) Phase 17 for detailed status.
+See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) for complete root cause analysis and [DEVELOPMENT_LOG.md](../DEVELOPMENT_LOG.md) Phases 17-18 for detailed status.
 
 ### Key Discoveries
 
@@ -477,7 +481,7 @@ See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) for complete root cause ana
 mt7927-linux-driver/
 ├── README.md                    # Minimal quick start guide
 ├── AGENTS.md                    # Session bootstrap guide
-├── DEVELOPMENT_LOG.md           # Complete development history (17 phases)
+├── DEVELOPMENT_LOG.md           # Complete development history (18 phases)
 ├── CLAUDE.md                    # AI agent project instructions
 │
 ├── docs/                        # Complete documentation
@@ -550,9 +554,10 @@ The MT7927 driver development uses three primary reference sources:
    - Location: `connectivity/wlan/core/gen4m/chips/mt6639/`
 
 2. **Zouyonghao MT7927 Driver** (reference_zouyonghao_mt7927/)
-   - Community working implementation
+   - Community reference implementation with correct polling patterns
    - Proves polling-based firmware loading works
    - Source of root cause discovery
+   - ⚠️ **Wiring is incomplete** - FW loader never called (see Phase 18)
 
 3. **Linux Kernel MT7925 Driver**
    - CONNAC3X family reference
@@ -653,7 +658,7 @@ When adding new documentation:
 
 1. **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** - **ROOT CAUSE & SOLUTION** ⚠️ **READ FIRST!**
 2. **[MT6639_ANALYSIS.md](MT6639_ANALYSIS.md)** - Architecture proof (MT7927 = MT6639 variant)
-3. **[DEVELOPMENT_LOG.md](../DEVELOPMENT_LOG.md)** - Complete project history (Phase 17!)
+3. **[DEVELOPMENT_LOG.md](../DEVELOPMENT_LOG.md)** - Complete project history (Phase 18!)
 4. **[ROADMAP.md](ROADMAP.md)** - Current status and implementation plan
 5. **[CONTRIBUTING.md](CONTRIBUTING.md)** - How to contribute (implementation needed!)
 
