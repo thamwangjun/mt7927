@@ -2,8 +2,6 @@
 
 Linux kernel driver for MediaTek MT7927 WiFi 7 (802.11be) chipset.
 
-> **Status**: ROOT CAUSE FOUND! See [docs/ZOUYONGHAO_ANALYSIS.md](docs/ZOUYONGHAO_ANALYSIS.md) for complete analysis.
-
 ## Quick Start
 
 ### Prerequisites
