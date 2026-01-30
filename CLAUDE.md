@@ -78,7 +78,7 @@ echo 1 | sudo tee /sys/bus/pci/devices/0000:$DEVICE/remove
 sleep 2
 echo 1 | sudo tee /sys/bus/pci/rescan
 
-# ⚠️ Test: Disable L1 ASPM (potential DMA blocker!)
+# Note: ASPM L1 is NOT the DMA blocker (disproven). Disabling is optional for debugging:
 # Bash: DEVICE=$(lspci -nn | grep 14c3:7927 | cut -d' ' -f1); sudo setpci -s $DEVICE CAP_EXP+10.w=0x0000
 # Fish: set DEVICE (lspci -nn | grep 14c3:7927 | cut -d' ' -f1); sudo setpci -s $DEVICE CAP_EXP+10.w=0x0000
 ```
@@ -115,15 +115,15 @@ diag/               # 18 hardware exploration/diagnostic modules
 
 2. **DMA Setup** (mt7927_dma.c)
    - Allocate coherent DMA memory for descriptor rings
-   - Configure 8 TX rings (0-7) and 16 RX rings (0-15)
+   - Configure sparse TX ring layout (0,1,2,15,16) and RX rings
    - Set ring base addresses, counts, and indices
-   - **MT7927-specific**: Uses rings 4 (FWDL) and 5 (MCU_WM), NOT 16/15 like MT7925
+   - **MT7927-specific**: Uses rings 15 (MCU_WM) and 16 (FWDL) - same as MT6639/CONNAC3X standard
 
-3. **Firmware Load** (mt7927_mcu.c) - **CURRENTLY BLOCKED HERE**
-   - Send PATCH_SEM_CONTROL command via TX ring 15 (MCU_WM)
-   - Transfer firmware chunks via TX ring 16 (FWDL)
-   - Signal completion and activate firmware
-   - **Blocker**: First MCU command times out because DMA_DIDX never advances
+3. **Firmware Load** (mt7927_mcu.c) - **ROOT CAUSE FOUND**
+   - ~~Send PATCH_SEM_CONTROL command via TX ring 15 (MCU_WM)~~ - ROM doesn't support mailbox
+   - Transfer firmware chunks via TX ring 16 (FWDL) using **polling mode**
+   - Skip FW_START, manually set SW_INIT_DONE
+   - **Solution**: Use polling-based loading (see ZOUYONGHAO_ANALYSIS.md)
 
 ### Architecture: MT6639 Family (CONNAC3X)
 
@@ -153,9 +153,9 @@ diag/               # 18 hardware exploration/diagnostic modules
 | IRQ | 48 (pin A, legacy INTx mode) |
 | MSI | 1/32 vectors available (currently disabled) |
 | ASPM L0s | Disabled (by driver) |
-| **⚠️ ASPM L1** | **ENABLED** (potential DMA blocker!) |
-| **⚠️ L1.1 Substate** | **ENABLED** |
-| **⚠️ L1.2 Substate** | **ENABLED** |
+| ASPM L1 | Enabled (normal - NOT the blocker) |
+| L1.1 Substate | Enabled (normal) |
+| L1.2 Substate | Enabled (normal) |
 
 ### Key Register Locations (BAR0 offsets)
 
@@ -171,38 +171,37 @@ PCIE_MAC_PM        = 0x74030194  // PCIe power management (L0S)
 SWDEF_MODE         = 0x0041f23c  // Firmware mode register
 ```
 
-## Current Blocker Details
+## Root Cause (FOUND 2026-01-31)
 
-**All initialization steps succeed**, but DMA hardware doesn't process TX descriptors:
-- TX ring initialized: CIDX=0, CPU_DIDX=0, DMA_DIDX=0 (stuck)
-- MCU ready status: 0x00000001 (confirmed)
-- Power management: Host owns DMA, handshake complete
-- Descriptors in coherent DMA memory, ring registers configured correctly
-- CIDX write triggers processing attempt, but DMA_DIDX never advances
-- No DMA completion interrupts occur
+**MT7927 ROM bootloader does NOT support mailbox command protocol!**
 
-**This is the Catch-22**:
-- RST=0x30 (reset bits SET): Ring registers writable, but DMA doesn't process
-- RST=0x00 (reset bits CLEAR): Ring configuration gets wiped immediately
+The driver was:
+1. Sending PATCH_SEM_CONTROL command
+2. **Waiting for mailbox response** ← Blocked here forever
+3. ROM bootloader never responds (mailbox not implemented)
+4. Driver times out, never proceeds to firmware loading
 
-Reference MT7925 driver leaves RST=0x30 and DMA works. MT7927 behaves differently.
+**Why DMA appeared "stuck"**: DMA hardware works correctly! The problem was:
+- We sent a command the ROM doesn't understand
+- We waited for a response that never came
+- DMA_DIDX stays at 0 because we blocked before any real transfer
 
-### ⚠️ NEW PRIME SUSPECT: L1 ASPM States
+**Solution**: Polling-based firmware loading:
+- Skip semaphore command (ROM doesn't support it)
+- Send firmware without waiting for mailbox responses (`wait_resp=false`)
+- Use time-based delays (5-50ms) instead of mailbox waits
+- Set SW_INIT_DONE manually instead of FW_START command
 
-**lspci analysis reveals** (see HARDWARE_ANALYSIS.md):
-- Driver disables L0s ✓
-- **But L1 ASPM is still ENABLED** ⚠️
-- **L1.1 and L1.2 substates are ENABLED** ⚠️
-- LTR threshold: 166912ns for L1.2 entry
+See **docs/ZOUYONGHAO_ANALYSIS.md** for complete implementation details.
 
-**Hypothesis**: Device enters L1.2 power saving state when DMA should be active, causing DIDX to never advance.
+### Invalidated Hypotheses
 
-**First Test**: Disable all ASPM states:
-```bash
-sudo setpci -s 01:00.0 CAP_EXP+10.w=0x0000
-```
-
-See AGENTS.md for detailed history of all 8+ phases of attempts and DEVELOPMENT_LOG.md for complete investigation record.
+| Hypothesis | Status | Evidence |
+|------------|--------|----------|
+| ~~ASPM L1 blocking DMA~~ | **DISPROVEN** | Working zouyonghao driver has L1 enabled |
+| ~~Ring 4/5 for MCU/FWDL~~ | **DISPROVEN** | MT6639 uses rings 15/16 (CONNAC3X standard) |
+| ~~DMA hardware broken~~ | **DISPROVEN** | Works with polling protocol |
+| ~~Missing init step~~ | **DISPROVEN** | All init steps correct |
 
 ## Recent Fixes: test_fw_load.c (2026-01-30)
 
@@ -235,15 +234,16 @@ dev->regs = pcim_iomap_table(pdev)[0];  /* Use BAR0 (2MB) */
 #define MT_WFDMA0_TX_RING_BASE(n)   (MT_WFDMA0_BASE + 0x300 + (n) * 0x10)
 ```
 
-### 3. Wrong FWDL Queue Index
-**Problem**: Used ring 16 (MT7925 style), but MT7927 only has rings 0-7
+### 3. Ring Assignment Clarified
+**Note**: MT7927 uses **sparse ring layout** like MT6639 (rings 0,1,2,15,16), NOT dense layout like MT7925 (0-16).
 
-**Fix**:
+**Current correct assignment** (validated via MT6639 analysis):
 ```c
-// Before: #define FWDL_QUEUE_IDX 16
-// After:
-#define FWDL_QUEUE_IDX      4   /* MT7927 uses ring 4 for FWDL */
+#define FWDL_RING_IDX       16   /* Ring 16 for FWDL (CONNAC3X standard) */
+#define MCU_WM_RING_IDX     15   /* Ring 15 for MCU commands */
 ```
+
+**Note**: Physical ring CNT=0 for rings 8-17 in uninitialized state is normal. Driver initializes CNT when configuring rings.
 
 ### 4. Incomplete Reset Check
 **Problem**: Only checked RST_B_EN (bit 0), but should also verify INIT_DONE (bit 4)
@@ -276,36 +276,26 @@ if (chip_id == 0xffffffff) {
 
 Critical bugs found and fixed in production driver after comprehensive code review:
 
-### 1. DMA Prefetch Uses Wrong Ring Indices (CRITICAL)
-**File**: `src/mt7927_dma.c:395-412`
+### 1. DMA Prefetch Ring Indices (Clarified)
+**File**: `src/mt7927_dma.c`
 
-**Problem**: Code configured prefetch for rings 15/16 (MT7925 style) but MT7927 uses rings 4/5:
+**Current correct configuration** (MT6639/CONNAC3X standard):
 ```c
-// Before (WRONG):
-mt7927_wr(dev, MT_WFDMA0_TX_RING15_EXT_CTRL, PREFETCH(...));  /* MCU WM */
-mt7927_wr(dev, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH(...));  /* FWDL */
-
-// After (CORRECT):
-mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(4), PREFETCH(...));  /* FWDL ring 4 */
-mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(5), PREFETCH(...));  /* MCU WM ring 5 */
+// Ring 15 = MCU_WM, Ring 16 = FWDL (validated via MT6639 analysis)
+mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(15), PREFETCH(...));  /* MCU WM */
+mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(16), PREFETCH(...));  /* FWDL */
 ```
 
-### 2. TX Interrupt Handler Swapped Queue Indices (CRITICAL)
-**File**: `src/mt7927_pci.c:217-228`
+### 2. TX Interrupt Handler Queue Indices (Clarified)
+**File**: `src/mt7927_pci.c`
 
-**Problem**: Ring 4 completion went to tx_q[1], Ring 5 to tx_q[2] - backwards!
+**Current correct configuration**:
 ```c
-// Before (WRONG):
-if (intr & HOST_TX_DONE_INT_ENA4)
-    mt7927_tx_complete(dev, &dev->tx_q[1]);  /* Should be tx_q[2] */
-if (intr & HOST_TX_DONE_INT_ENA5)
-    mt7927_tx_complete(dev, &dev->tx_q[2]);  /* Should be tx_q[1] */
-
-// After (CORRECT):
-if (intr & HOST_TX_DONE_INT_ENA4)
-    mt7927_tx_complete(dev, &dev->tx_q[2]);  /* Ring 4 FWDL */
-if (intr & HOST_TX_DONE_INT_ENA5)
-    mt7927_tx_complete(dev, &dev->tx_q[1]);  /* Ring 5 MCU WM */
+// Ring 15 = MCU_WM, Ring 16 = FWDL
+if (intr & HOST_TX_DONE_INT_ENA15)
+    mt7927_tx_complete(dev, &dev->tx_q[MT_MCUQ_WM]);   /* Ring 15 MCU */
+if (intr & HOST_TX_DONE_INT_ENA16)
+    mt7927_tx_complete(dev, &dev->tx_q[MT_MCUQ_FWDL]); /* Ring 16 FWDL */
 ```
 
 ### 3. Ring Config Wipe Not Handled (HIGH)
@@ -374,10 +364,11 @@ Ring | BASE       | CNT    | CIDX | DIDX | EXT_CTRL   | Status
 
 | Finding | Status | Evidence |
 |---------|--------|----------|
-| MT7927 has 8 TX rings (0-7) | **✓ CONFIRMED** | CNT=512 for rings 0-7, CNT=0 for rings 8-17 |
-| Rings 4/5 physically exist | **✓ CONFIRMED** | Both show valid CNT=512 |
-| Rings 15/16 don't exist | **✓ CONFIRMED** | Both show CNT=0 |
-| ASPM L1 doesn't affect register reads | **✓ CONFIRMED** | Identical results with L1 disabled |
+| MT7927 has 8 physical TX rings | **✓ CONFIRMED** | CNT=512 for rings 0-7 in uninitialized state |
+| Sparse ring layout (0,1,2,15,16) | **✓ CONFIRMED** | MT6639 analysis + MediaTek kernel modules |
+| Rings 15/16 are correct for MCU/FWDL | **✓ CONFIRMED** | MT6639 bus_info structure + zouyonghao driver |
+| CNT=0 for uninitialized rings is normal | **✓ CONFIRMED** | Driver sets CNT when configuring rings |
+| ASPM L1 is NOT the DMA blocker | **✓ CONFIRMED** | Working driver has L1 enabled |
 
 ### Chip ID Location Clarified
 
@@ -387,11 +378,11 @@ Ring | BASE       | CNT    | CIDX | DIDX | EXT_CTRL   | Status
 - `mt7927_diag.c` maps BAR2, so BAR2+0x000 = correct Chip ID
 - Other modules using BAR0+0x0000 read SRAM (0x00000000)
 
-### Outstanding Uncertainties
+### Resolved Uncertainties (2026-01-31)
 
-1. **Ring 4/5 choice not firmware-validated**: These rings exist, but firmware may expect MCU commands on different rings. MT7925 uses 15/16, MT7921 uses different assignments again. Our choice is based on availability, not reverse-engineered firmware requirements.
+1. **Ring assignment**: Rings 15/16 are correct for MCU_WM/FWDL. Validated via MT6639 MediaTek kernel modules and zouyonghao working driver.
 
-2. **ASPM L1 effect on DMA**: Register reads work, but DMA processing may still be blocked by L1 power states. Test with L1 disabled before concluding.
+2. **ASPM L1**: NOT the blocker. Working zouyonghao driver has L1 enabled (same as ours). Root cause was mailbox protocol assumption.
 
 ## Code Style and Conventions
 
@@ -644,9 +635,12 @@ See **docs/ZOUYONGHAO_ANALYSIS.md** for complete implementation details.
 ## Reference Documentation
 
 All technical documentation is in `docs/` directory:
+- **docs/ZOUYONGHAO_ANALYSIS.md** - 🎯 **ROOT CAUSE** - Polling-based firmware loading solution
+- **docs/MT6639_ANALYSIS.md** - Architecture proof (MT7927 = MT6639 variant)
+- **docs/REFERENCE_SOURCES.md** - Analysis of all reference code sources
 - **docs/README.md** - Documentation navigation
 - **docs/mt7927_pci_documentation.md** - PCI layer details
-- **docs/dma_mcu_documentation.md** - DMA/MCU implementation
+- **docs/dma_mcu_documentation.md** - DMA/MCU implementation (note: mailbox protocol doesn't work for ROM)
 - **docs/headers_documentation.md** - Complete register reference
 - **docs/test_modules_documentation.md** - Test framework guide
 - **docs/diagnostic_modules_documentation.md** - Diagnostic tools

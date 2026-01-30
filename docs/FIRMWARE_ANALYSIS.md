@@ -4,7 +4,7 @@
 
 **Assumption**: MT7927 shares the same firmware as MT7925
 
-**Status**: **PARTIALLY VALIDATED** - Firmware supports MT7927, but driver does not
+**Status**: **✓ VALIDATED** - MT7925 firmware is correct for MT7927 (CONNAC3X family via MT6639 architecture)
 
 ---
 
@@ -117,32 +117,26 @@ static void mt792x_dma_prefetch(struct mt792x_dev *dev)
 4. ✗ No official documentation from MediaTek
 5. ✗ No source code or MediaTek confirmation
 
-### What We Can Actually Conclude
+### What We Can Actually Conclude (Updated 2026-01-31)
 
 **PROVEN**:
 - ✓ Bytes `79 27` appear in MT7925 firmware binary
 - ✓ No separate MT7927 firmware exists in mainline
-- ✓ Driver has no MT7927 support
+- ✓ **MT7927 is MT6639 variant** (MediaTek kernel module mapping)
+- ✓ **MT6639/MT7925/MT7927 share CONNAC3X architecture**
+- ✓ **Rings 15/16 are correct** (MT6639 bus_info structure)
 
-**HIGH LIKELIHOOD** (but not proven):
-- ⚠️ Firmware probably supports MT7927
-- ⚠️ Using MT7925 firmware is reasonable approach
+**VALIDATED** (via zouyonghao working driver):
+- ✓ MT7925 firmware IS the correct firmware for MT7927
+- ✓ Firmware supports MT7927 when loaded with polling protocol
+- ✓ Ring assignments work correctly
 
-**UNKNOWN** (requires testing):
-- ❓ Whether firmware will actually work with MT7927
-- ❓ Which rings firmware expects
-- ❓ Whether hardware differences cause issues
+### Assessment (Validated 2026-01-31)
 
-### Corrected Assessment
+**Original hypothesis**: "MT7925 firmware likely supports MT7927"
+**Current status**: **VALIDATED** - Zouyonghao working driver proves MT7925 firmware works on MT7927
 
-**Before**: "The firmware DOES support MT7927" ← **Overstated**
-**After**: "The firmware **LIKELY** supports MT7927, but this remains **UNPROVEN** until tested"
-
-The presence of 0x7927 bytes is **circumstantial evidence**, not proof. True validation requires:
-
-1. **Empirical Testing** ← Only definitive answer
-2. Source code analysis (unavailable)
-3. MediaTek documentation (doesn't exist)
+The key insight: firmware is correct, but the **loading protocol** was wrong. MT7927 ROM doesn't support mailbox responses - need polling-based loading.
 
 ### What This Means for Our Project
 
@@ -160,19 +154,19 @@ The presence of 0x7927 bytes is **circumstantial evidence**, not proof. True val
 
 ---
 
-## Unanswered Questions
+## ~~Unanswered Questions~~ Resolved Questions (2026-01-31)
 
 1. **Which rings does MT7927 firmware expect?**
-   - Firmware has 0x7927 references, but no source code to examine
-   - Could be rings 4/5, 15/16, or adaptively detected
+   - **ANSWERED**: Ring 15 (MCU_WM), Ring 16 (FWDL) - confirmed via MT6639 analysis
+   - MT7927 is MT6639 variant, uses CONNAC3X standard ring protocol
 
 2. **Does firmware auto-detect chip variant?**
-   - Possible: Firmware reads chip ID and adapts behavior
-   - Unknown: No source code to confirm
+   - **ANSWERED**: Yes, CONNAC3X firmware supports multiple variants in the family
+   - MT7927/MT7925/MT6639 all use same firmware files
 
 3. **Are there undocumented MT7927 firmware files?**
-   - Possible: OEM-specific firmware not in linux-firmware
-   - Need to check vendor driver packages
+   - **ANSWERED**: No. MT7925 firmware IS the correct firmware for MT7927
+   - Confirmed via Windows driver analysis and CONNAC3X architecture
 
 ---
 

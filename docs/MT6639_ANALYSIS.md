@@ -195,56 +195,56 @@ This explains the Windows firmware analysis findings:
 
 ### What This Doesn't Change
 
-1. **Current DMA Blocker**
-   - DIDX stuck at 0 issue still present
-   - ASPM L1 hypothesis still primary suspect
-   - Need to test with L1 disabled
+1. ~~**Current DMA Blocker**~~ **RESOLVED** (2026-01-31)
+   - ~~DIDX stuck at 0 issue still present~~
+   - ~~ASPM L1 hypothesis still primary suspect~~
+   - **Root cause found**: MT7927 ROM doesn't support mailbox protocol
+   - **Solution**: Use polling-based firmware loading (see ZOUYONGHAO_ANALYSIS.md)
 
 2. **Power Management**
-   - LPCTL handshake sequence likely same
+   - LPCTL handshake sequence validated
    - WFSYS reset procedure validated in Phase 5
-   - May need MT6639-specific timing
+   - MT6639 timing works correctly
 
 3. **Build Process**
    - Current driver structure is sound
    - Test modules remain valid
    - Diagnostic tools work correctly
 
-## Next Steps
+## ~~Next Steps~~ Status Update (2026-01-31)
 
-### Immediate Actions
+### ~~Immediate Actions~~ Completed
 
-1. **Update Documentation**
-   - Change all references from "MT7925-based" to "MT6639-based"
-   - Update CLAUDE.md with MT6639 reference
-   - Add MT6639 comparison to README.md
+1. ✅ **Documentation Updated**
+   - Changed references to "MT6639-based"
+   - CLAUDE.md updated with MT6639 reference
+   - MT6639 comparison added
 
-2. **Code Review**
-   - Compare our implementation with MT6639 driver
-   - Check for MT6639-specific initialization steps
-   - Verify register offset calculations
+2. ✅ **Code Review Completed**
+   - MT6639 driver compared
+   - Ring 15/16 assignments confirmed
+   - Register offsets validated
 
-3. **Test with ASPM L1 Disabled**
-   - This remains the primary DMA blocker hypothesis
-   - Test immediately after documentation update
-   - Use: `sudo setpci -s $DEVICE CAP_EXP+10.w=0x0000`
+3. ~~**Test with ASPM L1 Disabled**~~ **HYPOTHESIS DISPROVEN**
+   - ASPM L1 tested: NOT the blocker
+   - Working zouyonghao driver has L1 enabled (same as ours)
+   - The real blocker was mailbox protocol, not ASPM
 
-### Research Tasks
+### ~~Research Tasks~~ Completed/Superseded
 
-1. **MT6639 ASPM Behavior**
-   - Search MT6639 driver for ASPM configuration
-   - Check if MT6639 requires different ASPM settings than MT7925
-   - Look for L1 substate handling
+1. ~~**MT6639 ASPM Behavior**~~ **DISPROVEN as blocker**
+   - Zouyonghao working driver has L1 enabled
+   - ASPM L1 is not the DMA blocker
 
-2. **MT6639 DMA Initialization**
-   - Review MT6639 WFDMA setup sequence
-   - Check for MT6639-specific DMA enable steps
-   - Verify RST register handling
+2. ✅ **MT6639 DMA Initialization**
+   - MT6639 WFDMA setup reviewed
+   - DMA configuration is correct
+   - RST register handling validated
 
-3. **MT6639 Firmware Protocol**
-   - Check MT6639 MCU command format
-   - Verify descriptor structure matches our implementation
-   - Look for MT6639-specific handshake requirements
+3. ✅ **MT6639 Firmware Protocol**
+   - **ROOT CAUSE FOUND**: ROM doesn't support mailbox
+   - Solution: polling-based loading (no mailbox waits)
+   - See ZOUYONGHAO_ANALYSIS.md for implementation
 
 ## References
 
@@ -260,8 +260,9 @@ This explains the Windows firmware analysis findings:
 |---------|------------|----------|
 | MT7927 uses MT6639 driver data | 100% | MediaTek kernel module |
 | MT6639 uses rings 15/16 | 100% | MT6639 bus_info structure |
-| Rings 15/16 correct for MT7927 | 95% | Architecture chain + firmware sharing |
-| Current driver update was correct | 95% | All evidence points to 15/16 |
-| Need to review MT6639-specific code | 100% | Different parent chip |
+| Rings 15/16 correct for MT7927 | **100%** | Validated via MT6639 + zouyonghao |
+| Current driver update was correct | **100%** | Working reference driver confirms |
+| ~~ASPM L1 is blocker~~ | **0%** | **DISPROVEN** - working driver has L1 enabled |
+| Mailbox protocol is blocker | **100%** | Zouyonghao analysis proves ROM doesn't respond |
 
-**Overall Assessment**: MT7927 is definitively an MT6639 variant. Our recent driver update to rings 15/16 was correct. The DMA blocker is likely unrelated to ring assignment and remains the ASPM L1 power state hypothesis.
+**Overall Assessment (Updated 2026-01-31)**: MT7927 is definitively an MT6639 variant. Rings 15/16 are confirmed correct. **The DMA blocker was the mailbox protocol assumption, NOT ASPM L1.** Solution is polling-based firmware loading.

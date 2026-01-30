@@ -54,12 +54,14 @@ struct mt7927_desc {
 
 - **TX Queues**: For transmitting data/commands to hardware
   - Queue 0: Band0 data transmission
-  - Queue 4: Firmware download (FWDL)
-  - Queue 5: MCU command/response (WM)
-  
+  - Queue 15: MCU command/response (MCU_WM) - **CONFIRMED via MT6639 analysis**
+  - Queue 16: Firmware download (FWDL) - **CONFIRMED via MT6639 analysis**
+
 - **RX Queues**: For receiving data/responses from hardware
   - Queue 0: MCU responses (WM)
   - Queue 2: Band0 data reception
+
+**⚠️ IMPORTANT**: MT7927 has 8 physical TX rings (0-7), but uses sparse ring numbering (0,1,2,15,16) like MT6639. Rings 15/16 exist in hardware despite CNT=0 in uninitialized state.
 
 ### DMA Queue Management
 
@@ -631,11 +633,13 @@ Lines 672-673: Clear MCU queue pointers
 
 The MCU (Microcontroller Unit) subsystem handles communication between the host driver and the WiFi firmware running on the chip. It uses a message-based protocol over DMA queues.
 
+**⚠️ CRITICAL WARNING**: MT7927 ROM bootloader does NOT support mailbox command protocol! The mailbox-based functions documented below only work AFTER firmware has loaded and the MCU is running. For firmware loading, use **polling-based** approach (see [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)).
+
 #### MCU Queues
 
-- **TX Queue 5 (WM)**: Send MCU commands
-- **TX Queue 4 (FWDL)**: Send firmware data
-- **RX Queue 0 (WM)**: Receive MCU responses
+- **TX Queue 15 (MCU_WM)**: Send MCU commands - **CONFIRMED via MT6639 analysis**
+- **TX Queue 16 (FWDL)**: Send firmware data - **CONFIRMED via MT6639 analysis**
+- **RX Queue 0 (WM)**: Receive MCU responses (only works after firmware loads)
 
 #### MCU Message Format
 
@@ -800,7 +804,17 @@ Lines 172-175: Return or free response
 
 ### MCU Firmware Loading
 
-#### Firmware Loading Sequence
+**⚠️ CRITICAL**: The sequence below describes the **mailbox-based** protocol used by MT7925. **MT7927 ROM bootloader does NOT support mailbox protocol!** For MT7927, use the polling-based approach documented in [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md):
+
+1. Skip semaphore command (ROM doesn't support it)
+2. Send firmware chunks WITHOUT waiting for responses (`wait_resp=false`)
+3. Use time-based delays (5-50ms) instead of mailbox waits
+4. Set SW_INIT_DONE bit manually instead of FW_START command
+5. Poll status registers for completion
+
+#### Firmware Loading Sequence (Mailbox-Based - MT7925 Style)
+
+**Note**: This sequence works for MT7925 but NOT for MT7927 ROM bootloader.
 
 1. **Acquire Patch Semaphore**: Request permission to load patch
 2. **Load ROM Patch**: Download patch firmware in chunks

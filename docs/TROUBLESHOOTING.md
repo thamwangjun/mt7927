@@ -147,10 +147,14 @@ make recover
 
 ## ASPM Issues
 
-### Disabling ASPM for Testing
+### ASPM L1 is NOT the DMA Blocker
+
+**Status (2026-01-31)**: ASPM L1 hypothesis was **DISPROVEN**. The working zouyonghao driver has L1 enabled (same as ours). The real blocker was the mailbox protocol assumption.
+
+### Disabling ASPM for Testing (Usually Not Needed)
 
 ```bash
-# Disable L1 ASPM (potential DMA fix - under investigation)
+# Disable L1 ASPM (NOT required - but useful for debugging)
 # Bash:
 DEVICE=$(lspci -nn | grep 14c3:7927 | cut -d' ' -f1)
 sudo setpci -s $DEVICE CAP_EXP+10.w=0x0000
@@ -160,7 +164,7 @@ set DEVICE (lspci -nn | grep 14c3:7927 | cut -d' ' -f1)
 sudo setpci -s $DEVICE CAP_EXP+10.w=0x0000
 ```
 
-**Note**: The working zouyonghao driver has L1 enabled, so this may not be necessary.
+**Note**: ASPM L1 being enabled is normal and expected. The working driver doesn't disable it.
 
 ## Kernel Oops or Panic
 

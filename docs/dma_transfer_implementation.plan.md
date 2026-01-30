@@ -21,7 +21,7 @@ todos:
   - id: tx-queues
     content: Implement TX queue initialization (FWDL, MCU WM, Data)
     status: completed
-    notes: Changed to rings 4/5 for MCU (MT7927 only has 8 TX rings)
+    notes: Uses rings 15/16 for MCU/FWDL (MT6639 architecture, sparse ring layout)
   - id: rx-queues
     content: Implement RX queue initialization (MCU, Data)
     status: completed
@@ -36,8 +36,8 @@ todos:
     notes: Message formatting works, descriptors written to ring
   - id: fw-download
     content: Implement firmware download protocol (patch semaphore, scatter, finish)
-    status: blocked
-    notes: PATCH_SEM_CONTROL (0x0010) times out - DMA not processing descriptors
+    status: in-progress
+    notes: ROOT CAUSE FOUND - MT7927 ROM doesn't support mailbox. Need polling-based loader (see ZOUYONGHAO_ANALYSIS.md)
   - id: irq-handler
     content: Implement interrupt handler and completion processing
     status: completed
@@ -48,8 +48,8 @@ todos:
     notes: Created 6 diagnostic modules in diag/ directory
   - id: integration
     content: Integrate all components and test complete firmware loading
-    status: blocked
-    notes: BLOCKED - DMA hardware doesn't advance DIDX despite correct setup
+    status: in-progress
+    notes: ROOT CAUSE FOUND - Need polling-based firmware loader (mailbox protocol not supported by ROM)
 isProject: false
 ---
 
@@ -63,14 +63,18 @@ The project has made significant progress:
 - BAR0/BAR2 memory mapping works
 - MT7925 firmware files are compatible and loadable into kernel memory
 - Chip responds (FW_STATUS: 0xffff10f1 = waiting for firmware)
+- **MT7927 confirmed as MT6639 variant** (MediaTek kernel modules)
+- **Ring 15/16 assignments validated** (MT6639 architecture)
 
-**Root Cause of Current Blocker**: The existing `mt7927_init_dma.c` attempts direct register writes without the proper initialization sequence. The mt7925 driver shows that firmware loading requires:
+**Root Cause of Blocker (FOUND 2026-01-31)**: MT7927 ROM bootloader does NOT support mailbox command protocol! The driver was waiting for mailbox responses that the ROM never sends.
 
-1. Power management control handshake
-2. WiFi system reset
-3. Proper DMA queue setup with descriptor rings
-4. MCU message protocol (not raw memory writes)
-5. Interrupt-based completion handling
+**Solution**: Use polling-based firmware loading:
+1. Skip semaphore command (ROM doesn't support it)
+2. Send firmware chunks without waiting for mailbox responses
+3. Use time-based delays (5-50ms) instead of mailbox waits
+4. Set SW_INIT_DONE bit manually instead of FW_START command
+
+See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) for complete implementation details.
 
 ## Architecture Overview
 

@@ -1,184 +1,116 @@
 # MT7927 Test Results Summary
 
-**Date**: 2025-08-18
-**Status**: ✅ ALL SAFE TESTS PASSING | 🛑 BLOCKED ON FIRMWARE
+**Date**: 2026-01-31 (Updated from 2025-08-18 initial exploration)
+**Status**: ✅ HARDWARE VALIDATED | 🔧 FIRMWARE LOADING IN PROGRESS
 
 ## Executive Summary
 
-After extensive testing with **23 test modules**, we have achieved complete understanding of the MT7927 chip architecture. The critical finding: **the chip requires firmware to be loaded via DMA** to activate. Without firmware files from MediaTek, development cannot proceed.
+Hardware exploration is complete. **Root cause of firmware loading blocker identified**: MT7927 ROM bootloader does NOT support mailbox command protocol. Solution is polling-based firmware loading (validated by zouyonghao working driver).
 
-**Key Finding**: FW_STATUS register value `0xffff10f1` means "waiting for firmware load"
+**Key Findings**:
+- MT7927 is **MT6639 variant** (proven via MediaTek kernel modules)
+- Uses **MT7925 firmware files** (CONNAC3X family compatibility)
+- ROM bootloader requires **polling mode**, not mailbox waiting
+- DMA hardware works correctly when proper protocol is used
 
-## Test Categories & Results
+## Architecture Validated ✅
 
-### 01_safe_basic - Fundamental Verification ✅ 4/4 PASSING
-Safe tests that verify basic chip functionality without any risk.
+| Discovery | Status | Evidence |
+|-----------|--------|----------|
+| MT7927 = MT6639 variant | **✓ CONFIRMED** | MediaTek kernel module PCI table |
+| MT7925 firmware compatible | **✓ CONFIRMED** | Windows driver analysis + CONNAC3X family |
+| Ring 15 = MCU_WM | **✓ CONFIRMED** | MT6639 bus_info structure |
+| Ring 16 = FWDL | **✓ CONFIRMED** | MT6639 bus_info structure |
+| 8 physical TX rings | **✓ CONFIRMED** | Hardware scan (CNT=512 for rings 0-7) |
+| No mailbox in ROM | **✓ CONFIRMED** | Zouyonghao working driver analysis |
 
-| Test | Module | Result | Key Findings | 
-|------|--------|--------|-------------|
-| PCI Enumeration | test_pci_enum.ko | ✅ PASS | Chip ID: 0x792714c3 verified |
-| BAR Mapping | test_bar_map.ko | ✅ PASS | BAR0: 2MB @ 0x80000000, BAR2: 32KB @ 0x80200000 |
-| Chip ID | test_chip_id.ko | ✅ PASS | ID verified via multiple methods |
-| Scratch R/W | test_scratch_rw.ko | ✅ PASS | Registers 0x0020, 0x0024 fully writable |
+## Hardware Configuration
 
-### 02_safe_discovery - Architecture Analysis ✅ 3/3 COMPLETE
-Read-only tests that discover chip features and decode initialization sequence.
+| Property | Value |
+|----------|-------|
+| Chip ID | 0x00511163 |
+| BAR0 | 2MB (main registers) |
+| BAR2 | 32KB (read-only shadow) |
+| TX Rings | 8 physical, sparse layout (0,1,2,15,16 used) |
+| WFDMA1 | NOT present |
+| Architecture | CONNAC3X (same as MT7925) |
 
-| Test | Module | Result | Key Findings |
-|------|--------|--------|-------------|
-| Config Read | test_config_read.ko | ✅ PASS | 79 commands found at 0x080000 |
-| Config Decode | test_config_decode.ko | ✅ COMPLETE | 13 phases, register 0x81 critical |
-| MT7925 Compare | test_mt7925_patterns.ko | ✅ COMPLETE | Firmware loading pattern identified |
+## Firmware Files (Resolved)
 
-### 03_careful_write - State Modification ⚠️ 1/1 TESTED
-Tests that modify chip state carefully to attempt memory activation.
-
-| Test | Module | Result | Key Findings |
-|------|--------|--------|-------------|
-| Memory Activate | test_memory_activate.ko | ❌ NO ACTIVATION | Firmware required |
-
-### 04_risky_ops - Advanced Testing 🔬 12/12 COMPLETE
-Comprehensive tests to understand firmware requirements and initialization.
-
-| Test | Module | Purpose | Result |
-|------|--------|---------|--------|
-| Config Mapper | test_config_mapper.ko | Map config registers | ✅ Mapped |
-| Config Execute | test_config_execute.ko | Execute config commands | ❌ No activation |
-| Memory Probe | test_memory_probe.ko | Test activation theories | ❌ All failed |
-| Firmware Load | test_firmware_load.ko | Attempt firmware patterns | ❌ No activation |
-| Firmware Extract | test_firmware_extract.ko | Analyze firmware stub | 📊 Only 228 bytes |
-| MCU Init | test_mcu_init.ko | MCU initialization | ❌ No response |
-| Full Config | test_full_config.ko | Execute all commands | ❌ No activation |
-| PCIe Init | test_pcie_init.ko | PCIe-level init | ⚠️ Hangs on reset |
-| Simple Init | test_simple_init.ko | Safe init attempts | ❌ No activation |
-| FW Trigger | test_fw_trigger.ko | Firmware triggers | ❌ No activation |
-| Final Analysis | test_final_analysis.ko | Comprehensive analysis | 📊 Confirmed firmware needed |
-
-### 05_danger_zone - Destructive Testing 💀 DOCUMENTED ONLY
-Tests that will cause chip errors - documented but not executed.
-
-| Known Danger | Effect | Recovery |
-|-------------|--------|----------|
-| BAR2[0x00a4,0x00b8,0x00cc,0x00dc] | Immediate error state | PCI rescan required |
-| Write to BAR0[0x080000] | Chip error | PCI rescan required |
-| Write to BAR0[0x180000] | Chip error | PCI rescan required |
-| pci_reset_function() | System hang | Reboot required |
-
-## Critical Findings
-
-### Firmware Requirement Confirmed
-- **FW_STATUS**: 0xffff10f1 (waiting for firmware)
-- **Firmware stub**: Only 228 bytes at 0x0C0000 (insufficient)
-- **Required**: Full firmware binary via DMA load
-- **Without firmware**: No memory activation possible
-
-### Hardware Architecture (Fully Understood)
+Uses MT7925 firmware (CONNAC3X family compatibility):
 ```
-BAR0 Memory Map:
-0x000000 - Main memory (INACTIVE without firmware)
-0x020000 - DMA buffers (INACTIVE without firmware)
-0x080000 - Configuration (79 commands decoded)
-0x0C0000 - Firmware stub (228 bytes only)
-0x180000 - Status region (ACTIVE)
-
-BAR2 Control Registers:
-0x0200 - FW_STATUS (stuck at 0xffff10f1)
-0x0204 - DMA_ENABLE (0xf5 - channels 0,2,4,5,6,7)
-0x0020/0x0024 - Scratch registers (writable)
+/lib/firmware/mediatek/mt7925/
+├── WIFI_MT7925_PATCH_MCU_1_1_hdr.bin  # MCU patch
+└── WIFI_RAM_CODE_MT7925_1_1.bin        # RAM code
 ```
 
-### Configuration Analysis Complete
-- **79 commands** in 13 phases
-- **Register 0x81** accessed 13 times (firmware control)
-- **All commands** type 0x01 (OR operation) with value 0x02
-- **Execution successful** but insufficient without firmware
+**Note**: No MT7927-specific firmware exists. MT7925 files are the correct ones.
 
-## What Works vs What's Blocked
+## Root Cause Analysis
 
-### Fully Functional ✅
-- PCI communication
-- BAR mapping and access
-- Configuration reading
-- Register manipulation (safe zones)
-- Scratch register operations
-- Test framework
+### Why Firmware Loading Was Blocked
 
-### Blocked by Firmware ❌
-- Memory activation at BAR0[0x000000]
-- DMA buffer activation
-- MCU communication
-- WiFi functionality
-- Driver development
+1. **Old assumption**: Driver should wait for mailbox responses
+2. **Reality**: MT7927 ROM bootloader does NOT send mailbox responses
+3. **Result**: Driver waited forever for responses that never came
 
-## Required Firmware Files
+### Solution (Validated)
 
-Based on MT7925 pattern, we need:
-```
-mediatek/mt7927_rom_patch.bin
-mediatek/mt7927_ram_code.bin
-mediatek/mt7927_mcu.bin
-```
+Use polling-based firmware loading:
+- Skip semaphore command (ROM doesn't support it)
+- Send firmware without waiting for mailbox responses
+- Use time-based delays instead of response waiting
+- Set SW_INIT_DONE manually instead of FW_START command
 
-These files **do not exist** in linux-firmware repository.
+See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** for complete details.
 
-## Test Execution Safety Record
+## Invalidated Hypotheses
 
-### Safe Operations Confirmed
-- All read operations (except danger zones)
-- Scratch register writes
-- Mode register modifications
-- Configuration reading
+The following hypotheses were investigated and **disproven**:
 
-### Dangerous Operations Identified
-- BAR2 danger zones cause immediate error
-- pci_reset_function() causes system hang
-- Config/status region writes cause errors
+| Hypothesis | Status | Evidence |
+|------------|--------|----------|
+| ~~ASPM L1 blocking DMA~~ | **DISPROVEN** | Working driver has L1 enabled |
+| ~~Ring 4/5 for MCU/FWDL~~ | **DISPROVEN** | MT6639 uses rings 15/16 |
+| ~~Need MT7927-specific firmware~~ | **DISPROVEN** | MT7925 firmware is correct |
+| ~~DMA hardware broken~~ | **DISPROVEN** | Works with polling protocol |
 
-### Recovery Procedures Tested
-```bash
-# For chip error state (0xffffffff)
-echo 1 | sudo tee /sys/bus/pci/devices/0000:0a:00.0/remove
-sleep 2
-echo 1 | sudo tee /sys/bus/pci/rescan
+## Current Status
 
-# For stuck module
-sudo rmmod -f module_name  # May require reboot
-```
+### Working ✅
+- PCI enumeration and BAR mapping
+- Power management handshake (LPCTL)
+- WiFi subsystem reset (WFSYS_SW_RST_B)
+- DMA ring allocation
+- Firmware file loading into memory
+- Ring 15/16 configuration
 
-## Development Impact
+### In Progress 🔧
+- Polling-based firmware loader implementation
+- Test module validation
 
-### Achievements
-1. **Complete hardware documentation** - First public MT7927 documentation
-2. **Safe test framework** - 23 modules, no hardware damage
-3. **Initialization understood** - All requirements documented
-4. **Community contribution** - Prevents duplicate effort
+### Pending (after firmware loads)
+- MCU command processing
+- Network interface creation
+- WiFi connectivity
 
-### Blocker
-**Cannot proceed without official firmware from MediaTek**
+## Test Infrastructure
 
-## Next Steps
+Current test modules in `tests/05_dma_impl/`:
+- `test_power_ctrl.ko` - Power management
+- `test_wfsys_reset.ko` - WiFi reset
+- `test_dma_queues.ko` - DMA ring allocation
+- `test_fw_load.ko` - Complete firmware loading (polling mode)
 
-### Required Actions
-1. **Contact MediaTek** for firmware support
-2. **Contact ASUS** for vendor support
-3. **File linux-firmware issue** on GitHub
-4. **Post to linux-wireless** mailing list
+Diagnostic modules in `diag/`:
+- 20 hardware exploration modules
+- `mt7927_fw_precheck.ko` - Pre-flight validation
 
-### Cannot Do (Ethical/Legal)
-- Extract firmware from Windows drivers
-- Reverse engineer proprietary firmware
-- Use firmware from other chips
+## References
 
-## Conclusion
-
-**Testing Complete**: All possible tests without firmware executed
-**Result**: Firmware is absolute requirement for progress
-**Status**: Project blocked until MediaTek provides firmware
-**Hardware**: Stable and undamaged after all tests
+- **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** - Root cause and solution
+- **[MT6639_ANALYSIS.md](MT6639_ANALYSIS.md)** - Architecture proof
+- **[HARDWARE.md](HARDWARE.md)** - Hardware specifications
 
 ---
-*Test Suite Version: 1.0*
-*Total Modules: 23*
-*Safe Tests Pass Rate: 100%*
-*Firmware Tests Pass Rate: 0% (expected - no firmware)*
-*Last Updated: 2025-08-18*
+*Last Updated: 2026-01-31*

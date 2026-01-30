@@ -30,9 +30,9 @@
 | IRQ | 48 (pin A, legacy INTx mode) |
 | MSI | 1/32 vectors available (currently disabled) |
 | ASPM L0s | Disabled (by driver) |
-| **ASPM L1** | **ENABLED** |
-| **L1.1 Substate** | **ENABLED** |
-| **L1.2 Substate** | **ENABLED** |
+| ASPM L1 | Enabled (normal - not a blocker) |
+| L1.1 Substate | Enabled (normal) |
+| L1.2 Substate | Enabled (normal) |
 
 ## Key Register Locations (BAR0 offsets)
 
