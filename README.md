@@ -25,6 +25,11 @@ The DMA engine is correctly configured but doesn't process descriptors:
 
 This prevents MCU command completion and blocks firmware transfer.
 
+**⚠️ NEW FINDING** (see HARDWARE_ANALYSIS.md):
+- **L1 ASPM and L1 substates are ENABLED** (driver only disables L0s)
+- Device may enter L1.2 power saving during DMA operations
+- **PRIME SUSPECT** for DMA blocking issue
+
 ## Quick Start
 
 ### Prerequisites
@@ -80,6 +85,15 @@ sudo dmesg | tail -20
 
 # Check binding status
 lspci -k | grep -A 3 "14c3:7927"
+
+# Test: Disable L1 ASPM (potential DMA fix!)
+# Bash:
+DEVICE=$(lspci -nn | grep 14c3:7927 | cut -d' ' -f1)
+sudo setpci -s $DEVICE CAP_EXP+10.w=0x0000
+
+# Fish:
+set DEVICE (lspci -nn | grep 14c3:7927 | cut -d' ' -f1)
+sudo setpci -s $DEVICE CAP_EXP+10.w=0x0000
 ```
 
 ### Expected Output (Current State)
@@ -100,14 +114,17 @@ lspci -k | grep -A 3 "14c3:7927"
 ## Technical Details
 
 ### Hardware Information
-- **Chip**: MediaTek MT7927 WiFi 7 (802.11be)
+- **Chip**: MediaTek MT7927 WiFi 7 (802.11be) - also known as "Filogic 380"
+- **Full Name**: MT7927 802.11be 320MHz 2x2 PCIe Wireless Network Adapter
 - **PCI ID**: 14c3:7927 (vendor: MediaTek, device: MT7927)
+- **PCI Location**: Varies by system (example: 01:00.0) - check with `lspci -nn | grep 14c3:7927`
 - **Architecture**: Based on MT7925 + 320MHz channel support
 - **DMA Engine**: Single WFDMA0 (no WFDMA1), 8 TX rings + 16 RX rings
 - **Memory Map**:
-  - BAR0 @ 0x000000: 1MB SRAM (chip internal memory)
-  - BAR2 @ 0x000000: DMA control registers (WFDMA0_BASE)
-  - BAR2 @ 0x200000: Power management and status registers
+  - BAR0: **2MB** total (not 1MB!) - confirmed via lspci
+    - 0x000000 - 0x0FFFFF: SRAM (chip internal memory)
+    - 0x100000 - 0x1FFFFF: Control registers
+  - BAR2: 32KB (DMA register window, read-only shadow of BAR0)
 
 ### Key Discoveries
 1. **MT7925 firmware is compatible** - Confirmed through testing
@@ -118,7 +135,7 @@ lspci -k | grep -A 3 "14c3:7927"
 6. **DMA doesn't process** - Hardware won't advance descriptor index (root blocker)
 
 ### What's Working ✅
-- PCI enumeration and BAR mapping (BAR0: 1MB SRAM, BAR2: DMA registers)
+- PCI enumeration and BAR mapping (BAR0: **2MB confirmed**, BAR2: 32KB)
 - Driver successfully binds to device and handles IRQs
 - Firmware files load into kernel memory (MT7925 firmware compatible)
 - Power management handshake (host claims DMA ownership via PMCTRL)
@@ -145,13 +162,14 @@ All initialization steps execute correctly, but the DMA engine doesn't process T
 - IRQ handler confirms DMA engine is idle (no completion interrupts)
 
 **Hypotheses**:
-1. MT7927 may need different DMA trigger mechanism than MT7925
-2. Missing pre-DMA initialization step (clock/power domain)
-3. Different descriptor format or layout requirements
-4. Additional doorbell/kick register beyond CIDX write
-5. Hardware expects firmware to be partially active first
+1. **⚠️ L1 ASPM and L1 substates enabled** (see HARDWARE_ANALYSIS.md) - PRIORITY 1
+2. MT7927 may need different DMA trigger mechanism than MT7925
+3. Missing pre-DMA initialization step (clock/power domain)
+4. Different descriptor format or layout requirements
+5. Additional doorbell/kick register beyond CIDX write
+6. Hardware expects firmware to be partially active first
 
-See `AGENTS.md` and `DEVELOPMENT_LOG.md` for detailed investigation history.
+See `HARDWARE_ANALYSIS.md`, `AGENTS.md` and `DEVELOPMENT_LOG.md` for detailed investigation history.
 
 ## Project Structure
 ```
