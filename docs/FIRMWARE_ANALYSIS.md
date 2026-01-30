@@ -101,8 +101,11 @@ static void mt792x_dma_prefetch(struct mt792x_dev *dev)
 
 ## Conclusion
 
-### Evidence FOR Shared Firmware
-1. ✓ Firmware binary contains 0x7927 device ID references
+### Evidence FOR Shared Firmware (Circumstantial)
+1. ⚠️ Firmware binary contains bytes `79 27` (8+ occurrences)
+   - Could mean: firmware supports MT7927
+   - Could mean: firmware detects MT7927 for rejection
+   - Could mean: coincidental data, version numbers, etc.
 2. ✓ No separate MT7927 firmware exists in linux-firmware
 3. ✓ MediaTek describes MT7927 as "MT7925 + 320MHz"
 4. ✓ Both chips use same PCI vendor ID (14c3)
@@ -112,16 +115,41 @@ static void mt792x_dma_prefetch(struct mt792x_dev *dev)
 2. ✗ MT7927 falls into MT7921 code path instead of MT7925
 3. ✗ Different ring counts (8 vs 17+) not handled in driver
 4. ✗ No official documentation from MediaTek
+5. ✗ No source code or MediaTek confirmation
 
-### Final Assessment
+### What We Can Actually Conclude
 
-**The firmware DOES support MT7927**, but **the driver does NOT**. The firmware is multi-chip aware (contains both 0x7925 and 0x7927 references), suggesting MediaTek intended shared firmware.
+**PROVEN**:
+- ✓ Bytes `79 27` appear in MT7925 firmware binary
+- ✓ No separate MT7927 firmware exists in mainline
+- ✓ Driver has no MT7927 support
 
-However, the mainline driver lacks MT7927-specific code paths. This means:
+**HIGH LIKELIHOOD** (but not proven):
+- ⚠️ Firmware probably supports MT7927
+- ⚠️ Using MT7925 firmware is reasonable approach
 
-1. **Firmware assumption is VALID** ✓
-2. **Driver compatibility is BROKEN** ✗
-3. **We need MT7927-specific driver code** (this project!)
+**UNKNOWN** (requires testing):
+- ❓ Whether firmware will actually work with MT7927
+- ❓ Which rings firmware expects
+- ❓ Whether hardware differences cause issues
+
+### Corrected Assessment
+
+**Before**: "The firmware DOES support MT7927" ← **Overstated**
+**After**: "The firmware **LIKELY** supports MT7927, but this remains **UNPROVEN** until tested"
+
+The presence of 0x7927 bytes is **circumstantial evidence**, not proof. True validation requires:
+
+1. **Empirical Testing** ← Only definitive answer
+2. Source code analysis (unavailable)
+3. MediaTek documentation (doesn't exist)
+
+### What This Means for Our Project
+
+1. **Use MT7925 firmware files** ⚠️ (reasonable assumption, not validated)
+2. **Driver compatibility is broken** ✓ (proven by code analysis)
+3. **Custom driver is necessary** ✓ (whether firmware works or not)
+4. **Must test empirically** ✓ (only way to know if it works)
 
 ### Implications for Our Driver
 

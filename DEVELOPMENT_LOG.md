@@ -1079,7 +1079,7 @@ hexdump -C mt7925_ram.bin | grep -E "79 25|79 27"
 00038da0  a7 3d 9f 1d 27 9a 79 27  1f d8 21 13 0b 5b 09 51
 ```
 
-**CRITICAL DISCOVERY**: The MT7925 firmware binary contains references to **BOTH** 0x7925 AND 0x7927 device IDs. The firmware is **multi-chip aware**!
+**FINDING**: The MT7925 firmware binary contains bytes `79 27` (0x7927) in 8+ locations. **Interpretation uncertain** - could mean firmware supports MT7927, or could be coincidental data/version numbers/detection for rejection.
 
 **Test 3: Driver Code Analysis**
 
@@ -1117,34 +1117,42 @@ if (is_mt7925(&dev->mt76)) {
 
 | Aspect | Status | Evidence |
 |--------|--------|----------|
-| Firmware supports MT7927 | ✓ **VALIDATED** | Binary contains 0x7927 device ID |
-| Firmware is multi-chip | ✓ **VALIDATED** | Contains both 0x7925 and 0x7927 |
-| No separate MT7927 firmware | ✓ **VALIDATED** | linux-firmware has no mt7927/ |
-| Driver supports MT7927 | ✗ **INVALIDATED** | No is_mt7927() detection |
-| Driver config would work | ✗ **INVALIDATED** | Would use MT7921 path (wrong!) |
+| Binary contains bytes 0x7927 | ✓ **PROVEN** | Found 8+ occurrences in hex dump |
+| Firmware supports MT7927 | ⚠️ **HIGH LIKELIHOOD** | Circumstantial (bytes could be coincidental) |
+| Firmware is multi-chip aware | ⚠️ **LIKELY** | Contains both 0x7925 and 0x7927 bytes |
+| No separate MT7927 firmware | ✓ **PROVEN** | linux-firmware has no mt7927/ |
+| Driver supports MT7927 | ✗ **PROVEN FALSE** | No is_mt7927() detection exists |
+| Driver config would work | ✗ **PROVEN FALSE** | Would use MT7921 path (wrong!) |
+| Firmware will actually work | ❓ **UNKNOWN** | Requires empirical testing |
 
 **Conclusions**
 
-1. **Firmware Assumption: CORRECT** ✓
-   - MT7925 firmware is designed for both chips
-   - Binary analysis proves multi-chip awareness
-   - Should use MT7925 firmware files
+1. **Firmware Assumption: HIGH LIKELIHOOD** ⚠️ (not proven)
+   - Binary contains 0x7927 bytes (circumstantial evidence)
+   - No separate MT7927 firmware exists (supports assumption)
+   - MediaTek describes MT7927 as variant (supports assumption)
+   - **BUT**: Requires empirical testing to validate
 
-2. **Driver Compatibility: BROKEN** ✗
-   - Mainline driver has no MT7927 support
-   - Would incorrectly use MT7921 configuration
+2. **Driver Compatibility: BROKEN** ✓ (proven)
+   - Mainline driver has no MT7927 support (proven by code)
+   - Would incorrectly use MT7921 configuration (proven by code flow)
    - Ring assignments would be wrong (16/17 vs 0-7)
 
-3. **Our Project Justification: VALIDATED** ✓
-   - Firmware supports MT7927 but driver doesn't
-   - Need custom driver with MT7927-specific paths
+3. **Our Project Justification: VALID** ✓
+   - Driver definitely doesn't support MT7927 (proven)
+   - Custom driver is necessary regardless of firmware
    - Cannot rely on mainline driver logic
 
 4. **Ring Assignment Impact**:
-   - Firmware knows about MT7927 (proven by device ID presence)
-   - But we don't know which rings firmware expects
+   - Binary contains 0x7927 bytes (not proof of support)
+   - Don't know which rings firmware expects (unknown)
    - Mainline would use rings 16/17 (don't exist on MT7927!)
-   - Our rings 4/5 choice is educated guess, needs empirical testing
+   - Our rings 4/5 choice is educated guess, **requires testing**
+
+5. **Scientific Rigor**:
+   - Finding bytes ≠ proof of functionality
+   - Only empirical test can validate firmware compatibility
+   - High likelihood ≠ certainty
 
 **Documentation Created**: `docs/FIRMWARE_ANALYSIS.md` - Complete technical analysis with hex dumps, driver code examination, and recommendations.
 
