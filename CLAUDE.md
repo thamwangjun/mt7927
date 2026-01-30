@@ -435,13 +435,22 @@ Create test modules in `tests/05_dma_impl/` or `diag/` rather than modifying pro
 1. Run `make clean && make` (or appropriate target like `make tests`, `make diag`)
 2. Verify the .ko file was rebuilt with the latest changes
 3. Remind user to reboot if device state may be altered from previous tests
+4. Run `mt7927_diag.ko` first to verify device state is consistent before critical tests
 
 Example pre-load sequence:
 ```bash
 # Clean and rebuild
-make clean && make tests
+make clean && make tests && make diag
 
-# Then load (after reboot if needed)
+# Verify device state first (after reboot if needed)
+sudo insmod diag/mt7927_diag.ko
+sudo dmesg | tail -20
+sudo rmmod mt7927_diag
+
+# Expected: Chip ID 0x00511163, FW_STATUS 0xffff10f1 (pre-init)
+# If values differ, consider rebooting
+
+# Then load the actual test module
 sudo insmod tests/05_dma_impl/test_fw_load.ko
 sudo dmesg | tail -60
 ```
