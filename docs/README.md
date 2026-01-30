@@ -47,6 +47,7 @@ If you're new to this project, start here:
 Jump directly to:
 - **Root Cause & Solution** → [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) ⚠️ **READ THIS FIRST!**
 - **Architecture Proof** → [MT6639_ANALYSIS.md](MT6639_ANALYSIS.md)
+- **Reference Code Analysis** → [REFERENCE_SOURCES.md](REFERENCE_SOURCES.md)
 - **Hardware Details** → [HARDWARE.md](HARDWARE.md)
 - **Implementation Guide** → [CONTRIBUTING.md](CONTRIBUTING.md)
 - **PCI & Power Management** → [mt7927_pci_documentation.md](mt7927_pci_documentation.md)
@@ -386,6 +387,58 @@ Jump directly to:
 
 ---
 
+### Analysis Documents
+
+#### [REFERENCE_SOURCES.md](REFERENCE_SOURCES.md)
+**Purpose:** Analysis of reference source code origins and their relevance
+
+**Contents:**
+- **MediaTek vendor kernel modules** (reference_mtk_modules/)
+  - Source and origin (Xiaomi "rodin" device kernel tree)
+  - Evidence of origin (git history, copyright, structure)
+  - Critical MT7927 → MT6639 mapping discovery
+  - Key files for MT7927 development
+  - Licensing considerations
+- **Zouyonghao MT7927 driver** (reference_zouyonghao_mt7927/)
+  - Working implementation analysis
+  - Polling-based firmware loading proof
+- **Linux kernel MT7925 driver**
+  - CONNAC3X family patterns
+  - Differences from MT7927
+- Reference priority guide for development
+- Validation of MT6639 architectural relationship
+- Implementation confidence levels
+
+**When to Read:**
+- Understanding reference code sources
+- Validating architectural claims (MT7927 = MT6639)
+- Finding authoritative implementation examples
+- Determining which reference to use for specific tasks
+- Understanding licensing and attribution
+- Confirming register definitions and initialization sequences
+
+**Key Discovery:** Proves MT7927 → MT6639 driver data mapping from official MediaTek vendor code, validating all claims in MT6639_ANALYSIS.md.
+
+---
+
+#### [FIRMWARE_ANALYSIS.md](FIRMWARE_ANALYSIS.md)
+**Purpose:** Analysis of firmware compatibility and file formats
+
+**When to Read:**
+- Understanding firmware file requirements
+- Validating firmware compatibility
+
+---
+
+#### [WINDOWS_FIRMWARE_ANALYSIS.md](WINDOWS_FIRMWARE_ANALYSIS.md)
+**Purpose:** Analysis of Windows driver firmware usage
+
+**When to Read:**
+- Confirming MT7925 firmware compatibility
+- Cross-platform validation
+
+---
+
 ## Project Overview
 
 ### What is MT7927?
@@ -449,6 +502,7 @@ mt7927-linux-driver/
 │   ├── diagnostic_modules_documentation.md  # Diagnostic tools
 │   │
 │   │── ANALYSIS:
+│   ├── REFERENCE_SOURCES.md            # Analysis of reference implementations
 │   ├── FIRMWARE_ANALYSIS.md            # Firmware compatibility
 │   ├── WINDOWS_FIRMWARE_ANALYSIS.md    # Windows driver proof
 │   ├── TEST_RESULTS_SUMMARY.md         # Validation status
@@ -474,6 +528,9 @@ mt7927-linux-driver/
 │   ├── mt7927_power_diag.c     # Power management analysis
 │   └── ... (15 more)
 │
+├── reference_mtk_modules/       # MediaTek vendor kernel modules
+│   └── connectivity/wlan/core/gen4m/chips/mt6639/  # MT6639 official code
+│
 └── reference_zouyonghao_mt7927/ # Working driver reference
     └── mt7927_fw_load.c        # Polling-based firmware loader
 ```
@@ -484,20 +541,31 @@ mt7927-linux-driver/
 
 ### Reference Implementations
 
-The project is based on the MT7925 driver in the Linux kernel:
+The MT7927 driver development uses three primary reference sources:
 
-**Kernel Source Location:**
-```
-drivers/net/wireless/mediatek/mt76/mt7925/
-├── pci.c         # PCI probe and initialization
-├── mcu.c         # MCU communication and firmware loading
-├── init.c        # Hardware initialization
-└── dma.c         # DMA setup and transfer
-```
+1. **MediaTek Vendor Kernel Modules** (reference_mtk_modules/)
+   - Official MediaTek MT6639 implementation
+   - From Xiaomi device kernel tree
+   - **Most authoritative** for MT7927 (proves MT7927 = MT6639 variant)
+   - Location: `connectivity/wlan/core/gen4m/chips/mt6639/`
+
+2. **Zouyonghao MT7927 Driver** (reference_zouyonghao_mt7927/)
+   - Community working implementation
+   - Proves polling-based firmware loading works
+   - Source of root cause discovery
+
+3. **Linux Kernel MT7925 Driver**
+   - CONNAC3X family reference
+   - Upstream quality code
+   - Location: `drivers/net/wireless/mediatek/mt76/mt7925/`
+
+**For detailed analysis of each source, see [REFERENCE_SOURCES.md](REFERENCE_SOURCES.md)**
 
 **Online References:**
-- [Linux kernel source](https://github.com/torvalds/linux/tree/master/drivers/net/wireless/mediatek/mt76/mt7925)
+- [Linux kernel mt7925](https://github.com/torvalds/linux/tree/master/drivers/net/wireless/mediatek/mt76/mt7925)
 - [mt76 framework](https://github.com/openwrt/mt76)
+- [MediaTek vendor modules](https://github.com/Fede2782/MTK_modules) (reference_mtk_modules/)
+- [Zouyonghao MT7927](https://github.com/zouyonghao/mt7927) (reference_zouyonghao_mt7927/)
 
 ### Hardware Information
 
