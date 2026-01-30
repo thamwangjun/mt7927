@@ -433,6 +433,50 @@ The `reference/linux/drivers/net/wireless/mediatek/mt76/mt7925/` directory conta
 4. Check MCU ready status (FW_OWN_REQ_SET should return 0x1)
 5. Look for interrupt activity (IRQ handler logs)
 
+## ⚠️ Device State Awareness During Testing
+
+**IMPORTANT**: The MT7927 device state can become corrupted or altered during testing, especially after:
+- Failed module loads or crashes
+- Write tests to hardware registers
+- Incomplete initialization sequences
+- Power management state changes
+- ASPM state modifications via setpci
+
+### Symptoms of Altered Device State
+- Chip ID reads as 0xffffffff (hung/unresponsive)
+- Chip ID reads as 0x00000000 (wrong register or corrupted)
+- Register values differ from expected fresh-boot values
+- DMA rings show unexpected configuration
+- Module loads fail with -EIO or timeout errors
+
+### Recovery Options
+
+**Option 1: PCI Rescan** (quick, often sufficient)
+```bash
+# Bash:
+DEVICE=$(lspci -nn | grep 14c3:7927 | cut -d' ' -f1)
+echo 1 | sudo tee /sys/bus/pci/devices/0000:$DEVICE/remove
+sleep 2
+echo 1 | sudo tee /sys/bus/pci/rescan
+
+# Fish:
+set DEVICE (lspci -nn | grep 14c3:7927 | cut -d' ' -f1)
+echo 1 | sudo tee /sys/bus/pci/devices/0000:$DEVICE/remove
+sleep 2
+echo 1 | sudo tee /sys/bus/pci/rescan
+```
+
+**Option 2: Full System Reboot** (recommended when in doubt)
+
+**When to reboot**:
+- After kernel oops or panic related to MT7927
+- After multiple failed test iterations
+- Before running critical validation tests
+- When PCI rescan doesn't restore expected register values
+- When comparing results across different test scenarios (ensures consistent baseline)
+
+**Best Practice**: When conducting systematic testing or validation, start each test session with a fresh reboot to ensure the device is in a known-good state.
+
 ## What NOT to Do
 
 - **Don't write to random registers** - Can hang the chip (recovery requires PCI rescan)
@@ -440,6 +484,7 @@ The `reference/linux/drivers/net/wireless/mediatek/mt76/mt7925/` directory conta
 - **Don't modify production driver without tests** - Use test modules for experimentation
 - **Don't clear WFDMA0_RST to 0x00** - Wipes ring configuration immediately
 - **Don't access registers when chip is in error state** - Check for 0xffffffff first
+- **Don't assume device state is clean after failed tests** - Reboot if uncertain
 
 ## Investigation Priorities
 
