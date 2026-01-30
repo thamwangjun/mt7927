@@ -856,3 +856,89 @@ BAR2: [mem 0x90800000-0x90807fff 64bit]
    - RST=0x30: Rings writable, but DMA doesn't process
    - RST=0x00: DMA could process, but rings get wiped
    - Need to investigate if there's a state transition sequence that works
+
+---
+
+## Phase 15: ASPM Fix and Diagnostic Enhancement (2026-01-31)
+
+### What We Did
+
+1. **Added ASPM L0s and L1 Disable to test_fw_load.c**
+   - Identified that driver only disabled L0s, but L1 and L1 substates (L1.1, L1.2) remained enabled
+   - Added `pci_disable_link_state(pdev, PCIE_LINK_STATE_L0S | PCIE_LINK_STATE_L1)` early in probe
+   - Eliminates need to manually run setpci before loading module
+
+2. **Enhanced mt7927_diag.c Baseline Check**
+   - Added BAR0 mapping alongside BAR2 to access WFDMA registers
+   - Now reads actual TX/RX ring state (BASE/CNT/CIDX/DIDX) from BAR0+0x2xxx
+   - Provides complete device state verification before testing
+
+3. **Fixed Diagnostic False Positives**
+   - Corrected logic to only flag BASE/CIDX/DIDX as concerning (not CNT)
+   - CNT=512 is hardware default for rings 0-7 and is expected
+   - Previous version incorrectly warned about "RX ring not clean" due to CNT=512
+
+4. **Updated CLAUDE.md Test Module Requirements**
+   - Documented mandatory ASPM disable for all DMA test modules
+   - Added pre-load checklist: clean build, verify rebuild, check baseline with mt7927_diag.ko
+   - Ensures consistent testing procedure going forward
+
+### Test Results
+
+**Baseline Check Output (After Reboot)**:
+```
+Chip ID:       0x00511163
+HW Rev:        0x11885162
+FW_STATUS:     0xffff10f1 (pre-init - expected)
+WFDMA GLO_CFG: 0x1010b870 (TX:OFF RX:OFF)
+WFDMA RST_PTR: 0x00000000
+All TX rings clean (BASE=0, CIDX=0, DIDX=0)
+RX ring clean (BASE=0, CIDX=0, DIDX=0)
+```
+
+### Key Findings
+
+1. **Device Baseline Confirmed Clean**:
+   - All ring BASE addresses are 0x00000000 (no DMA allocated)
+   - All CIDX/DIDX are 0 (no processing in progress)
+   - CNT=512 for rings 0-7 (expected hardware default)
+
+2. **WFDMA GLO_CFG Not Zero**:
+   - Value is 0x1010b870 instead of expected 0x00000000
+   - TX and RX DMA are still OFF (bits 0 and 2 are clear)
+   - Other bits may be hardware defaults or configuration flags
+
+3. **ASPM L1 Prime Suspect**:
+   - lspci confirmed L1, L1.1, and L1.2 substates were ENABLED
+   - Driver only disabled L0s previously
+   - Device may enter L1.2 sleep during DMA operations, blocking DIDX advancement
+
+### Files Modified
+
+- `tests/05_dma_impl/test_fw_load.c` - Added ASPM L0s and L1 disable
+- `diag/mt7927_diag.c` - Enhanced to check WFDMA baseline state
+- `CLAUDE.md` - Added test module requirements section
+
+### Commits
+
+- `920203a` Add ASPM L0s and L1 disable to test_fw_load.c
+- `ebc53cb` Add test module requirements to CLAUDE.md
+- `cb9e5c1` Add mt7927_diag pre-check to test module requirements
+- `ddce30b` Enhance mt7927_diag to check WFDMA baseline state
+- `6d068a7` Fix mt7927_diag baseline check logic
+
+### Next Steps
+
+**Ready for Critical Test**: With ASPM L0s and L1 now properly disabled in test_fw_load.c, ready to test if DMA DIDX advances:
+
+```bash
+make clean && make tests && make diag
+sudo insmod diag/mt7927_diag.ko && sudo dmesg | tail -20 && sudo rmmod mt7927_diag
+sudo insmod tests/05_dma_impl/test_fw_load.ko
+sudo dmesg | tail -60
+```
+
+**Watch For**:
+- "ASPM L0s and L1 disabled" message confirming fix is active
+- Whether DIDX advances from 0 when CIDX is incremented
+- MCU command completion vs timeout
