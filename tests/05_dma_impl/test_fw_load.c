@@ -165,47 +165,47 @@
  * CB_INFRA Register Definitions (from reference_mtk_modules/coda/mt6639/)
  *
  * CRITICAL: These MUST be initialized BEFORE any WFDMA register access!
- * Addresses in 0x70xxxxxx range require L1 remap for access.
+ *
+ * Address translation via fixed_map from zouyonghao pci.c:
+ *   { 0x70020000, 0x1f0000, 0x0010000 }
+ * So chip address 0x70020000 + offset → BAR0 0x1f0000 + offset
+ *
+ * NOTE: Addresses 0x70020000-0x7002FFFF are in fixed_map and use DIRECT access.
+ *       Addresses 0x70005xxx (CBTOP GPIO) are NOT in fixed_map, need L1 remap.
  * ========================================================================== */
 
-/* CB_INFRA_MISC0 - PCIe Remap Configuration (0x70026000 base)
+/* CB_INFRA_MISC0 - PCIe Remap Configuration (direct BAR0 offsets)
+ * Chip 0x70026000 + offset → BAR0 0x1f6000 + offset
  * From: reference_gen4m/chips/mt6639/mt6639.c:2727-2737 (set_cbinfra_remap)
  */
-#define CB_INFRA_MISC0_BASE             0x70026000
-#define CB_INFRA_PCIE_REMAP_WF_ADDR     (CB_INFRA_MISC0_BASE + 0x554)  /* 0x70026554 */
-#define CB_INFRA_PCIE_REMAP_WF_BT_ADDR  (CB_INFRA_MISC0_BASE + 0x558)  /* 0x70026558 */
+#define CB_INFRA_PCIE_REMAP_WF          0x1f6554    /* Chip 0x70026554 */
+#define CB_INFRA_PCIE_REMAP_WF_BT       0x1f6558    /* Chip 0x70026558 */
 #define CB_INFRA_PCIE_REMAP_WF_VALUE    0x74037001  /* From mt6639.c */
 #define CB_INFRA_PCIE_REMAP_WF_BT_VALUE 0x70007000  /* From mt6639.c */
 
-/* CB_INFRA_RGU - Reset Generation Unit (0x70028000 base)
+/* CB_INFRA_RGU - Reset Generation Unit (direct BAR0 offsets)
+ * Chip 0x70028000 + offset → BAR0 0x1f8000 + offset
  * From: reference_mtk_modules/coda/mt6639/cb_infra_rgu.h
  */
-#define CB_INFRA_RGU_BASE               0x70028000
-#define CB_INFRA_WF_SUBSYS_RST_ADDR     (CB_INFRA_RGU_BASE + 0x600)    /* 0x70028600 */
-#define CB_INFRA_BT_SUBSYS_RST_ADDR     (CB_INFRA_RGU_BASE + 0x610)    /* 0x70028610 */
+#define CB_INFRA_WF_SUBSYS_RST          0x1f8600    /* Chip 0x70028600 */
+#define CB_INFRA_BT_SUBSYS_RST          0x1f8610    /* Chip 0x70028610 */
 
-/* CB_INFRA_SLP_CTRL - Sleep Control (0x70025000 base)
+/* CB_INFRA_SLP_CTRL - Sleep Control (direct BAR0 offsets)
+ * Chip 0x70025000 + offset → BAR0 0x1f5000 + offset
  * From: reference_mtk_modules/coda/mt6639/cb_infra_slp_ctrl.h
  * IMPORTANT: Use the SET register (0x034) to grant MCU ownership, not status (0x030)
  */
-#define CB_INFRA_SLP_CTRL_BASE          0x70025000
-#define CB_INFRA_CRYPTO_MCU_OWN_ADDR    (CB_INFRA_SLP_CTRL_BASE + 0x030)  /* Status */
-#define CB_INFRA_CRYPTO_MCU_OWN_SET_ADDR (CB_INFRA_SLP_CTRL_BASE + 0x034) /* SET register */
+#define CB_INFRA_CRYPTO_MCU_OWN         0x1f5030    /* Chip 0x70025030 - Status */
+#define CB_INFRA_CRYPTO_MCU_OWN_SET     0x1f5034    /* Chip 0x70025034 - SET register */
 
 /* CBTOP GPIO Mode Configuration (0x70005000 range)
+ * NOTE: These are NOT in fixed_map, so they need L1 remap!
  * From: reference_gen4m/chips/mt6639/mt6639.c:2651-2653 (mt6639_mcu_reinit)
  */
-#define CBTOP_GPIO_MODE5_ADDR           0x7000535c
-#define CBTOP_GPIO_MODE6_ADDR           0x7000536c
+#define CBTOP_GPIO_MODE5_CHIP           0x7000535c  /* Needs L1 remap */
+#define CBTOP_GPIO_MODE6_CHIP           0x7000536c  /* Needs L1 remap */
 #define GPIO_MODE5_VALUE                0x80000000  /* From mt6639.c */
 #define GPIO_MODE6_VALUE                0x80        /* From mt6639.c */
-
-/* Legacy compatibility aliases */
-#define CHIP_GPIO_MODE5_ADDR            CBTOP_GPIO_MODE5_ADDR
-#define CHIP_GPIO_MODE6_ADDR            CBTOP_GPIO_MODE6_ADDR
-#define CHIP_BT_SUBSYS_RST_ADDR         CB_INFRA_BT_SUBSYS_RST_ADDR
-#define CHIP_WF_SUBSYS_RST_ADDR         CB_INFRA_WF_SUBSYS_RST_ADDR
-#define CHIP_CRYPTO_MCU_OWN_ADDR        CB_INFRA_CRYPTO_MCU_OWN_SET_ADDR  /* Use SET register! */
 
 /* Reset sequence values from MTK mt6639
  * From: reference_gen4m/chips/mt6639/mt6639.c:2660-2669
@@ -218,6 +218,11 @@
 /* WF_SUBSYS_RST bit fields for RMW */
 #define WF_SUBSYS_RST_WF_MASK           0x00000010
 #define WF_SUBSYS_RST_WF_SHFT           4
+
+/* Backward compatibility - these are now direct BAR0 offsets */
+#define CHIP_WF_SUBSYS_RST              CB_INFRA_WF_SUBSYS_RST
+#define CHIP_BT_SUBSYS_RST              CB_INFRA_BT_SUBSYS_RST
+#define CHIP_CRYPTO_MCU_OWN             CB_INFRA_CRYPTO_MCU_OWN_SET
 
 /* LPCTL bits */
 #define MT_LPCTL_HOST_OWN               BIT(0)
@@ -423,8 +428,8 @@ static void reg_remap_restore(struct test_dev *dev)
 	}
 }
 
-/* Read/write with automatic L1 remap for 0x70xxxxxx addresses */
-static u32 mt_rr_remap(struct test_dev *dev, u32 addr)
+/* Read/write with automatic L1 remap for 0x70xxxxxx addresses (CBTOP GPIO only) */
+static u32 __maybe_unused mt_rr_remap(struct test_dev *dev, u32 addr)
 {
 	u32 val, mapped_addr;
 
@@ -627,11 +632,14 @@ static int init_cbinfra_remap(struct test_dev *dev)
 	/* Step 1: Set PCIe remap for WiFi WFDMA access
 	 * From mt6639.c: HAL_MCR_WR(ad, CB_INFRA_MISC0_CBTOP_PCIE_REMAP_WF_ADDR, 0x74037001)
 	 * This maps PCIe address space to the correct WFDMA registers
+	 *
+	 * NOTE: CB_INFRA registers are in fixed_map, so use DIRECT BAR0 access!
+	 * Chip 0x70026554 → BAR0 0x1f6554 (via fixed_map { 0x70020000, 0x1f0000, 0x0010000 })
 	 */
-	dev_info(&dev->pdev->dev, "  Setting CB_INFRA PCIE_REMAP_WF (0x%08x)...\n",
-		 CB_INFRA_PCIE_REMAP_WF_ADDR);
-	mt_wr_remap(dev, CB_INFRA_PCIE_REMAP_WF_ADDR, CB_INFRA_PCIE_REMAP_WF_VALUE);
-	val = mt_rr_remap(dev, CB_INFRA_PCIE_REMAP_WF_ADDR);
+	dev_info(&dev->pdev->dev, "  Setting CB_INFRA PCIE_REMAP_WF (BAR0 + 0x%06x)...\n",
+		 CB_INFRA_PCIE_REMAP_WF);
+	mt_wr(dev, CB_INFRA_PCIE_REMAP_WF, CB_INFRA_PCIE_REMAP_WF_VALUE);
+	val = mt_rr(dev, CB_INFRA_PCIE_REMAP_WF);
 	dev_info(&dev->pdev->dev, "    PCIE_REMAP_WF = 0x%08x (expected 0x%08x) %s\n",
 		 val, CB_INFRA_PCIE_REMAP_WF_VALUE,
 		 val == CB_INFRA_PCIE_REMAP_WF_VALUE ? "OK" : "MISMATCH!");
@@ -639,10 +647,10 @@ static int init_cbinfra_remap(struct test_dev *dev)
 	/* Step 2: Set PCIe remap for WiFi/BT shared area
 	 * From mt6639.c: HAL_MCR_WR(ad, CB_INFRA_MISC0_CBTOP_PCIE_REMAP_WF_BT_ADDR, 0x70007000)
 	 */
-	dev_info(&dev->pdev->dev, "  Setting CB_INFRA PCIE_REMAP_WF_BT (0x%08x)...\n",
-		 CB_INFRA_PCIE_REMAP_WF_BT_ADDR);
-	mt_wr_remap(dev, CB_INFRA_PCIE_REMAP_WF_BT_ADDR, CB_INFRA_PCIE_REMAP_WF_BT_VALUE);
-	val = mt_rr_remap(dev, CB_INFRA_PCIE_REMAP_WF_BT_ADDR);
+	dev_info(&dev->pdev->dev, "  Setting CB_INFRA PCIE_REMAP_WF_BT (BAR0 + 0x%06x)...\n",
+		 CB_INFRA_PCIE_REMAP_WF_BT);
+	mt_wr(dev, CB_INFRA_PCIE_REMAP_WF_BT, CB_INFRA_PCIE_REMAP_WF_BT_VALUE);
+	val = mt_rr(dev, CB_INFRA_PCIE_REMAP_WF_BT);
 	dev_info(&dev->pdev->dev, "    PCIE_REMAP_WF_BT = 0x%08x (expected 0x%08x) %s\n",
 		 val, CB_INFRA_PCIE_REMAP_WF_BT_VALUE,
 		 val == CB_INFRA_PCIE_REMAP_WF_BT_VALUE ? "OK" : "MISMATCH!");
@@ -668,47 +676,54 @@ static int wfsys_reset(struct test_dev *dev)
 
 	dev_info(&dev->pdev->dev, "=== Phase 0b: WiFi/BT Subsystem Reset ===\n");
 
-	/* Step 1: GPIO mode configuration */
-	dev_info(&dev->pdev->dev, "  Setting GPIO mode registers...\n");
-	mt_wr_remap(dev, CHIP_GPIO_MODE5_ADDR, GPIO_MODE5_VALUE);
-	mt_wr_remap(dev, CHIP_GPIO_MODE6_ADDR, GPIO_MODE6_VALUE);
+	/* Step 1: GPIO mode configuration
+	 * NOTE: CBTOP_GPIO addresses (0x70005xxx) are NOT in fixed_map,
+	 * so they need L1 remap access.
+	 */
+	dev_info(&dev->pdev->dev, "  Setting GPIO mode registers (via L1 remap)...\n");
+	mt_wr_remap(dev, CBTOP_GPIO_MODE5_CHIP, GPIO_MODE5_VALUE);
+	mt_wr_remap(dev, CBTOP_GPIO_MODE6_CHIP, GPIO_MODE6_VALUE);
 	usleep_range(100, 200);
 
-	/* Step 2: BT subsystem reset */
-	dev_info(&dev->pdev->dev, "  Resetting BT subsystem...\n");
-	mt_wr_remap(dev, CHIP_BT_SUBSYS_RST_ADDR, BT_SUBSYS_RST_ASSERT);
+	/* Step 2: BT subsystem reset
+	 * NOTE: CB_INFRA addresses are in fixed_map, use DIRECT access.
+	 */
+	dev_info(&dev->pdev->dev, "  Resetting BT subsystem (BAR0 + 0x%06x)...\n",
+		 CHIP_BT_SUBSYS_RST);
+	mt_wr(dev, CHIP_BT_SUBSYS_RST, BT_SUBSYS_RST_ASSERT);
 	msleep(10);
-	mt_wr_remap(dev, CHIP_BT_SUBSYS_RST_ADDR, BT_SUBSYS_RST_DEASSERT);
+	mt_wr(dev, CHIP_BT_SUBSYS_RST, BT_SUBSYS_RST_DEASSERT);
 	msleep(10);
 
 	/* Step 3: First WF subsystem reset */
-	dev_info(&dev->pdev->dev, "  Resetting WF subsystem (first pass)...\n");
-	mt_wr_remap(dev, CHIP_WF_SUBSYS_RST_ADDR, WF_SUBSYS_RST_ASSERT);
+	dev_info(&dev->pdev->dev, "  Resetting WF subsystem (first pass, BAR0 + 0x%06x)...\n",
+		 CHIP_WF_SUBSYS_RST);
+	mt_wr(dev, CHIP_WF_SUBSYS_RST, WF_SUBSYS_RST_ASSERT);
 	msleep(10);
-	mt_wr_remap(dev, CHIP_WF_SUBSYS_RST_ADDR, WF_SUBSYS_RST_DEASSERT);
+	mt_wr(dev, CHIP_WF_SUBSYS_RST, WF_SUBSYS_RST_DEASSERT);
 	msleep(50);
 
 	/* Step 4: Second WF reset (MTK RMW on bit 4 - exact mt6639 sequence) */
 	dev_info(&dev->pdev->dev, "  Resetting WF subsystem (second pass - RMW)...\n");
 
 	/* Read current value */
-	val = mt_rr_remap(dev, CHIP_WF_SUBSYS_RST_ADDR);
+	val = mt_rr(dev, CHIP_WF_SUBSYS_RST);
 	dev_info(&dev->pdev->dev, "    WF_SUBSYS_RST read: 0x%08x\n", val);
 
 	/* Assert reset: clear mask, then set bit */
 	val &= ~WF_SUBSYS_RST_WF_MASK;
 	val |= (1 << WF_SUBSYS_RST_WF_SHFT);
-	mt_wr_remap(dev, CHIP_WF_SUBSYS_RST_ADDR, val);
+	mt_wr(dev, CHIP_WF_SUBSYS_RST, val);
 	dev_info(&dev->pdev->dev, "    WF_SUBSYS_RST wrote: 0x%08x (assert)\n", val);
 	msleep(1);
 
 	/* Read again */
-	val = mt_rr_remap(dev, CHIP_WF_SUBSYS_RST_ADDR);
+	val = mt_rr(dev, CHIP_WF_SUBSYS_RST);
 	dev_info(&dev->pdev->dev, "    WF_SUBSYS_RST after 1ms: 0x%08x\n", val);
 
 	/* De-assert reset */
 	val &= ~WF_SUBSYS_RST_WF_MASK;
-	mt_wr_remap(dev, CHIP_WF_SUBSYS_RST_ADDR, val);
+	mt_wr(dev, CHIP_WF_SUBSYS_RST, val);
 	dev_info(&dev->pdev->dev, "    WF_SUBSYS_RST wrote: 0x%08x (de-assert)\n", val);
 	msleep(10);
 
@@ -752,9 +767,12 @@ static int init_conninfra(struct test_dev *dev)
 	/* Step 3: WFSYS reset already done in Phase 0 - skip duplicate reset here
 	 * Per zouyonghao analysis: mt7927e_mcu_pre_init() only does single reset */
 
-	/* Step 4: Set Crypto MCU ownership (via L1 remap) */
-	dev_info(&dev->pdev->dev, "  Setting Crypto MCU ownership...\n");
-	mt_wr_remap(dev, CHIP_CRYPTO_MCU_OWN_ADDR, BIT(0));
+	/* Step 4: Set Crypto MCU ownership
+	 * NOTE: CB_INFRA addresses are in fixed_map, use DIRECT access.
+	 */
+	dev_info(&dev->pdev->dev, "  Setting Crypto MCU ownership (BAR0 + 0x%06x)...\n",
+		 CHIP_CRYPTO_MCU_OWN);
+	mt_wr(dev, CHIP_CRYPTO_MCU_OWN, BIT(0));
 	msleep(5);
 
 	/* Step 5: Wait for MCU IDLE state */
