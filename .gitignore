@@ -155,3 +155,6 @@ debian/stamp-*
 
 # Ignore all files in the firmware directory
 reference_firmware/mtk*
+
+# ignore claude
+.claude
