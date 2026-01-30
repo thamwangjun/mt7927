@@ -71,19 +71,19 @@ static void dump_safe_registers(struct mt7927_diag *diag)
     dev_info(&pdev->dev, "WFDMA RST_PTR: 0x%08x\n", val);
 
     /* Check TX rings 0-7 (MT7927 has 8 TX rings) */
-    dev_info(&pdev->dev, "\nTX Rings (expecting all zeros in pre-init state):\n");
+    dev_info(&pdev->dev, "\nTX Rings (BASE/CIDX/DIDX should be zero; CNT=512 is hardware default):\n");
     for (i = 0; i < 8; i++) {
         base = readl(diag->bar0 + MT_WFDMA0_TX_RING_BASE(i));
         cnt  = readl(diag->bar0 + MT_WFDMA0_TX_RING_CNT(i));
         cidx = readl(diag->bar0 + MT_WFDMA0_TX_RING_CIDX(i));
         didx = readl(diag->bar0 + MT_WFDMA0_TX_RING_DIDX(i));
 
-        if (base || cnt || cidx || didx) {
-            dev_info(&pdev->dev, "  TX%d: BASE=0x%08x CNT=%u CIDX=%u DIDX=%u *** NON-ZERO ***\n",
+        if (base || cidx || didx) {
+            dev_info(&pdev->dev, "  TX%d: BASE=0x%08x CNT=%u CIDX=%u DIDX=%u *** NOT CLEAN ***\n",
                      i, base, cnt, cidx, didx);
         }
     }
-    dev_info(&pdev->dev, "  (All TX rings 0-7 are zero - clean state)\n");
+    dev_info(&pdev->dev, "  All TX rings clean (BASE=0, CIDX=0, DIDX=0)\n");
 
     /* Check RX ring 0 */
     base = readl(diag->bar0 + MT_WFDMA0_RX_RING_BASE(0));
@@ -94,10 +94,10 @@ static void dump_safe_registers(struct mt7927_diag *diag)
     dev_info(&pdev->dev, "\nRX Ring 0: BASE=0x%08x CNT=%u CIDX=%u DIDX=%u\n",
              base, cnt, cidx, didx);
 
-    if (base || cnt || cidx || didx)
-        dev_info(&pdev->dev, "  *** WARNING: RX ring not clean ***\n");
+    if (base || cidx || didx)
+        dev_info(&pdev->dev, "  *** WARNING: RX ring not clean (has DMA or active processing) ***\n");
     else
-        dev_info(&pdev->dev, "  (Clean state - expected)\n");
+        dev_info(&pdev->dev, "  RX ring clean (BASE=0, CIDX=0, DIDX=0)\n");
 
     dev_info(&pdev->dev, "\n=== Baseline check complete ===\n");
 }
