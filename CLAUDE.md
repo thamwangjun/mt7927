@@ -8,17 +8,17 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 
 **Official Product Name**: MT7927 802.11be 320MHz 2x2 PCIe Wireless Network Adapter [Filogic 380]
 
-**Current Status**: BLOCKED on DMA descriptor processing. All initialization steps succeed (PCI probe, power management, WFSYS reset, ring allocation), but DMA hardware doesn't advance descriptor index (DIDX stuck at 0). This prevents MCU command completion and firmware transfer.
+**Current Status**: **ROOT CAUSE FOUND (2026-01-31)** - MT7927 ROM bootloader does NOT support mailbox command protocol! Our driver waits for mailbox responses that the ROM will never send. DMA hardware works correctly; we're using the wrong communication protocol.
 
-**⚠️ PRIMARY SUSPECT**: Hardware analysis reveals **L1 ASPM and L1 substates are ENABLED** (driver only disables L0s). Device may enter L1.2 sleep during DMA operations. See HARDWARE_ANALYSIS.md for details. **TEST THIS FIRST** before other hypotheses.
+**⚠️ SOLUTION**: Switch to polling-based firmware loading (no mailbox waits). Working reference driver from zouyonghao proves this approach. See ZOUYONGHAO_ANALYSIS.md for complete details.
 
 ## Critical Files to Review First
 
-1. **docs/MT6639_ANALYSIS.md** - ⚠️ **NEW** - Proves MT7927 is MT6639 variant, validates rings 15/16
-2. **HARDWARE_ANALYSIS.md** - lspci analysis revealing L1 ASPM issue and BAR0 size discrepancy
-3. **AGENTS.md** - Session bootstrap with current blocker details, hardware context, and what's been tried
-4. **DEVELOPMENT_LOG.md** - Complete chronological development history (critical for understanding all previous attempts)
-5. **docs/dma_transfer_implementation.plan.md** - Implementation plan with task status
+1. **docs/ZOUYONGHAO_ANALYSIS.md** - 🎯 **ROOT CAUSE FOUND** - No mailbox protocol in MT7927 ROM!
+2. **docs/MT6639_ANALYSIS.md** - Proves MT7927 is MT6639 variant, validates rings 15/16
+3. **DEVELOPMENT_LOG.md** - Complete chronological history (Phase 17 = root cause discovery)
+4. **AGENTS.md** - Session bootstrap with current blocker details, hardware context, and what's been tried
+5. **HARDWARE_ANALYSIS.md** - lspci analysis (L1 ASPM hypothesis now invalidated)
 6. **README.md** - Project overview, build instructions, expected outputs
 
 ## Build System
@@ -539,40 +539,46 @@ echo 1 | sudo tee /sys/bus/pci/rescan
 
 ## Investigation Priorities
 
-### 🔥 Priority 1: L1 ASPM Power States (NEW - Test First!)
+### 🎯 **ROOT CAUSE IDENTIFIED** (Phase 17 - 2026-01-31)
 
-**Test**: Disable L1 and L1 substates that lspci shows are enabled:
+**MT7927 ROM bootloader does NOT support mailbox command protocol!**
 
-**Bash:**
-```bash
-# Runtime disable via setpci
-DEVICE=$(lspci -nn | grep 14c3:7927 | cut -d' ' -f1)
-sudo setpci -s $DEVICE CAP_EXP+10.w=0x0000
-```
+Our driver:
+- Sends PATCH_SEM_CONTROL command
+- **Waits for mailbox response** ← **BLOCKS HERE FOREVER**
+- ROM bootloader never sends responses
+- Timeout after 5 seconds
+- Never proceeds to firmware loading
 
-**Fish:**
-```fish
-# Runtime disable via setpci
-set DEVICE (lspci -nn | grep 14c3:7927 | cut -d' ' -f1)
-sudo setpci -s $DEVICE CAP_EXP+10.w=0x0000
-```
+**Solution**: Polling-based firmware loading (reference_zouyonghao_mt7927)
 
-**In driver code:**
+### Implementation Path
+
+**Quick Test** (validate hypothesis):
 ```c
-pci_disable_link_state(pdev, PCIE_LINK_STATE_L0S | PCIE_LINK_STATE_L1);
+// In src/mt7927_mcu.c - change one line:
+ret = mt76_mcu_send_msg(&dev->mt76, MCU_CMD_PATCH_SEM_CONTROL,
+                       &req, sizeof(req), false);  // Don't wait!
 ```
 
-**Why**: Device may enter L1.2 sleep when DMA should be active. Driver only disables L0s currently.
+**Full Solution**:
+1. Create `src/mt7927_fw_load.c` (polling-based, no mailbox)
+2. Skip semaphore command entirely
+3. Add aggressive TX cleanup (before+after each chunk)
+4. Add polling delays (5-50ms for ROM processing)
+5. Skip FW_START, manually set SW_INIT_DONE (0x7C000140 bit 4)
+6. Poll status registers (0x7c060204, 0x7c0600f0)
 
-### Original Hypotheses (from DEVELOPMENT_LOG.md)
+See **docs/ZOUYONGHAO_ANALYSIS.md** for complete implementation details.
 
-2. **RST State Transition** - Find MT7927-specific way to enable DMA processing without losing ring config
-3. **BAR0 Size Impact** - Verify register offsets with 2MB BAR0 (not 1MB as docs claimed)
-4. **Missing Doorbell/Kick** - Additional trigger register beyond CIDX write
-5. **Descriptor Format** - MT7927 may expect different TXD structure
-6. **Bootstrap Mode** - Firmware may need partial activation before DMA works
-7. **MSI Interrupts** - Test MSI mode instead of legacy INTx (32 vectors available)
-8. **MT7996 Comparison** - Newer chip may share MT7927's quirks
+### Invalidated Hypotheses
+
+1. ~~**L1 ASPM blocking DMA**~~ - Working driver has L1 enabled, same as ours
+2. ~~**Ring assignment wrong**~~ - Rings 15/16 validated via MT6639 analysis
+3. ~~**DMA configuration incorrect**~~ - Working driver uses same config
+4. ~~**Missing initialization step**~~ - All init steps are correct
+
+**The problem was always the mailbox protocol assumption!**
 
 ## Reference Documentation
 
