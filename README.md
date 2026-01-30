@@ -4,12 +4,26 @@
 
 We've discovered that the MT7927 is architecturally identical to the MT7925 (which has full Linux support since kernel 6.7) except for 320MHz channel width capability. This means we can adapt the existing mt7925 driver rather than writing one from scratch!
 
-## Current Status: ON-HOLD INDEFINITELY 🚧
+## Current Status: BLOCKED ON DMA DESCRIPTOR PROCESSING 🚧
 
-**Working**: Custom driver successfully binds to MT7927 hardware and loads firmware  
-**Next Step**: Implement DMA firmware transfer to activate the chip  
+**Working**: Complete DMA transfer layer implemented, power management functional, all initialization steps succeed  
+**Blocked**: DMA hardware doesn't process TX descriptors - DIDX never advances despite correct ring setup  
+**Impact**: MCU commands timeout, preventing firmware activation and chip bring-up
 
-I have other projects that I am working on, so I probably won't continue work on this one. I'm sharing my work in case anyone finds it useful.
+### Implementation Complete ✅
+- Production driver with full PCI probe, power management, and DMA support (`src/`)
+- Complete test framework for validation (`tests/05_dma_impl/`)
+- 18 diagnostic modules for hardware exploration (`diag/`)
+- Comprehensive documentation (`docs/`)
+
+### Current Blocker 🔴
+The DMA engine is correctly configured but doesn't process descriptors:
+- TX ring initialized: CIDX=0, CPU_DIDX=0, DMA_DIDX=0 (stuck)
+- MCU ready status: 0x00000001 (confirmed)
+- Power management: Host owns DMA, handshake complete
+- All prerequisites met, but hardware won't advance DIDX
+
+This prevents MCU command completion and blocks firmware transfer.
 
 ## Quick Start
 
@@ -42,14 +56,45 @@ sudo update-initramfs -u
 # Clone and build
 git clone https://github.com/[your-username]/mt7927-linux-driver
 cd mt7927-linux-driver
-make clean && make tests
 
-# Load the driver
-sudo insmod tests/04_risky_ops/mt7927_init.ko
+# Build all components
+make clean
+make           # Build production driver (src/)
+make tests     # Build test modules (tests/)
+make diag      # Build diagnostic modules (diag/)
 
-# Check status
+# Option 1: Load test module (recommended for development)
+sudo rmmod test_fw_load 2>/dev/null
+sudo insmod tests/05_dma_impl/test_fw_load.ko
+sudo dmesg | tail -40
+
+# Option 2: Load production driver
+sudo rmmod mt7927_pci 2>/dev/null
+sudo insmod src/mt7927_pci.ko
+sudo dmesg | tail -40
+
+# Option 3: Load diagnostic module
+sudo rmmod mt7927_diag 2>/dev/null
+sudo insmod diag/mt7927_diag.ko
 sudo dmesg | tail -20
-lspci -k | grep -A 3 "14c3:7927"  # Should show "Kernel driver in use: mt7927_init"
+
+# Check binding status
+lspci -k | grep -A 3 "14c3:7927"
+```
+
+### Expected Output (Current State)
+```
+[   10.123] mt7927_pci: MT7927 WiFi 7 driver loading
+[   10.124] mt7927 0000:0a:00.0: enabling device (0000 -> 0002)
+[   10.125] mt7927 0000:0a:00.0: BAR0 mapped, size=1048576
+[   10.126] mt7927 0000:0a:00.0: BAR2 mapped, size=1048576
+[   10.127] mt7927 0000:0a:00.0: Power management: Host claimed DMA
+[   10.128] mt7927 0000:0a:00.0: WFSYS reset complete
+[   10.129] mt7927 0000:0a:00.0: DMA rings allocated (8 TX, 2 RX)
+[   10.130] mt7927 0000:0a:00.0: MCU ready (status=0x00000001)
+[   10.131] mt7927 0000:0a:00.0: Sending patch semaphore command...
+[   15.132] mt7927 0000:0a:00.0: ERROR: MCU command timeout
+[   15.133] mt7927 0000:0a:00.0: DMA_DIDX stuck at 0 (no descriptor processing)
 ```
 
 ## Technical Details
@@ -57,54 +102,113 @@ lspci -k | grep -A 3 "14c3:7927"  # Should show "Kernel driver in use: mt7927_in
 ### Hardware Information
 - **Chip**: MediaTek MT7927 WiFi 7 (802.11be)
 - **PCI ID**: 14c3:7927 (vendor: MediaTek, device: MT7927)
-- **Architecture**: Same as MT7925 except supports 320MHz channels
-- **Current State**: FW_STATUS: 0xffff10f1 (waiting for DMA firmware transfer)
+- **Architecture**: Based on MT7925 + 320MHz channel support
+- **DMA Engine**: Single WFDMA0 (no WFDMA1), 8 TX rings + 16 RX rings
+- **Memory Map**:
+  - BAR0 @ 0x000000: 1MB SRAM (chip internal memory)
+  - BAR2 @ 0x000000: DMA control registers (WFDMA0_BASE)
+  - BAR2 @ 0x200000: Power management and status registers
 
 ### Key Discoveries
-1. **MT7925 firmware is compatible** - No need to wait for MediaTek
-2. **Driver binding works** - Custom driver successfully claims device
-3. **Clear path forward** - Just need to implement DMA transfer mechanism
+1. **MT7925 firmware is compatible** - Confirmed through testing
+2. **MT7927 has fewer TX rings** - 8 TX rings vs MT7925's 17 rings
+3. **Queue assignment differs** - FWDL uses ring 4, MCU_WM uses ring 5 (not 16/15)
+4. **Single DMA engine** - Only WFDMA0 present (MT7925 has both WFDMA0/1)
+5. **Initialization succeeds** - Power management, reset, ring setup all work
+6. **DMA doesn't process** - Hardware won't advance descriptor index (root blocker)
 
 ### What's Working ✅
-- PCI enumeration and BAR mapping
-- Driver successfully binds to device
-- Firmware files load into kernel memory
-- All hardware registers accessible
-- Chip is stable and responsive
+- PCI enumeration and BAR mapping (BAR0: 1MB SRAM, BAR2: DMA registers)
+- Driver successfully binds to device and handles IRQs
+- Firmware files load into kernel memory (MT7925 firmware compatible)
+- Power management handshake (host claims DMA ownership via PMCTRL)
+- WiFi subsystem reset sequence (WFSYS_SW_RST_B timing)
+- DMA descriptor rings allocated and configured (8 TX, 16 RX)
+- Queue assignments identified (FWDL=ring 4, MCU_WM=ring 5)
+- MCU responds as ready (FW_OWN_REQ_SET returns 0x00000001)
+- PCIe ASPM L0s disabled (MT_PCIE_MAC_PM_L0S_DIS set)
+- SWDEF_MODE set to normal operation (0x1)
+- All registers writable, no protection issues
 
-### What's Not Working Yet ❌
-- DMA firmware transfer to chip (main blocker)
-- Memory activation at 0x000000
-- WiFi network interface creation
+### What's Not Working ❌
+- **DMA descriptor processing** - Hardware doesn't advance DMA_DIDX
+- MCU command timeouts (patch semaphore never completes)
+- Firmware transfer blocked by non-functional DMA
+- Network interface creation (requires successful initialization)
 
-### Why It's Not Working (Root Cause)
-The firmware loads into kernel memory but isn't transferred to the chip via DMA. We need to:
-1. Set up DMA descriptors properly
-2. Copy firmware with correct headers to DMA buffer
-3. Trigger MCU to read from DMA buffer
-4. Wait for firmware acknowledgment
+### Root Cause Analysis
+All initialization steps execute correctly, but the DMA engine doesn't process TX descriptors:
+- Descriptors allocated in coherent DMA memory
+- Ring configured: base address, count, CIDX=0, CPU_DIDX=0
+- CIDX written to trigger processing
+- DMA_DIDX remains stuck at 0 (should increment after processing)
+- IRQ handler confirms DMA engine is idle (no completion interrupts)
+
+**Hypotheses**:
+1. MT7927 may need different DMA trigger mechanism than MT7925
+2. Missing pre-DMA initialization step (clock/power domain)
+3. Different descriptor format or layout requirements
+4. Additional doorbell/kick register beyond CIDX write
+5. Hardware expects firmware to be partially active first
+
+See `AGENTS.md` and `DEVELOPMENT_LOG.md` for detailed investigation history.
 
 ## Project Structure
 ```
 mt7927-linux-driver/
-├── README.md                        # This file (main documentation)
-├── Makefile                         # Build system
-├── tests/
-│   ├── 04_risky_ops/
-│   │   ├── mt7927_wrapper.c        # ✅ Basic driver (binds successfully)
-│   │   ├── mt7927_init.c           # 🚧 Current driver (loads firmware)
-│   │   └── test_mt7925_firmware.c  # ✅ Firmware compatibility test
-│   └── Kbuild                       # Kernel build config
-└── src/                             # Future production driver location
+├── README.md                        # Project overview and status
+├── AGENTS.md                        # Session bootstrap for development resumption
+├── DEVELOPMENT_LOG.md               # Complete chronological development history
+├── Makefile                         # Main build system (all, tests, diag targets)
+│
+├── src/                             # Production driver implementation
+│   ├── mt7927_pci.c                # PCI probe, power management, WFSYS reset
+│   ├── mt7927_dma.c                # DMA queue management (8 TX, 16 RX rings)
+│   ├── mt7927_mcu.c                # MCU protocol, firmware loading sequence
+│   ├── mt7927_diag.c               # Diagnostic register dump module
+│   ├── mt7927.h                    # Core data structures and API
+│   ├── mt7927_mcu.h                # MCU message structures
+│   ├── mt7927_regs.h               # Register definitions and address mapping
+│   └── Makefile                    # Driver build configuration
+│
+├── tests/05_dma_impl/              # Test modules for validation
+│   ├── test_power_ctrl.c           # Power management handshake test
+│   ├── test_wfsys_reset.c          # WiFi subsystem reset verification
+│   ├── test_dma_queues.c           # DMA ring allocation test
+│   ├── test_fw_load.c              # Complete firmware loading integration test
+│   └── README.md                   # Test module documentation
+│
+├── diag/                            # Hardware exploration diagnostic modules
+│   ├── mt7927_diag.c               # Basic register dump
+│   ├── mt7927_minimal_scan.c       # Safe register scanner
+│   ├── mt7927_power_diag.c         # Power management analysis
+│   ├── mt7927_dma_reset.c          # DMA reset sequence exploration
+│   ├── mt7927_wfsys_reset.c        # WFSYS reset testing
+│   └── [13 more diagnostic modules] # Various hardware exploration tools
+│
+└── docs/                            # Comprehensive documentation
+    ├── README.md                   # Documentation index and navigation
+    ├── mt7927_pci_documentation.md # PCI layer API documentation
+    ├── dma_mcu_documentation.md    # DMA and MCU layer documentation
+    ├── headers_documentation.md    # Complete header file reference
+    ├── test_modules_documentation.md      # Test framework guide
+    ├── diagnostic_modules_documentation.md # Diagnostic tools reference
+    └── dma_transfer_implementation.plan.md # Implementation plan with status
 ```
 
 ## Development Roadmap
 
-### Phase 1: Get It Working (CURRENT)
+### Phase 1: Get It Working (BLOCKED)
 - [x] Bind driver to device
 - [x] Load firmware files
-- [ ] **Implement DMA transfer** ← Current focus
-- [ ] Activate chip memory
+- [x] Implement power management handshake
+- [x] Implement WiFi subsystem reset
+- [x] Implement DMA ring allocation and configuration
+- [x] Implement MCU communication protocol
+- [x] Implement firmware download sequence
+- [ ] **Fix DMA descriptor processing** ← Current blocker
+- [ ] Achieve MCU command completion
+- [ ] Complete firmware transfer and activation
 - [ ] Create network interface
 
 ### Phase 2: Make It Good
@@ -118,12 +222,44 @@ mt7927-linux-driver/
 - [ ] Submit to linux-wireless
 - [ ] Get merged into mainline kernel
 
+### Known Implementation Status
+**Completed Components**:
+- PCI probe and resource allocation
+- Power management control (host/firmware ownership)
+- WiFi subsystem reset with proper timing
+- DMA descriptor ring structures (8 TX, 16 RX)
+- Queue assignment mapping (FWDL=4, MCU_WM=5)
+- MCU message structures and send functions
+- Firmware loading protocol (patch semaphore, scatter)
+- Interrupt handler registration
+- Complete register definitions
+
+**Current Investigation**:
+- Why DMA_DIDX doesn't advance despite correct setup
+- Potential missing initialization step
+- Differences between MT7927 and MT7925 DMA behavior
+- Alternative descriptor format requirements
+
 ## How to Contribute
 
-### Immediate Needs
-1. **DMA Implementation** - Study mt7925 source in `drivers/net/wireless/mediatek/mt76/mt7925/`
-2. **Testing** - Try the driver on your MT7927 hardware
-3. **Documentation** - Improve this README with your findings
+### Critical Investigation Needed
+The DMA layer is fully implemented but hardware doesn't process descriptors. We need to find:
+1. **Missing initialization step** - What makes MT7927's DMA engine operational?
+2. **Register differences** - Are there MT7927-specific DMA control registers?
+3. **Descriptor format** - Does MT7927 expect different TXD structure?
+4. **Trigger mechanism** - Is there a doorbell/kick register beyond CIDX write?
+
+### Development Resources
+- **Full documentation**: See `docs/README.md` for complete API reference
+- **Implementation plan**: `docs/dma_transfer_implementation.plan.md`
+- **Development log**: `DEVELOPMENT_LOG.md` (chronological investigation history)
+- **Session bootstrap**: `AGENTS.md` (quick-start guide for new sessions)
+
+### Testing on Your Hardware
+1. Build and load `tests/05_dma_impl/test_fw_load.ko`
+2. Capture full dmesg output showing DMA_DIDX behavior
+3. Try diagnostic modules in `diag/` to explore register behavior
+4. Document any differences from expected behavior in GitHub issues
 
 ### Code References
 
@@ -180,14 +316,29 @@ ls -la /lib/firmware/mediatek/mt7925/
 ### Successful Tests ✅
 - **Hardware Detection**: PCI enumeration works perfectly
 - **Driver Binding**: Custom driver claims device successfully  
-- **Firmware Compatibility**: MT7925 firmware loads without errors
-- **Register Access**: All BAR2 control registers accessible
+- **Firmware Compatibility**: MT7925 firmware loads into kernel memory
+- **Register Access**: All control registers accessible and writable
+- **Power Management**: Host successfully claims DMA ownership
+- **WFSYS Reset**: Reset sequence completes correctly
+- **DMA Allocation**: All descriptor rings allocate successfully
+- **Queue Configuration**: Ring base addresses and counts set correctly
+- **MCU Ready Status**: MCU reports ready (FW_OWN_REQ_SET = 0x1)
+- **IRQ Registration**: Interrupt handler installs and responds
 - **Chip Stability**: No crashes or lockups during testing
 
-### Pending Implementation 🚧
-- **DMA Transfer**: Firmware not reaching chip memory
-- **Memory Activation**: Main memory at 0x000000 still shows 0x00000000
-- **Network Interface**: Requires successful initialization first
+### Failed Tests ❌
+- **DMA Descriptor Processing**: DMA_DIDX never advances from 0
+- **MCU Commands**: All commands timeout waiting for completion
+- **Firmware Transfer**: Cannot send firmware to chip via DMA
+
+### Diagnostic Findings
+- Descriptors are in coherent DMA memory (verified)
+- Ring registers contain correct addresses and counts
+- CIDX write operation succeeds (triggers processing attempt)
+- No DMA completion interrupts occur
+- CPU_DIDX and DMA_DIDX remain synchronized at 0 (no processing)
+
+See `docs/TEST_RESULTS_SUMMARY.md` for detailed test execution logs.
 
 ## FAQ
 
@@ -210,6 +361,27 @@ GPL v2 - Intended for upstream Linux kernel submission
 - **GitHub Issues**: Report bugs and discuss development
 - **Linux Wireless**: [Mailing list](http://vger.kernel.org/vger-lists.html#linux-wireless) for upstream discussion
 
+## Documentation
+
+Complete technical documentation is available in the `docs/` directory:
+
+- **[docs/README.md](docs/README.md)** - Documentation index and navigation guide
+- **[AGENTS.md](AGENTS.md)** - Quick-start session bootstrap for development
+- **[DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md)** - Complete chronological development history
+- **[docs/mt7927_pci_documentation.md](docs/mt7927_pci_documentation.md)** - PCI layer implementation
+- **[docs/dma_mcu_documentation.md](docs/dma_mcu_documentation.md)** - DMA and MCU layer details
+- **[docs/headers_documentation.md](docs/headers_documentation.md)** - Header file reference
+- **[docs/test_modules_documentation.md](docs/test_modules_documentation.md)** - Test framework guide
+- **[docs/diagnostic_modules_documentation.md](docs/diagnostic_modules_documentation.md)** - Diagnostic tools
+
+## Getting Help
+
+1. **Read AGENTS.md first** - Contains critical context and current status
+2. **Check DEVELOPMENT_LOG.md** - See what has already been tried
+3. **Review implementation plan** - `docs/dma_transfer_implementation.plan.md`
+4. **Study reference driver** - MT7925 source in kernel tree
+5. **Ask in GitHub issues** - Share findings and discuss approaches
+
 ---
 
-**Status as of 2025-08-18**: Driver successfully binds and loads firmware. Implementing DMA transfer to complete initialization. This is no longer a reverse engineering project - we're adapting proven MT7925 code to support MT7927's PCI ID and eventually its 320MHz capability.
+**Status as of 2026-01-29**: Complete DMA transfer layer implemented with production driver, test framework, and diagnostic tools. All initialization steps succeed (power management, reset, ring configuration), but DMA hardware doesn't process descriptors. This blocks MCU command completion and prevents firmware activation. Investigation needed to identify MT7927-specific DMA requirements or missing initialization step.
