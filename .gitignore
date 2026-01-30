@@ -152,3 +152,6 @@ debian/stamp-*
 !Makefile
 !Kbuild
 !tests/Kbuild
+
+# Ignore all files in the firmware directory
+reference_firmware/mtk*
