@@ -73,6 +73,35 @@ Complete polling-based firmware loader:
 
 See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) lines 274-293 for complete requirements.
 
+### Expected Output (Current State)
+
+**Before mailbox fix (current state)**:
+```
+[   10.123] mt7927: Chip ID: 0x00511163
+[   10.124] mt7927: BAR0 mapped, size=1048576
+[   10.125] mt7927: Power management: Host claimed DMA
+[   10.126] mt7927: WFSYS reset complete
+[   10.127] mt7927: DMA rings allocated
+[   10.128] mt7927: MCU ready (status=0x00000001)
+[   10.129] mt7927: Sending patch semaphore command...
+[   15.130] mt7927: ERROR: MCU command timeout  ← Expected blocker
+```
+
+**After mailbox fix (expected)**:
+```
+[   10.123] mt7927: Chip ID: 0x00511163
+[   10.124] mt7927: BAR0 mapped, size=1048576
+[   10.125] mt7927: Power management: Host claimed DMA
+[   10.126] mt7927: WFSYS reset complete
+[   10.127] mt7927: DMA rings allocated
+[   10.128] mt7927: MCU ready (status=0x00000001)
+[   10.129] mt7927: Loading patch (polling mode)
+[   10.145] mt7927: Patch sent successfully
+[   10.146] mt7927: Loading RAM firmware
+[   10.230] mt7927: Firmware loaded successfully
+[   10.231] mt7927: Network interface created: wlan0
+```
+
 ## Phase 2: Make It Good
 
 ### Network Functionality

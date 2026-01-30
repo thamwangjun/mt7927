@@ -421,35 +421,61 @@ See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) for complete root cause ana
 ### Project Structure
 
 ```
-mt7927/
-├── README.md                    # Main project overview
+mt7927-linux-driver/
+├── README.md                    # Minimal quick start guide
 ├── AGENTS.md                    # Session bootstrap guide
-├── DEVELOPMENT_LOG.md           # Complete development history
-├── docs/                       # Documentation (this directory)
-│   ├── README.md              # This file (documentation index)
-│   ├── dma_transfer_implementation.plan.md  # Implementation plan
-│   ├── test_modules_documentation.md
-│   ├── diagnostic_modules_documentation.md
-│   ├── dma_mcu_documentation.md
-│   ├── mt7927_pci_documentation.md
-│   ├── headers_documentation.md
-│   └── TEST_RESULTS_SUMMARY.md
-├── src/                        # Production driver source
-│   ├── mt7927.h
-│   ├── mt7927_regs.h
-│   ├── mt7927_pci.c
-│   ├── mt7927_dma.c
-│   └── mt7927_mcu.c
-├── tests/                      # Test modules
-│   └── 05_dma_impl/           # DMA implementation tests
-│       ├── test_power_ctrl.c
-│       ├── test_wfsys_reset.c
-│       ├── test_dma_queues.c
-│       └── test_fw_load.c
-└── diag/                       # Diagnostic modules
-    ├── mt7927_diag.c
-    ├── mt7927_power_unlock.c
-    └── ... (many more)
+├── DEVELOPMENT_LOG.md           # Complete development history (17 phases)
+├── CLAUDE.md                    # AI agent project instructions
+│
+├── docs/                        # Complete documentation
+│   ├── README.md               # Documentation index (this file)
+│   │
+│   │── CRITICAL READING:
+│   ├── ZOUYONGHAO_ANALYSIS.md  # ROOT CAUSE & SOLUTION
+│   ├── MT6639_ANALYSIS.md      # Architecture proof (MT7927 = MT6639)
+│   ├── ROADMAP.md              # Current status and plan
+│   ├── CONTRIBUTING.md         # How to contribute
+│   │
+│   │── REFERENCE:
+│   ├── HARDWARE.md             # Hardware specifications
+│   ├── TROUBLESHOOTING.md      # Common issues and solutions
+│   ├── FAQ.md                  # Frequently asked questions
+│   │
+│   │── TECHNICAL:
+│   ├── mt7927_pci_documentation.md      # PCI layer API
+│   ├── dma_mcu_documentation.md         # DMA and MCU layer
+│   ├── headers_documentation.md         # Register reference
+│   ├── test_modules_documentation.md    # Test framework
+│   ├── diagnostic_modules_documentation.md  # Diagnostic tools
+│   │
+│   │── ANALYSIS:
+│   ├── FIRMWARE_ANALYSIS.md            # Firmware compatibility
+│   ├── WINDOWS_FIRMWARE_ANALYSIS.md    # Windows driver proof
+│   ├── TEST_RESULTS_SUMMARY.md         # Validation status
+│   └── dma_transfer_implementation.plan.md  # Original plan
+│
+├── src/                         # Production driver
+│   ├── mt7927_pci.c            # PCI probe, power management
+│   ├── mt7927_dma.c            # DMA queue management
+│   ├── mt7927_mcu.c            # MCU protocol, firmware loading
+│   ├── mt7927.h                # Core structures and API
+│   ├── mt7927_regs.h           # Register definitions
+│   └── mt7927_mcu.h            # MCU message structures
+│
+├── tests/05_dma_impl/          # Component validation tests
+│   ├── test_power_ctrl.c       # Power management handshake
+│   ├── test_wfsys_reset.c      # WiFi subsystem reset
+│   ├── test_dma_queues.c       # DMA ring allocation
+│   └── test_fw_load.c          # Complete firmware loading
+│
+├── diag/                        # Hardware exploration (18 modules)
+│   ├── mt7927_diag.c           # Basic register dump
+│   ├── mt7927_minimal_scan.c   # Safe register scanner
+│   ├── mt7927_power_diag.c     # Power management analysis
+│   └── ... (15 more)
+│
+└── reference_zouyonghao_mt7927/ # Working driver reference
+    └── mt7927_fw_load.c        # Polling-based firmware loader
 ```
 
 ---
