@@ -1,3 +1,6 @@
 [submodule "reference_zouyonghao_mt7927"]
 	path = reference_zouyonghao_mt7927
 	url = https://github.com/zouyonghao/mt7927.git
+[submodule "reference_mtk_modules"]
+	path = reference_mtk_modules
+	url = https://github.com/MiCode/MTK_kernel_modules.git
