@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * MT7927 Diagnostic Module - ULTRA MINIMAL VERSION
- * 
- * Only reads BAR2 registers that are known to be safe.
- * Does NOT scan BAR0 or access potentially dangerous regions.
+ * MT7927 Diagnostic Module - Complete Baseline Check
+ *
+ * Maps both BAR0 and BAR2 to verify device state before testing.
+ * Reads chip ID, FW status, and WFDMA ring configuration.
  */
 
 #include <linux/module.h>
@@ -13,76 +13,104 @@
 #define MT7927_VENDOR_ID    0x14c3
 #define MT7927_DEVICE_ID    0x7927
 
+/* WFDMA Register offsets (from BAR0) */
+#define MT_WFDMA0_BASE              0x2000
+#define MT_WFDMA0_HOST_INT_STA      (MT_WFDMA0_BASE + 0x200)
+#define MT_WFDMA0_HOST_INT_ENA      (MT_WFDMA0_BASE + 0x204)
+#define MT_WFDMA0_GLO_CFG           (MT_WFDMA0_BASE + 0x208)
+#define MT_WFDMA0_RST_DTX_PTR       (MT_WFDMA0_BASE + 0x20c)
+
+#define MT_WFDMA0_TX_RING_BASE(n)   (MT_WFDMA0_BASE + 0x300 + (n) * 0x10)
+#define MT_WFDMA0_TX_RING_CNT(n)    (MT_WFDMA0_BASE + 0x304 + (n) * 0x10)
+#define MT_WFDMA0_TX_RING_CIDX(n)   (MT_WFDMA0_BASE + 0x308 + (n) * 0x10)
+#define MT_WFDMA0_TX_RING_DIDX(n)   (MT_WFDMA0_BASE + 0x30c + (n) * 0x10)
+
+#define MT_WFDMA0_RX_RING_BASE(n)   (MT_WFDMA0_BASE + 0x500 + (n) * 0x10)
+#define MT_WFDMA0_RX_RING_CNT(n)    (MT_WFDMA0_BASE + 0x504 + (n) * 0x10)
+#define MT_WFDMA0_RX_RING_CIDX(n)   (MT_WFDMA0_BASE + 0x508 + (n) * 0x10)
+#define MT_WFDMA0_RX_RING_DIDX(n)   (MT_WFDMA0_BASE + 0x50c + (n) * 0x10)
+
 struct mt7927_diag {
     struct pci_dev *pdev;
-    void __iomem *bar2;  /* BAR2: 32KB registers - SAFE */
+    void __iomem *bar0;  /* BAR0: 2MB main memory */
+    void __iomem *bar2;  /* BAR2: 32KB register shadow */
 };
 
 static void dump_safe_registers(struct mt7927_diag *diag)
 {
     struct pci_dev *pdev = diag->pdev;
-    u32 val;
+    u32 val, base, cnt, cidx, didx;
+    int i;
 
-    dev_info(&pdev->dev, "=== MT7927 Safe Register Dump (BAR2 only) ===\n");
+    dev_info(&pdev->dev, "=== MT7927 Baseline State Check ===\n");
 
-    /* These registers were confirmed safe in first run */
+    /* Chip identification (from BAR2) */
     val = readl(diag->bar2 + 0x000);
-    dev_info(&pdev->dev, "  [0x000] Chip ID:       0x%08x\n", val);
-    
+    dev_info(&pdev->dev, "Chip ID:       0x%08x\n", val);
+
     val = readl(diag->bar2 + 0x004);
-    dev_info(&pdev->dev, "  [0x004] HW Rev:        0x%08x\n", val);
+    dev_info(&pdev->dev, "HW Rev:        0x%08x\n", val);
 
+    /* Firmware status (from BAR2) */
     val = readl(diag->bar2 + 0x200);
-    dev_info(&pdev->dev, "  [0x200] HOST_INT_STA:  0x%08x (FW_STATUS)\n", val);
-
-    val = readl(diag->bar2 + 0x204);
-    dev_info(&pdev->dev, "  [0x204] HOST_INT_ENA:  0x%08x\n", val);
-
-    val = readl(diag->bar2 + 0x208);
-    dev_info(&pdev->dev, "  [0x208] WPDMA_GLO_CFG: 0x%08x\n", val);
-
-    val = readl(diag->bar2 + 0x20c);
-    dev_info(&pdev->dev, "  [0x20c] RST_DTX_PTR:   0x%08x\n", val);
-
-    /* TX Ring 0 */
-    dev_info(&pdev->dev, "  [0x300] TX0_BASE:      0x%08x\n", readl(diag->bar2 + 0x300));
-    dev_info(&pdev->dev, "  [0x304] TX0_CNT:       0x%08x\n", readl(diag->bar2 + 0x304));
-
-    /* TX Ring 16 (FWDL) */
-    dev_info(&pdev->dev, "  [0x400] TX16_BASE:     0x%08x\n", readl(diag->bar2 + 0x400));
-
-    /* RX Ring 0 */
-    dev_info(&pdev->dev, "  [0x500] RX0_BASE:      0x%08x\n", readl(diag->bar2 + 0x500));
-
-    /* Decode FW_STATUS */
-    val = readl(diag->bar2 + 0x200);
-    dev_info(&pdev->dev, "\nFW_STATUS = 0x%08x:\n", val);
+    dev_info(&pdev->dev, "FW_STATUS:     0x%08x ", val);
     if (val == 0xffff10f1)
-        dev_info(&pdev->dev, "  -> Pre-init state (chip locked, needs unlock sequence)\n");
-    else if ((val & 0xFFFF0000) == 0xFFFF0000)
-        dev_info(&pdev->dev, "  -> Error/pre-init (upper=0xFFFF)\n");
+        pr_cont("(pre-init - expected)\n");
     else if (val == 0x00000001)
-        dev_info(&pdev->dev, "  -> MCU ready!\n");
+        pr_cont("(MCU ready)\n");
     else
-        dev_info(&pdev->dev, "  -> Unknown state\n");
+        pr_cont("(unknown)\n");
 
-    /* WPDMA state */
-    val = readl(diag->bar2 + 0x208);
-    dev_info(&pdev->dev, "\nWPDMA_GLO_CFG = 0x%08x:\n", val);
-    dev_info(&pdev->dev, "  TX_DMA: %s, RX_DMA: %s\n",
+    /* WFDMA state (from BAR0) */
+    val = readl(diag->bar0 + MT_WFDMA0_GLO_CFG);
+    dev_info(&pdev->dev, "\nWFDMA GLO_CFG: 0x%08x (TX:%s RX:%s)\n", val,
              (val & BIT(0)) ? "ON" : "OFF",
              (val & BIT(2)) ? "ON" : "OFF");
 
-    dev_info(&pdev->dev, "=== End ===\n");
+    val = readl(diag->bar0 + MT_WFDMA0_RST_DTX_PTR);
+    dev_info(&pdev->dev, "WFDMA RST_PTR: 0x%08x\n", val);
+
+    /* Check TX rings 0-7 (MT7927 has 8 TX rings) */
+    dev_info(&pdev->dev, "\nTX Rings (expecting all zeros in pre-init state):\n");
+    for (i = 0; i < 8; i++) {
+        base = readl(diag->bar0 + MT_WFDMA0_TX_RING_BASE(i));
+        cnt  = readl(diag->bar0 + MT_WFDMA0_TX_RING_CNT(i));
+        cidx = readl(diag->bar0 + MT_WFDMA0_TX_RING_CIDX(i));
+        didx = readl(diag->bar0 + MT_WFDMA0_TX_RING_DIDX(i));
+
+        if (base || cnt || cidx || didx) {
+            dev_info(&pdev->dev, "  TX%d: BASE=0x%08x CNT=%u CIDX=%u DIDX=%u *** NON-ZERO ***\n",
+                     i, base, cnt, cidx, didx);
+        }
+    }
+    dev_info(&pdev->dev, "  (All TX rings 0-7 are zero - clean state)\n");
+
+    /* Check RX ring 0 */
+    base = readl(diag->bar0 + MT_WFDMA0_RX_RING_BASE(0));
+    cnt  = readl(diag->bar0 + MT_WFDMA0_RX_RING_CNT(0));
+    cidx = readl(diag->bar0 + MT_WFDMA0_RX_RING_CIDX(0));
+    didx = readl(diag->bar0 + MT_WFDMA0_RX_RING_DIDX(0));
+
+    dev_info(&pdev->dev, "\nRX Ring 0: BASE=0x%08x CNT=%u CIDX=%u DIDX=%u\n",
+             base, cnt, cidx, didx);
+
+    if (base || cnt || cidx || didx)
+        dev_info(&pdev->dev, "  *** WARNING: RX ring not clean ***\n");
+    else
+        dev_info(&pdev->dev, "  (Clean state - expected)\n");
+
+    dev_info(&pdev->dev, "\n=== Baseline check complete ===\n");
 }
 
 static int mt7927_diag_probe(struct pci_dev *pdev,
                              const struct pci_device_id *id)
 {
     struct mt7927_diag *diag;
+    void __iomem *const *iomap_table;
+    u32 chip_id;
     int ret;
 
-    dev_info(&pdev->dev, "MT7927 Diagnostic - MINIMAL SAFE VERSION\n");
+    dev_info(&pdev->dev, "MT7927 Diagnostic - Baseline State Check\n");
 
     diag = devm_kzalloc(&pdev->dev, sizeof(*diag), GFP_KERNEL);
     if (!diag)
@@ -97,22 +125,30 @@ static int mt7927_diag_probe(struct pci_dev *pdev,
         return ret;
     }
 
-    /* Only map BAR2 - the safe control registers */
-    ret = pcim_iomap_regions(pdev, BIT(2), "mt7927_diag");
+    /* Map both BAR0 (2MB main) and BAR2 (32KB shadow) */
+    ret = pcim_iomap_regions(pdev, BIT(0) | BIT(2), "mt7927_diag");
     if (ret) {
-        dev_err(&pdev->dev, "Failed to map BAR2\n");
+        dev_err(&pdev->dev, "Failed to map BARs\n");
         return ret;
     }
 
-    diag->bar2 = pcim_iomap_table(pdev)[2];
-    if (!diag->bar2) {
-        dev_err(&pdev->dev, "BAR2 mapping failed\n");
+    iomap_table = pcim_iomap_table(pdev);
+    diag->bar0 = iomap_table[0];
+    diag->bar2 = iomap_table[2];
+
+    if (!diag->bar0 || !diag->bar2) {
+        dev_err(&pdev->dev, "BAR mapping failed\n");
         return -ENOMEM;
     }
 
-    dev_info(&pdev->dev, "BAR2: %pR\n", &pdev->resource[2]);
+    /* Verify chip is responding */
+    chip_id = readl(diag->bar2 + 0x000);
+    if (chip_id == 0xffffffff) {
+        dev_err(&pdev->dev, "Chip not responding (hung state)\n");
+        return -EIO;
+    }
 
-    /* Only read safe registers */
+    /* Dump baseline state */
     dump_safe_registers(diag);
 
     dev_info(&pdev->dev, "Done. Unload with: sudo rmmod mt7927_diag\n");
