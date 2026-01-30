@@ -196,6 +196,74 @@ sudo setpci -s 01:00.0 CAP_EXP+10.w=0x0000
 
 See AGENTS.md for detailed history of all 8+ phases of attempts and DEVELOPMENT_LOG.md for complete investigation record.
 
+## Recent Fixes: test_fw_load.c (2026-01-30)
+
+The test module `tests/05_dma_impl/test_fw_load.c` had several critical bugs that caused kernel crashes. All fixes have been applied:
+
+### 1. Wrong BAR Mapping (Caused Kernel Oops)
+**Symptom**: Page fault at address `ffffccbb878f0010` in `remap_write+0x42/0x60`
+
+**Root Cause**: Module mapped BAR2 (32KB) but tried to access MT_HIF_REMAP_L1 at offset 0x155024 (~1.3MB)
+
+**Fix**:
+```c
+// Before (WRONG):
+ret = pcim_iomap_regions(pdev, BIT(2), "mt7927_test");
+dev->regs = pcim_iomap_table(pdev)[2];
+
+// After (CORRECT):
+ret = pcim_iomap_regions(pdev, BIT(0), "mt7927_test");
+dev->regs = pcim_iomap_table(pdev)[0];  /* Use BAR0 (2MB) */
+```
+
+### 2. Wrong WFDMA Register Offsets
+**Problem**: Registers were at BAR2-style offsets (0x02xx) instead of BAR0 offsets (0x22xx)
+
+**Fix**: Added proper base offset:
+```c
+#define MT_WFDMA0_BASE              0x2000
+#define MT_WFDMA0_GLO_CFG           (MT_WFDMA0_BASE + 0x208)
+#define MT_WFDMA0_HOST_INT_STA      (MT_WFDMA0_BASE + 0x200)
+#define MT_WFDMA0_TX_RING_BASE(n)   (MT_WFDMA0_BASE + 0x300 + (n) * 0x10)
+```
+
+### 3. Wrong FWDL Queue Index
+**Problem**: Used ring 16 (MT7925 style), but MT7927 only has rings 0-7
+
+**Fix**:
+```c
+// Before: #define FWDL_QUEUE_IDX 16
+// After:
+#define FWDL_QUEUE_IDX      4   /* MT7927 uses ring 4 for FWDL */
+```
+
+### 4. Incomplete Reset Check
+**Problem**: Only checked RST_B_EN (bit 0), but should also verify INIT_DONE (bit 4)
+
+**Fix**:
+```c
+#define MT_WFSYS_SW_INIT_DONE       BIT(4)
+
+// Check both bits:
+if ((val & (MT_WFSYS_SW_RST_B_EN | MT_WFSYS_SW_INIT_DONE)) ==
+    (MT_WFSYS_SW_RST_B_EN | MT_WFSYS_SW_INIT_DONE)) {
+```
+
+### 5. Added Safety Checks
+**Added**: Chip ID validation after BAR mapping to catch hung chip early:
+```c
+u32 chip_id = readl(dev->regs + 0x0000);
+if (chip_id == 0xffffffff) {
+    dev_err(&pdev->dev, "Chip not responding (0xffffffff)\n");
+    return -EIO;
+}
+```
+
+### Testing After Fixes
+1. Disable ASPM L1 first: `sudo setpci -s $DEVICE CAP_EXP+10.w=0x0000`
+2. Load module: `sudo insmod tests/05_dma_impl/test_fw_load.ko`
+3. Check output: `sudo dmesg | tail -40`
+
 ## Code Style and Conventions
 
 ### Kernel Module Coding

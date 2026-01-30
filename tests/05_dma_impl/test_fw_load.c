@@ -17,12 +17,13 @@
 #define FW_RAM   "mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin"
 #define FW_PATCH "mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin"
 
-/* Key registers */
-#define MT_WFDMA0_GLO_CFG           0x0208
-#define MT_WFDMA0_HOST_INT_STA      0x0200
-#define MT_WFDMA0_HOST_INT_ENA      0x0204
-#define MT_WFDMA0_RST_DTX_PTR       0x020c
-#define MT_WFDMA0_TX_RING_BASE(n)   (0x0300 + (n) * 0x10)
+/* Key registers - BAR0 offsets (WFDMA at BAR0+0x2000) */
+#define MT_WFDMA0_BASE              0x2000
+#define MT_WFDMA0_GLO_CFG           (MT_WFDMA0_BASE + 0x208)
+#define MT_WFDMA0_HOST_INT_STA      (MT_WFDMA0_BASE + 0x200)
+#define MT_WFDMA0_HOST_INT_ENA      (MT_WFDMA0_BASE + 0x204)
+#define MT_WFDMA0_RST_DTX_PTR       (MT_WFDMA0_BASE + 0x20c)
+#define MT_WFDMA0_TX_RING_BASE(n)   (MT_WFDMA0_BASE + 0x300 + (n) * 0x10)
 
 #define MT_HIF_REMAP_L1             0x155024
 #define MT_HIF_REMAP_L1_MASK        GENMASK(31, 16)
@@ -34,6 +35,7 @@
 
 #define MT_WFSYS_SW_RST_B           0x7c000140
 #define MT_WFSYS_SW_RST_B_EN        BIT(0)
+#define MT_WFSYS_SW_INIT_DONE       BIT(4)
 
 /* DMA descriptor */
 struct test_desc {
@@ -43,7 +45,7 @@ struct test_desc {
     __le32 info;
 } __packed;
 
-#define FWDL_QUEUE_IDX      16
+#define FWDL_QUEUE_IDX      4   /* MT7927 uses ring 4 for FWDL, not 16 */
 #define FWDL_RING_SIZE      128
 #define FW_CHUNK_SIZE       (64 * 1024)
 
@@ -105,23 +107,37 @@ static int setup_power_control(struct test_dev *dev)
 
     dev_info(&dev->pdev->dev, "Setting up power control...\n");
 
-    /* Give control to firmware first */
-    remap_write(dev, MT_CONN_ON_LPCTL, MT_CONN_ON_LPCTL_FW_OWN);
+    /* Read initial state */
+    val = remap_read(dev, MT_CONN_ON_LPCTL);
+    dev_info(&dev->pdev->dev, "  LPCTL initial: 0x%08x\n", val);
+
+    /* Give control to firmware first (SET_OWN = BIT 0) */
+    dev_info(&dev->pdev->dev, "  Writing SET_OWN (0x%x) to give FW control\n",
+             MT_CONN_ON_LPCTL_HOST_OWN);
+    remap_write(dev, MT_CONN_ON_LPCTL, MT_CONN_ON_LPCTL_HOST_OWN);
     msleep(10);
 
-    /* Take control back for driver */
-    remap_write(dev, MT_CONN_ON_LPCTL, MT_CONN_ON_LPCTL_HOST_OWN);
+    val = remap_read(dev, MT_CONN_ON_LPCTL);
+    dev_info(&dev->pdev->dev, "  LPCTL after SET_OWN: 0x%08x\n", val);
 
+    /* Take control back for driver (CLR_OWN = BIT 1) */
+    dev_info(&dev->pdev->dev, "  Writing CLR_OWN (0x%x) to claim driver control\n",
+             MT_CONN_ON_LPCTL_FW_OWN);
+    remap_write(dev, MT_CONN_ON_LPCTL, MT_CONN_ON_LPCTL_FW_OWN);
+
+    /* Wait for OWN_SYNC (BIT 2) to clear */
     for (i = 0; i < 200; i++) {
         val = remap_read(dev, MT_CONN_ON_LPCTL);
-        if (!(val & MT_CONN_ON_LPCTL_FW_OWN)) {
-            dev_info(&dev->pdev->dev, "  Driver control acquired\n");
+        if (!(val & BIT(2))) {  /* OWN_SYNC clear = driver owns */
+            dev_info(&dev->pdev->dev, "  Driver control acquired (0x%08x)\n", val);
             return 0;
         }
+        if (i == 0 || i == 10 || i == 50)
+            dev_info(&dev->pdev->dev, "  Waiting... LPCTL=0x%08x (iter %d)\n", val, i);
         msleep(10);
     }
 
-    dev_warn(&dev->pdev->dev, "  Power control timeout\n");
+    dev_warn(&dev->pdev->dev, "  Power control timeout (LPCTL=0x%08x)\n", val);
     return -ETIMEDOUT;
 }
 
@@ -144,8 +160,10 @@ static int reset_wfsys(struct test_dev *dev)
 
     for (i = 0; i < 100; i++) {
         val = remap_read(dev, MT_WFSYS_SW_RST_B);
-        if (val & MT_WFSYS_SW_RST_B_EN) {
-            dev_info(&dev->pdev->dev, "  Reset complete\n");
+        /* Wait for both RST_B_EN and INIT_DONE */
+        if ((val & (MT_WFSYS_SW_RST_B_EN | MT_WFSYS_SW_INIT_DONE)) ==
+            (MT_WFSYS_SW_RST_B_EN | MT_WFSYS_SW_INIT_DONE)) {
+            dev_info(&dev->pdev->dev, "  Reset complete (0x%08x)\n", val);
             return 0;
         }
         msleep(10);
@@ -157,7 +175,14 @@ static int reset_wfsys(struct test_dev *dev)
 
 static int setup_dma(struct test_dev *dev)
 {
+    u32 ring_base_reg;
+
     dev_info(&dev->pdev->dev, "Setting up DMA...\n");
+    dev_info(&dev->pdev->dev, "  Using TX ring %d for FWDL\n", FWDL_QUEUE_IDX);
+
+    /* Read current GLO_CFG state */
+    dev_info(&dev->pdev->dev, "  GLO_CFG before: 0x%08x (at offset 0x%x)\n",
+             readl(dev->regs + MT_WFDMA0_GLO_CFG), MT_WFDMA0_GLO_CFG);
 
     /* Allocate FWDL ring */
     dev->ring = dma_alloc_coherent(&dev->pdev->dev,
@@ -169,6 +194,8 @@ static int setup_dma(struct test_dev *dev)
     }
     memset(dev->ring, 0, FWDL_RING_SIZE * sizeof(struct test_desc));
     dev->head = 0;
+    dev_info(&dev->pdev->dev, "  Ring allocated at DMA 0x%llx\n",
+             (unsigned long long)dev->ring_dma);
 
     /* Allocate firmware buffer */
     dev->fw_buf = dma_alloc_coherent(&dev->pdev->dev, FW_CHUNK_SIZE,
@@ -179,21 +206,31 @@ static int setup_dma(struct test_dev *dev)
     }
 
     /* Reset DMA pointers */
+    dev_info(&dev->pdev->dev, "  Resetting DMA pointers (RST_DTX_PTR at 0x%x)\n",
+             MT_WFDMA0_RST_DTX_PTR);
     writel(0xffffffff, dev->regs + MT_WFDMA0_RST_DTX_PTR);
     wmb();
     msleep(10);
 
     /* Configure FWDL ring */
-    writel(lower_32_bits(dev->ring_dma),
-           dev->regs + MT_WFDMA0_TX_RING_BASE(FWDL_QUEUE_IDX));
-    writel(upper_32_bits(dev->ring_dma),
-           dev->regs + MT_WFDMA0_TX_RING_BASE(FWDL_QUEUE_IDX) + 4);
-    writel(FWDL_RING_SIZE,
-           dev->regs + MT_WFDMA0_TX_RING_BASE(FWDL_QUEUE_IDX) + 8);
-    writel(0, dev->regs + MT_WFDMA0_TX_RING_BASE(FWDL_QUEUE_IDX) + 12);
+    ring_base_reg = MT_WFDMA0_TX_RING_BASE(FWDL_QUEUE_IDX);
+    dev_info(&dev->pdev->dev, "  Configuring ring at offset 0x%x\n", ring_base_reg);
+
+    writel(lower_32_bits(dev->ring_dma), dev->regs + ring_base_reg);
+    writel(upper_32_bits(dev->ring_dma), dev->regs + ring_base_reg + 4);
+    writel(FWDL_RING_SIZE, dev->regs + ring_base_reg + 8);
+    writel(0, dev->regs + ring_base_reg + 12);
     wmb();
 
-    /* Enable DMA */
+    /* Verify ring config was written */
+    dev_info(&dev->pdev->dev, "  Ring readback: BASE=0x%08x, CNT=%d, CIDX=%d\n",
+             readl(dev->regs + ring_base_reg),
+             readl(dev->regs + ring_base_reg + 8),
+             readl(dev->regs + ring_base_reg + 12));
+
+    /* Enable DMA: TX_DMA_EN | RX_DMA_EN | TX_WB_DDONE */
+    dev_info(&dev->pdev->dev, "  Enabling DMA (writing 0x%x to GLO_CFG)\n",
+             BIT(0) | BIT(2) | BIT(6));
     writel(BIT(0) | BIT(2) | BIT(6), dev->regs + MT_WFDMA0_GLO_CFG);
     wmb();
 
@@ -250,12 +287,31 @@ static int test_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (ret)
         goto err_free;
 
-    ret = pcim_iomap_regions(pdev, BIT(2), "mt7927_test");
+    ret = pcim_iomap_regions(pdev, BIT(0), "mt7927_test");
     if (ret)
         goto err_free;
 
-    dev->regs = pcim_iomap_table(pdev)[2];
+    dev->regs = pcim_iomap_table(pdev)[0];  /* Use BAR0 (2MB) for remap access */
+    if (!dev->regs) {
+        dev_err(&pdev->dev, "Failed to map BAR0\n");
+        ret = -ENOMEM;
+        goto err_free;
+    }
+
     pci_set_master(pdev);
+
+    /* Safety check: verify we can read a known register */
+    {
+        u32 chip_id = readl(dev->regs + 0x0000);
+        u32 hw_rev = readl(dev->regs + 0x0004);
+        dev_info(&pdev->dev, "BAR0 mapped, Chip ID: 0x%08x, HW Rev: 0x%08x\n",
+                 chip_id, hw_rev);
+        if (chip_id == 0xffffffff) {
+            dev_err(&pdev->dev, "Chip not responding (0xffffffff)\n");
+            ret = -EIO;
+            goto err_free;
+        }
+    }
 
     ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
     if (ret)
