@@ -421,6 +421,31 @@ iowrite32(value, dev->bar0 + offset);
 ### Adding Diagnostic Code
 Create test modules in `tests/05_dma_impl/` or `diag/` rather than modifying production driver. Test modules allow rapid iteration without risking production code stability.
 
+### Test Module Requirements
+
+**All test modules that perform DMA operations MUST:**
+1. Disable ASPM L0s and L1 early in probe, before any DMA operations:
+   ```c
+   pci_disable_link_state(pdev, PCIE_LINK_STATE_L0S | PCIE_LINK_STATE_L1);
+   ```
+2. Use BAR0 (2MB) for register access, NOT BAR2 (read-only shadow)
+3. Check for chip error state (0xffffffff) before proceeding
+
+**Before asking user to load any module, ALWAYS:**
+1. Run `make clean && make` (or appropriate target like `make tests`, `make diag`)
+2. Verify the .ko file was rebuilt with the latest changes
+3. Remind user to reboot if device state may be altered from previous tests
+
+Example pre-load sequence:
+```bash
+# Clean and rebuild
+make clean && make tests
+
+# Then load (after reboot if needed)
+sudo insmod tests/05_dma_impl/test_fw_load.ko
+sudo dmesg | tail -60
+```
+
 ### Comparing with MT7925 Reference
 The `reference/linux/drivers/net/wireless/mediatek/mt76/mt7925/` directory contains reference implementation. Key files:
 - `pci.c` - PCI initialization sequence
