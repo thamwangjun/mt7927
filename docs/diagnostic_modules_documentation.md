@@ -4,11 +4,90 @@ This document provides comprehensive documentation for all MT7927 diagnostic mod
 
 ## Table of Contents
 
-1. [Safe/Read-Only Diagnostic Modules](#safe-read-only-diagnostic-modules)
-2. [Power Management & Initialization](#power-management--initialization)
-3. [DMA & Ring Testing](#dma--ring-testing)
-4. [Full Initialization Sequences](#full-initialization-sequences)
-5. [Wide Scanning (Dangerous)](#wide-scanning-dangerous)
+1. [Pre-Flight Checks](#pre-flight-checks)
+2. [Safe/Read-Only Diagnostic Modules](#safe-read-only-diagnostic-modules)
+3. [Power Management & Initialization](#power-management--initialization)
+4. [DMA & Ring Testing](#dma--ring-testing)
+5. [Full Initialization Sequences](#full-initialization-sequences)
+6. [Wide Scanning (Dangerous)](#wide-scanning-dangerous)
+
+---
+
+## Pre-Flight Checks
+
+### mt7927_fw_precheck.c - Firmware Pre-Load Diagnostic
+
+**Purpose:** Comprehensive diagnostic that validates all assumptions documented in `docs/` that are required for successful firmware loading onto the MT7927 device. This should be run BEFORE attempting firmware loading to ensure the device is in the expected state.
+
+**Key Functions:**
+- `check_chip_identity()`: Validates Chip ID = 0x00511163
+- `check_bar_config()`: Validates BAR0 = 2MB, BAR2 = 32KB
+- `check_ring_config()`: Validates MT6639 sparse ring layout (0,1,2,15,16)
+- `check_power_management()`: Reads LPCTL state and ownership bits
+- `check_wfsys_state()`: Checks WFSYS reset and INIT_DONE status
+- `check_mcu_state()`: **CRITICAL** - Checks MCU IDLE state (0x1D1E)
+- `check_conninfra_state()`: Validates CONN_INFRA version
+- `check_aspm_state()`: Reports ASPM L0s/L1 configuration
+- `check_wfdma_state()`: Reports WFDMA DMA engine state
+
+**Assumptions Validated (from docs/):**
+
+| Assumption | Reference | Expected Value |
+|------------|-----------|----------------|
+| Chip ID | CLAUDE.md, ROADMAP.md | 0x00511163 |
+| BAR0 Size | HARDWARE.md | 2MB (0x200000) |
+| BAR2 Size | HARDWARE.md | 32KB (0x8000) |
+| MCU IDLE State | ZOUYONGHAO_ANALYSIS.md | 0x1D1E at 0x81021604 |
+| CONN_INFRA Version | ZOUYONGHAO_ANALYSIS.md | 0x03010002 |
+| Ring 15 | MT6639_ANALYSIS.md | MCU_WM commands |
+| Ring 16 | MT6639_ANALYSIS.md | FWDL firmware download |
+
+**Registers/Memory Accessed:**
+- **BAR0:** WFDMA registers at 0x2000, remap registers at 0x155024
+- **BAR2:** Chip ID at 0x000, HW Rev at 0x004
+- **Remapped:** LPCTL (0x7c060010), WFSYS_SW_RST_B (0x7c000140), MCU_ROMCODE_INDEX (0x81021604), MCU_STATUS (0x7c060204), CONN_ON_MISC (0x7c0600f0), CONNINFRA_VERSION (0x7C011000)
+
+**Expected Output:**
+```
+╔══════════════════════════════════════════════════════════╗
+║           MT7927 Firmware Pre-Load Check Summary         ║
+╠══════════════════════════════════════════════════════════╣
+║  PASSED:   X / Y                                          ║
+║  FAILED:   X                                              ║
+║  WARNINGS: X                                              ║
+╠══════════════════════════════════════════════════════════╣
+║  Key Requirements for Firmware Loading:                  ║
+║  1. Chip ID = 0x00511163                                 ║
+║  2. MCU in IDLE state (0x1D1E at 0x81021604)             ║
+║  3. Use polling-based protocol (NO mailbox waits)        ║
+║  4. Ring 15=MCU_WM, Ring 16=FWDL (MT6639 config)         ║
+║  5. Disable ASPM L0s before DMA operations               ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+**Safety Considerations:**
+- ✅ **SAFE** - Only reads registers, no writes
+- ✅ No system crash risk
+- ✅ Should be run FIRST before any firmware loading attempts
+
+**Usage:**
+```bash
+# Build
+make diag
+
+# Load pre-check module
+sudo insmod diag/mt7927_fw_precheck.ko
+sudo dmesg | tail -80
+
+# Review results, then unload
+sudo rmmod mt7927_fw_precheck
+```
+
+**Key Findings:**
+- MCU must be in IDLE state (0x1D1E) before firmware can be loaded
+- If MCU is not IDLE, WFSYS reset sequence is required
+- ASPM L0s should be disabled before DMA operations
+- Per zouyonghao analysis, ASPM L1 being enabled is acceptable
 
 ---
 

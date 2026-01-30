@@ -6,7 +6,7 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
 # Default target
-all: driver tests tools
+all: driver tests diag
 
 # Driver module
 driver:
@@ -16,7 +16,11 @@ driver:
 tests:
 	$(MAKE) -C $(KDIR) M=$(PWD)/tests modules
 
-# Tool modules
+# Diagnostic modules
+diag:
+	$(MAKE) -C $(KDIR) M=$(PWD)/diag modules
+
+# Tool modules (alias for tests)
 tools:
 	$(MAKE) -C $(KDIR) M=$(PWD)/tests modules
 
@@ -24,6 +28,7 @@ tools:
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD)/tests clean
 	$(MAKE) -C $(KDIR) M=$(PWD)/src clean
+	$(MAKE) -C $(KDIR) M=$(PWD)/diag clean
 	find . -name "*.log" -type f -delete
 	find . -name "*.o.cmd" -type f -delete
 	find . -name ".*.cmd" -type f -delete
@@ -106,4 +111,4 @@ setup:
 	@mkdir -p src docs tests/{01_safe_basic,02_safe_discovery,03_careful_write,04_risky_ops,05_danger_zone,tools} logs
 	@echo "✓ Directory structure created"
 
-.PHONY: all driver tests tools clean install check recover test-safe test-discovery help setup
+.PHONY: all driver tests diag tools clean install check recover test-safe test-discovery help setup
