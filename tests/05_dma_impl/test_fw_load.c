@@ -22,6 +22,7 @@
 #include <linux/firmware.h>
 #include <linux/dma-mapping.h>
 #include <linux/delay.h>
+#include <linux/sched.h>
 
 #define MT7927_VENDOR_ID        0x14c3
 #define MT7927_DEVICE_ID        0x7927
@@ -34,44 +35,150 @@
  * Register Definitions (from reference mt7927_regs.h)
  * ============================================================ */
 
-/* Remap registers (BAR0 offsets) */
-#define MT_HIF_REMAP_L1             0x155024
-#define MT_HIF_REMAP_L1_MASK        GENMASK(31, 16)
-#define MT_HIF_REMAP_BASE_L1        0x130000
-
-/* WFDMA registers (BAR0 offsets) */
-#define MT_WFDMA0_BASE              0x2000
+/* WFDMA registers (BAR0 offsets)
+ * CRITICAL: MT7927 WFDMA0 is at chip address 0x7C024000 (0x18024000 + CONN_INFRA_REMAPPING)
+ * From fixed_map_mt7927[]: { 0x7c020000, 0x0d0000, 0x0010000 }
+ * So 0x7C024000 maps to BAR0 offset 0x0d0000 + 0x4000 = 0x0d4000
+ *
+ * OLD WRONG VALUE: 0x2000 (from MT7921 which uses different mapping)
+ */
+#define MT_WFDMA0_BASE              0xd4000
 #define MT_WFDMA0_HOST_INT_STA      (MT_WFDMA0_BASE + 0x200)
 #define MT_WFDMA0_HOST_INT_ENA      (MT_WFDMA0_BASE + 0x204)
 #define MT_WFDMA0_GLO_CFG           (MT_WFDMA0_BASE + 0x208)
 #define MT_WFDMA0_RST_DTX_PTR       (MT_WFDMA0_BASE + 0x20c)
+
+/* DMA reset control - CRITICAL: Must reset before ring config works! */
+#define MT_WFDMA0_RST               (MT_WFDMA0_BASE + 0x100)
+#define MT_WFDMA0_RST_LOGIC_RST         BIT(4)
+#define MT_WFDMA0_RST_DMASHDL_ALL_RST   BIT(5)
+
+/* GLO_CFG extension for DMASHDL */
+#define MT_WFDMA0_GLO_CFG_EXT0      (MT_WFDMA0_BASE + 0x2b0)
+#define MT_WFDMA0_CSR_TX_DMASHDL_ENABLE BIT(6)
 
 #define MT_WFDMA0_TX_RING_BASE(n)   (MT_WFDMA0_BASE + 0x300 + (n) * 0x10)
 #define MT_WFDMA0_TX_RING_CNT(n)    (MT_WFDMA0_BASE + 0x304 + (n) * 0x10)
 #define MT_WFDMA0_TX_RING_CIDX(n)   (MT_WFDMA0_BASE + 0x308 + (n) * 0x10)
 #define MT_WFDMA0_TX_RING_DIDX(n)   (MT_WFDMA0_BASE + 0x30c + (n) * 0x10)
 
-/* GLO_CFG bits */
-#define MT_WFDMA0_GLO_CFG_TX_DMA_EN     BIT(0)
-#define MT_WFDMA0_GLO_CFG_RX_DMA_EN     BIT(2)
-#define MT_WFDMA0_GLO_CFG_TX_WB_DDONE   BIT(6)
+/* TX Ring EXT_CTRL (prefetch) registers - CRITICAL for rings 15/16!
+ * Without these configured, the higher rings don't work.
+ * From mt792x_regs.h: MT_WFDMA0(0x600 + n*4) for rings 0-6
+ * Rings 15/16 have dedicated offsets */
+#define MT_WFDMA0_TX_RING15_EXT_CTRL    (MT_WFDMA0_BASE + 0x63c)
+#define MT_WFDMA0_TX_RING16_EXT_CTRL    (MT_WFDMA0_BASE + 0x640)
 
-/* Key addresses accessed via remap (from mt7927_regs.h) */
-#define MT_CONN_ON_LPCTL                0x7c060010  /* Power management */
-#define MT_WFSYS_SW_RST_B               0x7c000140  /* WiFi subsystem reset */
-#define MT_MCU_ROMCODE_INDEX            0x81021604  /* MCU state */
-#define MT_MCU_STATUS                   0x7c060204  /* MCU status */
-#define MT_CONN_ON_MISC                 0x7c0600f0  /* MCU ready */
+/* Prefetch configuration: PREFETCH(base, depth) = (base << 16) | depth
+ * For MT7927 (from mt792x_dma.c):
+ *   Ring 15: PREFETCH(0x0500, 0x4) = 0x05000004
+ *   Ring 16: PREFETCH(0x0540, 0x4) = 0x05400004
+ */
+#define PREFETCH_RING15                 0x05000004
+#define PREFETCH_RING16                 0x05400004
 
-/* CONN_INFRA registers */
-#define MT_CONNINFRA_WAKEUP             0x7C0601A0  /* CONN_INFRA wakeup */
-#define MT_CONNINFRA_VERSION            0x7C011000  /* Version */
-#define MT_WF_SUBSYS_RST                0x70028600  /* WiFi subsystem reset */
-#define MT_CRYPTO_MCU_OWN               0x70025380  /* Crypto MCU ownership */
+/* GLO_CFG bits - need more than just TX/RX enable! */
+#define MT_WFDMA0_GLO_CFG_TX_DMA_EN             BIT(0)
+#define MT_WFDMA0_GLO_CFG_RX_DMA_EN             BIT(2)
+#define MT_WFDMA0_GLO_CFG_TX_WB_DDONE           BIT(6)
+#define MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN    BIT(12)
+#define MT_WFDMA0_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN BIT(15)
+#define MT_WFDMA0_GLO_CFG_OMIT_TX_INFO          BIT(28)
+#define MT_WFDMA0_GLO_CFG_OMIT_RX_INFO_PFET2    BIT(21)
+
+/*
+ * Key register addresses - DIRECT BAR0 OFFSETS from zouyonghao's fixed_map_mt7927[]
+ * These are calculated from the fixed_map entries, NOT using L1 remap.
+ *
+ * Fixed map format: { high_addr, bar0_offset, size }
+ * Translation: bar0_offset + (addr - high_addr_base)
+ *
+ * Key entries from zouyonghao/mt7925/pci.c fixed_map_mt7927[]:
+ *   { 0x81020000, 0x0c0000, 0x0010000 } - WF_TOP_MISC_ON (MCU_ROMCODE)
+ *   { 0x7c060000, 0x0e0000, 0x0010000 } - conn_host_csr_top (LPCTL, WAKEUP)
+ *   { 0x7c000000, 0x0f0000, 0x0010000 } - CONN_INFRA (AP2WF_BUS)
+ *   { 0x7c010000, 0x100000, 0x0010000 } - CONN_INFRA (VERSION)
+ *   { 0x70020000, 0x1f0000, 0x0010000 } - CB_INFRA (WF_RST, CRYPTO)
+ */
+
+/* From 0x7c060000 block (BAR0 + 0x0e0000) */
+#define MT_CONN_ON_LPCTL                0x0e0010    /* 0x7c060010: Power management */
+#define MT_MCU_STATUS                   0x0e0204    /* 0x7c060204: MCU status */
+#define MT_CONN_ON_MISC                 0x0e00f0    /* 0x7c0600f0: MCU ready */
+#define MT_CONNINFRA_WAKEUP             0x0e01a0    /* 0x7c0601a0: CONN_INFRA wakeup */
+
+/* From 0x7c000000 block (BAR0 + 0x0f0000) */
+#define MT_WFSYS_SW_RST_B               0x0f0140    /* 0x7c000140: WiFi subsystem reset (AP2WF) */
+
+/* From 0x7c010000 block (BAR0 + 0x100000) */
+#define MT_CONNINFRA_VERSION            0x101000    /* 0x7c011000: Version */
+
+/* From 0x81020000 block (BAR0 + 0x0c0000) */
+#define MT_MCU_ROMCODE_INDEX            0x0c1604    /* 0x81021604: MCU state */
+
+/* NOTE: Addresses in 0x70xxxxxx range require L1 remap - see CHIP_* definitions below */
 
 /* Expected values */
 #define MCU_IDLE                        0x1D1E
 #define CONNINFRA_VERSION_OK            0x03010002
+
+/* PCIE2AP Remap - CRITICAL for PCIe to MCU communication
+ * From fixed_map_mt7927[]: { 0x7c020000, 0x0d0000, 0x0010000 }
+ * So 0x7C021034 = 0x7c020000 + 0x1034 → BAR0 0x0d0000 + 0x1034 = 0x0d1034
+ */
+#define CONN_BUS_CR_VON_PCIE2AP_REMAP_WF_1_BA           0x0d1034    /* BAR0 offset for 0x7C021034 */
+#define MT7927_PCIE2AP_REMAP_WF_1_BA_VALUE              0x18051803
+
+/* WFDMA Extension Registers - all in 0x7c020000 block → BAR0 0x0d0000
+ * 0x7C027xxx = BAR0 0x0d7xxx
+ * 0x7C024xxx = BAR0 0x0d4xxx
+ */
+#define MT_WFDMA_HOST_CONFIG                            0x0d7030    /* 0x7C027030 */
+#define MT_WFDMA_MSI_INT_CFG0                           0x0d70F0    /* 0x7C0270F0 */
+#define MT_WFDMA_MSI_INT_CFG1                           0x0d70F4    /* 0x7C0270F4 */
+#define MT_WFDMA_MSI_INT_CFG2                           0x0d70F8    /* 0x7C0270F8 */
+#define MT_WFDMA_MSI_INT_CFG3                           0x0d70FC    /* 0x7C0270FC */
+
+/* WFDMA Host DMA extension registers (0x7C024xxx → BAR0 0x0d4xxx) */
+#define MT_WFDMA_GLO_CFG_EXT1                           0x0d42B4    /* 0x7C0242B4 */
+#define MT_WFDMA_GLO_CFG_EXT2                           0x0d42B8    /* 0x7C0242B8 */
+
+/* MT7927 MSI configuration values (from MTK driver) */
+#define MT7927_MSI_NUM_SINGLE                           0
+#define MT7927_MSI_INT_CFG0_VALUE                       0x00660077
+#define MT7927_MSI_INT_CFG1_VALUE                       0x00001100
+#define MT7927_MSI_INT_CFG2_VALUE                       0x0030004F
+#define MT7927_MSI_INT_CFG3_VALUE                       0x00542200
+
+/* WFDMA flow control values */
+#define MT7927_WPDMA_GLO_CFG_EXT1_VALUE                 0x8C800404
+#define MT7927_WPDMA_GLO_CFG_EXT2_VALUE                 0x44
+
+/* L1 Remap registers (for 0x70xxxxxx addresses) */
+#define MT_HIF_REMAP_L1                 0x155024
+#define MT_HIF_REMAP_L1_MASK            GENMASK(31, 16)
+#define MT_HIF_REMAP_L1_OFFSET          GENMASK(15, 0)
+#define MT_HIF_REMAP_L1_BASE            GENMASK(31, 16)
+#define MT_HIF_REMAP_BASE_L1            0x130000
+
+/* Addresses requiring L1 remap (0x70xxxxxx range) */
+#define CHIP_GPIO_MODE5_ADDR            0x7000535c
+#define CHIP_GPIO_MODE6_ADDR            0x7000536c
+#define CHIP_BT_SUBSYS_RST_ADDR         0x70028610
+#define CHIP_WF_SUBSYS_RST_ADDR         0x70028600
+#define CHIP_CRYPTO_MCU_OWN_ADDR        0x70025380
+
+/* Reset sequence values from MTK mt6639 */
+#define WF_SUBSYS_RST_ASSERT            0x10351
+#define WF_SUBSYS_RST_DEASSERT          0x10340
+#define BT_SUBSYS_RST_ASSERT            0x10351
+#define BT_SUBSYS_RST_DEASSERT          0x10340
+#define GPIO_MODE5_VALUE                0x80000000
+#define GPIO_MODE6_VALUE                0x80
+
+/* WF_SUBSYS_RST bit fields for RMW */
+#define WF_SUBSYS_RST_WF_MASK           0x00000010
+#define WF_SUBSYS_RST_WF_SHFT           4
 
 /* LPCTL bits */
 #define MT_LPCTL_HOST_OWN               BIT(0)
@@ -82,9 +189,13 @@
 #define MT_WFSYS_SW_RST_B_EN            BIT(0)
 #define MT_WFSYS_SW_INIT_DONE           BIT(4)
 
-/* Ring configuration */
+/* Ring configuration - MT7927 uses BOTH rings per zouyonghao reference:
+ * - Ring 15 (MCU_WM): Init commands (PATCH_START_REQ, TARGET_ADDRESS_LEN_REQ, etc.)
+ * - Ring 16 (FWDL): Firmware data chunks (FW_SCATTER)
+ */
+#define MCU_WM_RING_IDX         15      /* Ring 15 for MCU commands */
 #define FWDL_RING_IDX           16      /* Ring 16 for firmware download */
-#define FWDL_RING_SIZE          128
+#define RING_SIZE               128
 #define FW_CHUNK_SIZE           4096    /* 4KB chunks like reference */
 
 /* DMA descriptor format */
@@ -201,12 +312,16 @@ struct mt7927_fw_trailer {
 struct test_dev {
 	struct pci_dev *pdev;
 	void __iomem *regs;         /* BAR0 mapping */
-	u32 backup_l1;              /* Backup for remap register */
 
-	/* FWDL ring */
-	struct mt7927_desc *ring;
-	dma_addr_t ring_dma;
-	int ring_head;
+	/* Ring 15 - MCU_WM (for init commands) */
+	struct mt7927_desc *mcu_ring;
+	dma_addr_t mcu_ring_dma;
+	int mcu_ring_head;
+
+	/* Ring 16 - FWDL (for firmware data) */
+	struct mt7927_desc *fwdl_ring;
+	dma_addr_t fwdl_ring_dma;
+	int fwdl_ring_head;
 
 	/* Data buffer for DMA */
 	void *dma_buf;
@@ -231,38 +346,73 @@ static void mt_wr(struct test_dev *dev, u32 offset, u32 val)
 	writel(val, dev->regs + offset);
 }
 
-/* Remap read for addresses above BAR0 direct range */
-static u32 remap_read(struct test_dev *dev, u32 addr)
+/*
+ * L1 Remap for addresses in 0x70xxxxxx range
+ * These addresses are NOT in fixed_map and require dynamic remapping.
+ *
+ * The L1 remap mechanism:
+ * 1. Write base (upper 16 bits of target addr) to MT_HIF_REMAP_L1 register
+ * 2. Access via MT_HIF_REMAP_BASE_L1 + offset (lower 16 bits)
+ */
+static u32 backup_l1 = 0;
+
+static u32 reg_map_l1(struct test_dev *dev, u32 addr)
 {
-	u32 offset = addr & 0xffff;
-	u32 base = (addr >> 16) & 0xffff;
+	u32 offset = FIELD_GET(MT_HIF_REMAP_L1_OFFSET, addr);
+	u32 base = FIELD_GET(MT_HIF_REMAP_L1_BASE, addr);
 	u32 val;
 
-	dev->backup_l1 = mt_rr(dev, MT_HIF_REMAP_L1);
-	mt_wr(dev, MT_HIF_REMAP_L1,
-	      (dev->backup_l1 & ~MT_HIF_REMAP_L1_MASK) | (base << 16));
-	mt_rr(dev, MT_HIF_REMAP_L1); /* flush */
+	/* Save current remap value */
+	backup_l1 = mt_rr(dev, MT_HIF_REMAP_L1);
 
-	val = readl(dev->regs + MT_HIF_REMAP_BASE_L1 + offset);
+	/* Set new remap base */
+	val = (backup_l1 & ~MT_HIF_REMAP_L1_MASK) |
+	      FIELD_PREP(MT_HIF_REMAP_L1_MASK, base);
+	mt_wr(dev, MT_HIF_REMAP_L1, val);
 
-	mt_wr(dev, MT_HIF_REMAP_L1, dev->backup_l1);
-	return val;
+	/* Read back to push write */
+	mt_rr(dev, MT_HIF_REMAP_L1);
+
+	return MT_HIF_REMAP_BASE_L1 + offset;
 }
 
-/* Remap write for addresses above BAR0 direct range */
-static void remap_write(struct test_dev *dev, u32 addr, u32 val)
+static void reg_remap_restore(struct test_dev *dev)
 {
-	u32 offset = addr & 0xffff;
-	u32 base = (addr >> 16) & 0xffff;
+	if (backup_l1) {
+		mt_wr(dev, MT_HIF_REMAP_L1, backup_l1);
+		backup_l1 = 0;
+	}
+}
 
-	dev->backup_l1 = mt_rr(dev, MT_HIF_REMAP_L1);
-	mt_wr(dev, MT_HIF_REMAP_L1,
-	      (dev->backup_l1 & ~MT_HIF_REMAP_L1_MASK) | (base << 16));
-	mt_rr(dev, MT_HIF_REMAP_L1); /* flush */
+/* Read/write with automatic L1 remap for 0x70xxxxxx addresses */
+static u32 mt_rr_remap(struct test_dev *dev, u32 addr)
+{
+	u32 val, mapped_addr;
 
-	writel(val, dev->regs + MT_HIF_REMAP_BASE_L1 + offset);
+	if (addr >= 0x70000000 && addr < 0x78000000) {
+		mapped_addr = reg_map_l1(dev, addr);
+		val = mt_rr(dev, mapped_addr);
+		reg_remap_restore(dev);
+		return val;
+	}
 
-	mt_wr(dev, MT_HIF_REMAP_L1, dev->backup_l1);
+	/* For fixed_map addresses, use direct access */
+	return mt_rr(dev, addr);
+}
+
+static void mt_wr_remap(struct test_dev *dev, u32 addr, u32 val)
+{
+	u32 mapped_addr;
+
+	if (addr >= 0x70000000 && addr < 0x78000000) {
+		mapped_addr = reg_map_l1(dev, addr);
+		mt_wr(dev, mapped_addr, val);
+		reg_remap_restore(dev);
+		return;
+	}
+
+	/* For fixed_map addresses, use direct access */
+	mt_wr(dev, addr, val);
 }
 
 /* ============================================================
@@ -272,8 +422,40 @@ static void remap_write(struct test_dev *dev, u32 addr, u32 val)
 static u8 mcu_seq = 0;
 
 /*
- * Send MCU command with proper TXD header
+ * TX cleanup - wait for ring to drain (DIDX catches up to head)
+ * Per zouyonghao: Called before AND after each chunk with force=true
+ *
+ * @ring_idx: Which ring to clean (MCU_WM_RING_IDX or FWDL_RING_IDX)
+ * @head: Current ring head position
+ * @flush: If true, wait longer and reset ring tracking
+ */
+static void tx_cleanup(struct test_dev *dev, int ring_idx, int head, bool flush)
+{
+	u32 didx;
+	int timeout = flush ? 200 : 50;
+
+	/* Wait for DMA to process all pending descriptors */
+	while (timeout-- > 0) {
+		didx = mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(ring_idx));
+		if (didx == head)
+			return;
+		usleep_range(50, 100);
+	}
+
+	/* If flush mode and still not caught up, reset the ring pointer */
+	if (flush) {
+		mt_wr(dev, MT_WFDMA0_RST_DTX_PTR, BIT(ring_idx));
+		wmb();
+		usleep_range(100, 200);
+	}
+}
+
+/*
+ * Send MCU command with proper TXD header via Ring 15 (MCU_WM)
  * Note: FW_SCATTER doesn't use TXD header, only init commands do
+ * Per zouyonghao: Init commands go to Ring 15, FW data goes to Ring 16
+ *
+ * Uses same aggressive cleanup pattern as send_fw_chunk
  */
 static int send_mcu_cmd(struct test_dev *dev, u8 cmd, const void *data, size_t len)
 {
@@ -289,6 +471,9 @@ static int send_mcu_cmd(struct test_dev *dev, u8 cmd, const void *data, size_t l
 		dev_err(&dev->pdev->dev, "MCU cmd too large: %zu\n", total_len);
 		return -EINVAL;
 	}
+
+	/* Step 1: Aggressive cleanup BEFORE sending (per zouyonghao) */
+	tx_cleanup(dev, MCU_WM_RING_IDX, dev->mcu_ring_head, true);
 
 	/* Increment sequence */
 	mcu_seq = (mcu_seq + 1) & 0xf;
@@ -320,9 +505,9 @@ static int send_mcu_cmd(struct test_dev *dev, u8 cmd, const void *data, size_t l
 
 	wmb();
 
-	/* Setup descriptor */
-	idx = dev->ring_head;
-	desc = &dev->ring[idx];
+	/* Setup descriptor on Ring 15 (MCU_WM) */
+	idx = dev->mcu_ring_head;
+	desc = &dev->mcu_ring[idx];
 
 	desc->buf0 = cpu_to_le32(lower_32_bits(dev->dma_buf_phys));
 	desc->buf1 = cpu_to_le32(upper_32_bits(dev->dma_buf_phys));
@@ -331,21 +516,29 @@ static int send_mcu_cmd(struct test_dev *dev, u8 cmd, const void *data, size_t l
 	desc->info = 0;
 	wmb();
 
-	/* Kick DMA */
-	dev->ring_head = (idx + 1) % FWDL_RING_SIZE;
-	mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX), dev->ring_head);
+	/* Kick DMA on Ring 15 */
+	dev->mcu_ring_head = (idx + 1) % RING_SIZE;
+	mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(MCU_WM_RING_IDX), dev->mcu_ring_head);
 	wmb();
 
 	/* Poll for completion - but don't wait for mailbox response */
 	timeout = 100;
 	while (timeout-- > 0) {
-		didx = mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(FWDL_RING_IDX));
-		if (didx == dev->ring_head)
-			return 0;
+		didx = mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(MCU_WM_RING_IDX));
+		if (didx == dev->mcu_ring_head)
+			break;
 		usleep_range(100, 200);
 	}
 
-	dev_dbg(&dev->pdev->dev, "  MCU cmd 0x%02x: DMA timeout (continuing)\n", cmd);
+	if (timeout <= 0)
+		dev_dbg(&dev->pdev->dev, "  MCU cmd 0x%02x on Ring 15: DMA timeout (continuing)\n", cmd);
+
+	/* Step 3: Aggressive cleanup AFTER sending (per zouyonghao) */
+	tx_cleanup(dev, MCU_WM_RING_IDX, dev->mcu_ring_head, true);
+
+	/* Step 4: Let other kernel threads run (per zouyonghao) */
+	cond_resched();
+
 	return 0; /* Continue anyway - ROM doesn't send responses */
 }
 
@@ -379,6 +572,68 @@ static int init_download(struct test_dev *dev, u32 addr, u32 len, u32 mode)
 }
 
 /* ============================================================
+ * Phase 0: MT7927 WiFi/BT Subsystem Reset (CRITICAL - must run first!)
+ * Reference: pci.c::mt7927_wfsys_reset()
+ *
+ * This resets the entire WiFi subsystem including WFDMA.
+ * Without this, WFDMA ring registers may not accept writes!
+ * ============================================================ */
+
+static int wfsys_reset(struct test_dev *dev)
+{
+	u32 val;
+
+	dev_info(&dev->pdev->dev, "=== Phase 0: WiFi/BT Subsystem Reset ===\n");
+
+	/* Step 1: GPIO mode configuration */
+	dev_info(&dev->pdev->dev, "  Setting GPIO mode registers...\n");
+	mt_wr_remap(dev, CHIP_GPIO_MODE5_ADDR, GPIO_MODE5_VALUE);
+	mt_wr_remap(dev, CHIP_GPIO_MODE6_ADDR, GPIO_MODE6_VALUE);
+	usleep_range(100, 200);
+
+	/* Step 2: BT subsystem reset */
+	dev_info(&dev->pdev->dev, "  Resetting BT subsystem...\n");
+	mt_wr_remap(dev, CHIP_BT_SUBSYS_RST_ADDR, BT_SUBSYS_RST_ASSERT);
+	msleep(10);
+	mt_wr_remap(dev, CHIP_BT_SUBSYS_RST_ADDR, BT_SUBSYS_RST_DEASSERT);
+	msleep(10);
+
+	/* Step 3: First WF subsystem reset */
+	dev_info(&dev->pdev->dev, "  Resetting WF subsystem (first pass)...\n");
+	mt_wr_remap(dev, CHIP_WF_SUBSYS_RST_ADDR, WF_SUBSYS_RST_ASSERT);
+	msleep(10);
+	mt_wr_remap(dev, CHIP_WF_SUBSYS_RST_ADDR, WF_SUBSYS_RST_DEASSERT);
+	msleep(50);
+
+	/* Step 4: Second WF reset (MTK RMW on bit 4 - exact mt6639 sequence) */
+	dev_info(&dev->pdev->dev, "  Resetting WF subsystem (second pass - RMW)...\n");
+
+	/* Read current value */
+	val = mt_rr_remap(dev, CHIP_WF_SUBSYS_RST_ADDR);
+	dev_info(&dev->pdev->dev, "    WF_SUBSYS_RST read: 0x%08x\n", val);
+
+	/* Assert reset: clear mask, then set bit */
+	val &= ~WF_SUBSYS_RST_WF_MASK;
+	val |= (1 << WF_SUBSYS_RST_WF_SHFT);
+	mt_wr_remap(dev, CHIP_WF_SUBSYS_RST_ADDR, val);
+	dev_info(&dev->pdev->dev, "    WF_SUBSYS_RST wrote: 0x%08x (assert)\n", val);
+	msleep(1);
+
+	/* Read again */
+	val = mt_rr_remap(dev, CHIP_WF_SUBSYS_RST_ADDR);
+	dev_info(&dev->pdev->dev, "    WF_SUBSYS_RST after 1ms: 0x%08x\n", val);
+
+	/* De-assert reset */
+	val &= ~WF_SUBSYS_RST_WF_MASK;
+	mt_wr_remap(dev, CHIP_WF_SUBSYS_RST_ADDR, val);
+	dev_info(&dev->pdev->dev, "    WF_SUBSYS_RST wrote: 0x%08x (de-assert)\n", val);
+	msleep(10);
+
+	dev_info(&dev->pdev->dev, "  WF/BT subsystem reset complete\n");
+	return 0;
+}
+
+/* ============================================================
  * Phase 1: CONN_INFRA Wakeup and MCU Initialization
  * Reference: pci_mcu.c::mt7927e_mcu_pre_init()
  * ============================================================ */
@@ -393,13 +648,13 @@ static int init_conninfra(struct test_dev *dev)
 	/* Step 1: Force CONN_INFRA wakeup */
 	dev_info(&dev->pdev->dev, "  Waking CONN_INFRA (0x%08x = 0x1)...\n",
 		 MT_CONNINFRA_WAKEUP);
-	remap_write(dev, MT_CONNINFRA_WAKEUP, 0x1);
+	mt_wr(dev, MT_CONNINFRA_WAKEUP, 0x1);
 	msleep(5);
 
 	/* Step 2: Poll for CONN_INFRA version */
 	dev_info(&dev->pdev->dev, "  Polling CONN_INFRA version...\n");
 	for (i = 0; i < 100; i++) {
-		val = remap_read(dev, MT_CONNINFRA_VERSION);
+		val = mt_rr(dev, MT_CONNINFRA_VERSION);
 		if (val == CONNINFRA_VERSION_OK || val == 0x03010001) {
 			dev_info(&dev->pdev->dev, "  CONN_INFRA version: 0x%08x (OK)\n", val);
 			break;
@@ -407,27 +662,22 @@ static int init_conninfra(struct test_dev *dev)
 		msleep(10);
 	}
 	if (i >= 100) {
-		val = remap_read(dev, MT_CONNINFRA_VERSION);
+		val = mt_rr(dev, MT_CONNINFRA_VERSION);
 		dev_warn(&dev->pdev->dev, "  CONN_INFRA version: 0x%08x (unexpected, continuing)\n", val);
 	}
 
-	/* Step 3: WiFi subsystem reset */
-	dev_info(&dev->pdev->dev, "  Performing WiFi subsystem reset...\n");
-	val = remap_read(dev, MT_WF_SUBSYS_RST);
-	remap_write(dev, MT_WF_SUBSYS_RST, val | BIT(0));  /* Assert */
-	msleep(5);
-	remap_write(dev, MT_WF_SUBSYS_RST, val & ~BIT(0)); /* Deassert */
-	msleep(10);
+	/* Step 3: WFSYS reset already done in Phase 0 - skip duplicate reset here
+	 * Per zouyonghao analysis: mt7927e_mcu_pre_init() only does single reset */
 
-	/* Step 4: Set Crypto MCU ownership */
+	/* Step 4: Set Crypto MCU ownership (via L1 remap) */
 	dev_info(&dev->pdev->dev, "  Setting Crypto MCU ownership...\n");
-	remap_write(dev, MT_CRYPTO_MCU_OWN, BIT(0));
+	mt_wr_remap(dev, CHIP_CRYPTO_MCU_OWN_ADDR, BIT(0));
 	msleep(5);
 
 	/* Step 5: Wait for MCU IDLE state */
 	dev_info(&dev->pdev->dev, "  Waiting for MCU IDLE (0x%04x)...\n", MCU_IDLE);
 	for (i = 0; i < 500; i++) {
-		val = remap_read(dev, MT_MCU_ROMCODE_INDEX);
+		val = mt_rr(dev, MT_MCU_ROMCODE_INDEX);
 		if ((val & 0xFFFF) == MCU_IDLE) {
 			dev_info(&dev->pdev->dev, "  MCU IDLE reached: 0x%08x\n", val);
 			return 0;
@@ -438,7 +688,7 @@ static int init_conninfra(struct test_dev *dev)
 		msleep(10);
 	}
 
-	val = remap_read(dev, MT_MCU_ROMCODE_INDEX);
+	val = mt_rr(dev, MT_MCU_ROMCODE_INDEX);
 	dev_err(&dev->pdev->dev, "  MCU IDLE timeout! State: 0x%08x\n", val);
 	return -ETIMEDOUT;
 }
@@ -454,16 +704,16 @@ static int claim_host_ownership(struct test_dev *dev)
 
 	dev_info(&dev->pdev->dev, "=== Phase 2: Claim Host Ownership ===\n");
 
-	val = remap_read(dev, MT_CONN_ON_LPCTL);
+	val = mt_rr(dev, MT_CONN_ON_LPCTL);
 	dev_info(&dev->pdev->dev, "  LPCTL initial: 0x%08x\n", val);
 
 	/* Write FW_OWN bit to claim host ownership */
-	remap_write(dev, MT_CONN_ON_LPCTL, MT_LPCTL_FW_OWN);
+	mt_wr(dev, MT_CONN_ON_LPCTL, MT_LPCTL_FW_OWN);
 	msleep(5);
 
 	/* Poll until OWN_SYNC clears */
 	for (i = 0; i < 100; i++) {
-		val = remap_read(dev, MT_CONN_ON_LPCTL);
+		val = mt_rr(dev, MT_CONN_ON_LPCTL);
 		if (!(val & MT_LPCTL_OWN_SYNC)) {
 			dev_info(&dev->pdev->dev, "  Host ownership claimed: 0x%08x\n", val);
 			return 0;
@@ -476,6 +726,51 @@ static int claim_host_ownership(struct test_dev *dev)
 }
 
 /* ============================================================
+ * Phase 2.5: PCIE2AP Remap and WFDMA Extension Configuration
+ * Reference: pci_mcu.c::mt7927e_mcu_init() lines 146-207
+ *
+ * CRITICAL: These settings enable proper PCIe to MCU communication
+ * and must be done BEFORE DMA ring setup.
+ * ============================================================ */
+
+static int configure_pcie_wfdma(struct test_dev *dev)
+{
+	u32 val;
+
+	dev_info(&dev->pdev->dev, "=== Phase 2.5: PCIE/WFDMA Configuration ===\n");
+
+	/* Step 1: Set PCIE2AP remap for MCU communication
+	 * This maps PCIe address space to MCU's address space
+	 * Register: 0x7C021034 (CONN_BUS_CR_VON + 0x34)
+	 * Value: 0x18051803
+	 */
+	dev_info(&dev->pdev->dev, "  Setting PCIE2AP remap for MCU communication...\n");
+	mt_wr(dev, CONN_BUS_CR_VON_PCIE2AP_REMAP_WF_1_BA, MT7927_PCIE2AP_REMAP_WF_1_BA_VALUE);
+	val = mt_rr(dev, CONN_BUS_CR_VON_PCIE2AP_REMAP_WF_1_BA);
+	dev_info(&dev->pdev->dev, "    PCIE2AP_REMAP_WF_1_BA = 0x%08x (expected 0x%08x)\n",
+		 val, MT7927_PCIE2AP_REMAP_WF_1_BA_VALUE);
+
+	/* Step 2: Configure WFDMA MSI (single MSI mode) */
+	dev_info(&dev->pdev->dev, "  Configuring WFDMA MSI...\n");
+	mt_wr(dev, MT_WFDMA_HOST_CONFIG, MT7927_MSI_NUM_SINGLE);
+	mt_wr(dev, MT_WFDMA_MSI_INT_CFG0, MT7927_MSI_INT_CFG0_VALUE);
+	mt_wr(dev, MT_WFDMA_MSI_INT_CFG1, MT7927_MSI_INT_CFG1_VALUE);
+	mt_wr(dev, MT_WFDMA_MSI_INT_CFG2, MT7927_MSI_INT_CFG2_VALUE);
+	mt_wr(dev, MT_WFDMA_MSI_INT_CFG3, MT7927_MSI_INT_CFG3_VALUE);
+	dev_info(&dev->pdev->dev, "    MSI_INT_CFG0-3 configured\n");
+
+	/* Step 3: Configure WFDMA extensions (TX flow control) */
+	dev_info(&dev->pdev->dev, "  Configuring WFDMA extensions...\n");
+	mt_wr(dev, MT_WFDMA_GLO_CFG_EXT1, MT7927_WPDMA_GLO_CFG_EXT1_VALUE);
+	mt_wr(dev, MT_WFDMA_GLO_CFG_EXT2, MT7927_WPDMA_GLO_CFG_EXT2_VALUE);
+	dev_info(&dev->pdev->dev, "    GLO_CFG_EXT1 = 0x%08x, EXT2 = 0x%08x\n",
+		 mt_rr(dev, MT_WFDMA_GLO_CFG_EXT1), mt_rr(dev, MT_WFDMA_GLO_CFG_EXT2));
+
+	dev_info(&dev->pdev->dev, "  PCIE/WFDMA configuration complete\n");
+	return 0;
+}
+
+/* ============================================================
  * Phase 3: DMA Ring Setup
  * ============================================================ */
 
@@ -484,20 +779,35 @@ static int setup_dma_ring(struct test_dev *dev)
 	u32 val;
 
 	dev_info(&dev->pdev->dev, "=== Phase 3: DMA Ring Setup ===\n");
+	dev_info(&dev->pdev->dev, "  Setting up Ring 15 (MCU_WM) and Ring 16 (FWDL)\n");
 
-	/* Allocate FWDL ring (ring 16) */
-	dev->ring = dma_alloc_coherent(&dev->pdev->dev,
-				       FWDL_RING_SIZE * sizeof(struct mt7927_desc),
-				       &dev->ring_dma, GFP_KERNEL);
-	if (!dev->ring) {
+	/* Allocate Ring 15 (MCU_WM) for init commands */
+	dev->mcu_ring = dma_alloc_coherent(&dev->pdev->dev,
+					   RING_SIZE * sizeof(struct mt7927_desc),
+					   &dev->mcu_ring_dma, GFP_KERNEL);
+	if (!dev->mcu_ring) {
+		dev_err(&dev->pdev->dev, "  Failed to allocate MCU ring\n");
+		return -ENOMEM;
+	}
+	memset(dev->mcu_ring, 0, RING_SIZE * sizeof(struct mt7927_desc));
+	dev->mcu_ring_head = 0;
+
+	dev_info(&dev->pdev->dev, "  Ring 15 (MCU_WM) allocated at DMA 0x%pad\n",
+		 &dev->mcu_ring_dma);
+
+	/* Allocate Ring 16 (FWDL) for firmware data */
+	dev->fwdl_ring = dma_alloc_coherent(&dev->pdev->dev,
+					    RING_SIZE * sizeof(struct mt7927_desc),
+					    &dev->fwdl_ring_dma, GFP_KERNEL);
+	if (!dev->fwdl_ring) {
 		dev_err(&dev->pdev->dev, "  Failed to allocate FWDL ring\n");
 		return -ENOMEM;
 	}
-	memset(dev->ring, 0, FWDL_RING_SIZE * sizeof(struct mt7927_desc));
-	dev->ring_head = 0;
+	memset(dev->fwdl_ring, 0, RING_SIZE * sizeof(struct mt7927_desc));
+	dev->fwdl_ring_head = 0;
 
-	dev_info(&dev->pdev->dev, "  FWDL ring allocated at DMA 0x%pad\n",
-		 &dev->ring_dma);
+	dev_info(&dev->pdev->dev, "  Ring 16 (FWDL) allocated at DMA 0x%pad\n",
+		 &dev->fwdl_ring_dma);
 
 	/* Allocate DMA buffer for firmware chunks */
 	dev->dma_buf = dma_alloc_coherent(&dev->pdev->dev, FW_CHUNK_SIZE,
@@ -507,20 +817,86 @@ static int setup_dma_ring(struct test_dev *dev)
 		return -ENOMEM;
 	}
 
-	/* Reset DMA pointers */
-	mt_wr(dev, MT_WFDMA0_RST_DTX_PTR, BIT(FWDL_RING_IDX));
+	/* =====================================================================
+	 * CRITICAL: DMA Reset Sequence (from mt792x_dma_disable)
+	 * The WFDMA hardware ignores ring register writes until properly reset!
+	 * ===================================================================== */
+	dev_info(&dev->pdev->dev, "  Step 1: Disable WFDMA TX/RX...\n");
+	val = mt_rr(dev, MT_WFDMA0_GLO_CFG);
+	dev_info(&dev->pdev->dev, "    GLO_CFG before: 0x%08x\n", val);
+	val &= ~(MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
+	mt_wr(dev, MT_WFDMA0_GLO_CFG, val);
+	wmb();
+	usleep_range(1000, 2000);
+	dev_info(&dev->pdev->dev, "    GLO_CFG after disable: 0x%08x\n",
+		 mt_rr(dev, MT_WFDMA0_GLO_CFG));
+
+	dev_info(&dev->pdev->dev, "  Step 2: Disable DMASHDL...\n");
+	val = mt_rr(dev, MT_WFDMA0_GLO_CFG_EXT0);
+	dev_info(&dev->pdev->dev, "    GLO_CFG_EXT0 before: 0x%08x\n", val);
+	val &= ~MT_WFDMA0_CSR_TX_DMASHDL_ENABLE;
+	mt_wr(dev, MT_WFDMA0_GLO_CFG_EXT0, val);
+	wmb();
+
+	dev_info(&dev->pdev->dev, "  Step 3: DMA Logic Reset (CRITICAL!)...\n");
+	val = mt_rr(dev, MT_WFDMA0_RST);
+	dev_info(&dev->pdev->dev, "    RST before: 0x%08x\n", val);
+
+	/* Assert reset: set reset bits */
+	val |= (MT_WFDMA0_RST_LOGIC_RST | MT_WFDMA0_RST_DMASHDL_ALL_RST);
+	mt_wr(dev, MT_WFDMA0_RST, val);
+	wmb();
+	usleep_range(1000, 2000);  /* Hold reset for 1-2ms */
+
+	/* Deassert reset: clear reset bits - THIS WAS MISSING! */
+	val &= ~(MT_WFDMA0_RST_LOGIC_RST | MT_WFDMA0_RST_DMASHDL_ALL_RST);
+	mt_wr(dev, MT_WFDMA0_RST, val);
+	wmb();
+	msleep(5);  /* Give hardware time to come out of reset */
+
+	dev_info(&dev->pdev->dev, "    RST after deassert: 0x%08x (should be 0x00)\n",
+		 mt_rr(dev, MT_WFDMA0_RST));
+
+	/* Step 4: Configure prefetch/EXT_CTRL for rings 15/16
+	 * From mt792x_dma.c: mt792x_dma_prefetch() */
+	dev_info(&dev->pdev->dev, "  Step 4: Configuring prefetch (EXT_CTRL)...\n");
+	mt_wr(dev, MT_WFDMA0_TX_RING15_EXT_CTRL, PREFETCH_RING15);
+	mt_wr(dev, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH_RING16);
+	wmb();
+	dev_info(&dev->pdev->dev, "    Ring 15 EXT_CTRL: 0x%08x (expected 0x%08x)\n",
+		 mt_rr(dev, MT_WFDMA0_TX_RING15_EXT_CTRL), PREFETCH_RING15);
+	dev_info(&dev->pdev->dev, "    Ring 16 EXT_CTRL: 0x%08x (expected 0x%08x)\n",
+		 mt_rr(dev, MT_WFDMA0_TX_RING16_EXT_CTRL), PREFETCH_RING16);
+
+	/* Step 5: Reset DMA pointers for ALL TX rings */
+	dev_info(&dev->pdev->dev, "  Step 5: Resetting DMA pointers...\n");
+	mt_wr(dev, MT_WFDMA0_RST_DTX_PTR, ~0U);
 	wmb();
 	msleep(5);
 
-	/* Configure ring 16 (FWDL) */
-	dev_info(&dev->pdev->dev, "  Configuring ring %d (FWDL)...\n", FWDL_RING_IDX);
-	mt_wr(dev, MT_WFDMA0_TX_RING_BASE(FWDL_RING_IDX), lower_32_bits(dev->ring_dma));
-	mt_wr(dev, MT_WFDMA0_TX_RING_BASE(FWDL_RING_IDX) + 4, upper_32_bits(dev->ring_dma));
-	mt_wr(dev, MT_WFDMA0_TX_RING_CNT(FWDL_RING_IDX), FWDL_RING_SIZE);
+	/* Configure Ring 15 (MCU_WM) */
+	dev_info(&dev->pdev->dev, "  Configuring Ring %d (MCU_WM)...\n", MCU_WM_RING_IDX);
+	mt_wr(dev, MT_WFDMA0_TX_RING_BASE(MCU_WM_RING_IDX), lower_32_bits(dev->mcu_ring_dma));
+	mt_wr(dev, MT_WFDMA0_TX_RING_BASE(MCU_WM_RING_IDX) + 4, upper_32_bits(dev->mcu_ring_dma));
+	mt_wr(dev, MT_WFDMA0_TX_RING_CNT(MCU_WM_RING_IDX), RING_SIZE);
+	mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(MCU_WM_RING_IDX), 0);
+	wmb();
+
+	val = mt_rr(dev, MT_WFDMA0_TX_RING_BASE(MCU_WM_RING_IDX));
+	dev_info(&dev->pdev->dev, "  Ring %d: BASE=0x%08x CNT=%d CIDX=%d DIDX=%d\n",
+		 MCU_WM_RING_IDX, val,
+		 mt_rr(dev, MT_WFDMA0_TX_RING_CNT(MCU_WM_RING_IDX)),
+		 mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(MCU_WM_RING_IDX)),
+		 mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(MCU_WM_RING_IDX)));
+
+	/* Configure Ring 16 (FWDL) */
+	dev_info(&dev->pdev->dev, "  Configuring Ring %d (FWDL)...\n", FWDL_RING_IDX);
+	mt_wr(dev, MT_WFDMA0_TX_RING_BASE(FWDL_RING_IDX), lower_32_bits(dev->fwdl_ring_dma));
+	mt_wr(dev, MT_WFDMA0_TX_RING_BASE(FWDL_RING_IDX) + 4, upper_32_bits(dev->fwdl_ring_dma));
+	mt_wr(dev, MT_WFDMA0_TX_RING_CNT(FWDL_RING_IDX), RING_SIZE);
 	mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX), 0);
 	wmb();
 
-	/* Verify ring configuration */
 	val = mt_rr(dev, MT_WFDMA0_TX_RING_BASE(FWDL_RING_IDX));
 	dev_info(&dev->pdev->dev, "  Ring %d: BASE=0x%08x CNT=%d CIDX=%d DIDX=%d\n",
 		 FWDL_RING_IDX, val,
@@ -528,9 +904,21 @@ static int setup_dma_ring(struct test_dev *dev)
 		 mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX)),
 		 mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(FWDL_RING_IDX)));
 
-	/* Enable DMA */
-	val = MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN |
-	      MT_WFDMA0_GLO_CFG_TX_WB_DDONE;
+	/* Enable DMA with full configuration (from mt792x_dma_enable)
+	 * Key bits:
+	 * - TX_DMA_EN, RX_DMA_EN: Enable DMA engines
+	 * - TX_WB_DDONE: Write back done status
+	 * - FIFO_LITTLE_ENDIAN: Correct byte order
+	 * - CSR_DISP_BASE_PTR_CHAIN_EN: Enable base pointer chaining (critical!)
+	 * - OMIT_TX_INFO, OMIT_RX_INFO_PFET2: Optimize transfers
+	 */
+	val = MT_WFDMA0_GLO_CFG_TX_DMA_EN |
+	      MT_WFDMA0_GLO_CFG_RX_DMA_EN |
+	      MT_WFDMA0_GLO_CFG_TX_WB_DDONE |
+	      MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN |
+	      MT_WFDMA0_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN |
+	      MT_WFDMA0_GLO_CFG_OMIT_TX_INFO |
+	      MT_WFDMA0_GLO_CFG_OMIT_RX_INFO_PFET2;
 	mt_wr(dev, MT_WFDMA0_GLO_CFG, val);
 	wmb();
 
@@ -547,6 +935,17 @@ static int setup_dma_ring(struct test_dev *dev)
  * KEY INSIGHT: No mailbox waits! Just send and poll for completion.
  * ============================================================ */
 
+/*
+ * Send firmware data chunk via Ring 16 (FWDL)
+ * Per zouyonghao: FW_SCATTER data goes to Ring 16, raw data without TXD header
+ *
+ * Key pattern from zouyonghao mt7927_fw_load.c:
+ * 1. Aggressive TX cleanup BEFORE sending (force=true)
+ * 2. Send the chunk
+ * 3. Aggressive TX cleanup AFTER sending (force=true)
+ * 4. cond_resched() to yield CPU
+ * 5. msleep(5) delay for ROM processing
+ */
 static int send_fw_chunk(struct test_dev *dev, const void *data, size_t len)
 {
 	struct mt7927_desc *desc;
@@ -560,13 +959,16 @@ static int send_fw_chunk(struct test_dev *dev, const void *data, size_t len)
 		return -EINVAL;
 	}
 
+	/* Step 1: Aggressive cleanup BEFORE sending (per zouyonghao) */
+	tx_cleanup(dev, FWDL_RING_IDX, dev->fwdl_ring_head, true);
+
 	/* Copy data to DMA buffer */
 	memcpy(dev->dma_buf, data, len);
 	wmb();
 
-	/* Setup descriptor */
-	idx = dev->ring_head;
-	desc = &dev->ring[idx];
+	/* Setup descriptor on Ring 16 (FWDL) */
+	idx = dev->fwdl_ring_head;
+	desc = &dev->fwdl_ring[idx];
 
 	desc->buf0 = cpu_to_le32(lower_32_bits(dev->dma_buf_phys));
 	desc->buf1 = cpu_to_le32(upper_32_bits(dev->dma_buf_phys));
@@ -575,26 +977,35 @@ static int send_fw_chunk(struct test_dev *dev, const void *data, size_t len)
 	desc->info = 0;
 	wmb();
 
-	/* Advance ring head and kick DMA */
-	dev->ring_head = (idx + 1) % FWDL_RING_SIZE;
-	mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX), dev->ring_head);
+	/* Advance ring head and kick DMA on Ring 16 */
+	dev->fwdl_ring_head = (idx + 1) % RING_SIZE;
+	mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX), dev->fwdl_ring_head);
 	wmb();
 
 	/* Poll for DMA completion (DIDX should advance) */
 	timeout = 100;
 	while (timeout-- > 0) {
 		didx = mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(FWDL_RING_IDX));
-		if (didx == dev->ring_head) {
-			/* DMA completed */
-			return 0;
-		}
+		if (didx == dev->fwdl_ring_head)
+			break;
 		usleep_range(100, 200);
 	}
 
-	dev_warn(&dev->pdev->dev, "  DMA completion timeout (CIDX=%d, DIDX=%d)\n",
-		 dev->ring_head, didx);
+	if (timeout <= 0) {
+		dev_warn(&dev->pdev->dev, "  Ring 16 DMA timeout (CIDX=%d, DIDX=%d)\n",
+			 dev->fwdl_ring_head, didx);
+		/* Per zouyonghao: Continue anyway, ROM may have processed it */
+	}
 
-	/* Per zouyonghao: Continue anyway, ROM may have processed it */
+	/* Step 3: Aggressive cleanup AFTER sending (per zouyonghao) */
+	tx_cleanup(dev, FWDL_RING_IDX, dev->fwdl_ring_head, true);
+
+	/* Step 4: Let other kernel threads run to free memory (per zouyonghao) */
+	cond_resched();
+
+	/* Step 5: Brief delay for ROM to process buffer (per zouyonghao) */
+	msleep(5);
+
 	return 0;
 }
 
@@ -765,7 +1176,7 @@ static int load_firmware(struct test_dev *dev)
 	dev_info(&dev->pdev->dev, "  NOTE: NO mailbox waits - MT7927 ROM doesn't support mailbox\n");
 
 	/* Check MCU status before loading */
-	mcu_status = remap_read(dev, MT_MCU_STATUS);
+	mcu_status = mt_rr(dev, MT_MCU_STATUS);
 	dev_info(&dev->pdev->dev, "  MCU status before: 0x%08x\n", mcu_status);
 
 	/* Load patch */
@@ -776,7 +1187,7 @@ static int load_firmware(struct test_dev *dev)
 		if (ret)
 			dev_warn(&dev->pdev->dev, "  Patch load returned: %d\n", ret);
 
-		mcu_status = remap_read(dev, MT_MCU_STATUS);
+		mcu_status = mt_rr(dev, MT_MCU_STATUS);
 		dev_info(&dev->pdev->dev, "  MCU status after patch: 0x%08x\n", mcu_status);
 	}
 
@@ -797,19 +1208,19 @@ static int load_firmware(struct test_dev *dev)
 	dev_info(&dev->pdev->dev, "  Setting SW_INIT_DONE bit...\n");
 
 	{
-		u32 ap2wf = remap_read(dev, MT_WFSYS_SW_RST_B);
-		remap_write(dev, MT_WFSYS_SW_RST_B, ap2wf | MT_WFSYS_SW_INIT_DONE);
+		u32 ap2wf = mt_rr(dev, MT_WFSYS_SW_RST_B);
+		mt_wr(dev, MT_WFSYS_SW_RST_B, ap2wf | MT_WFSYS_SW_INIT_DONE);
 		dev_info(&dev->pdev->dev, "  AP2WF: 0x%08x -> 0x%08x\n",
-			 ap2wf, remap_read(dev, MT_WFSYS_SW_RST_B));
+			 ap2wf, mt_rr(dev, MT_WFSYS_SW_RST_B));
 	}
 
 	/* Check final MCU status */
 	msleep(100);
-	mcu_status = remap_read(dev, MT_MCU_STATUS);
+	mcu_status = mt_rr(dev, MT_MCU_STATUS);
 	dev_info(&dev->pdev->dev, "  MCU status after load: 0x%08x\n", mcu_status);
 
 	{
-		u32 mcu_ready = remap_read(dev, MT_CONN_ON_MISC);
+		u32 mcu_ready = mt_rr(dev, MT_CONN_ON_MISC);
 		dev_info(&dev->pdev->dev, "  MCU ready (CONN_ON_MISC): 0x%08x\n", mcu_ready);
 	}
 
@@ -896,6 +1307,14 @@ static int test_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 	dev_info(&pdev->dev, "  RAM: %s (%zu bytes)\n", FW_RAM, dev->fw_ram->size);
 
+	/* Phase 0: MT7927 WiFi/BT subsystem reset - CRITICAL, must run first!
+	 * This enables WFDMA ring register writes. */
+	ret = wfsys_reset(dev);
+	if (ret) {
+		dev_err(&pdev->dev, "WFSYS reset failed: %d\n", ret);
+		/* Continue anyway */
+	}
+
 	/* Phase 1: Initialize CONN_INFRA and wait for MCU IDLE */
 	ret = init_conninfra(dev);
 	if (ret) {
@@ -907,6 +1326,13 @@ static int test_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = claim_host_ownership(dev);
 	if (ret) {
 		dev_warn(&pdev->dev, "Host ownership claim issue: %d\n", ret);
+	}
+
+	/* Phase 2.5: PCIE2AP remap and WFDMA extension configuration
+	 * CRITICAL: Must be done before DMA ring setup */
+	ret = configure_pcie_wfdma(dev);
+	if (ret) {
+		dev_warn(&pdev->dev, "PCIE/WFDMA config issue: %d\n", ret);
 	}
 
 	/* Phase 3: Setup DMA ring */
@@ -929,7 +1355,10 @@ static int test_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	dev_info(&pdev->dev, "+----------------------------------------------------------+\n");
 	dev_info(&pdev->dev, "  WFDMA GLO_CFG: 0x%08x\n", mt_rr(dev, MT_WFDMA0_GLO_CFG));
 	dev_info(&pdev->dev, "  WFDMA INT_STA: 0x%08x\n", mt_rr(dev, MT_WFDMA0_HOST_INT_STA));
-	dev_info(&pdev->dev, "  Ring %d CIDX/DIDX: %d/%d\n", FWDL_RING_IDX,
+	dev_info(&pdev->dev, "  Ring %d (MCU_WM) CIDX/DIDX: %d/%d\n", MCU_WM_RING_IDX,
+		 mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(MCU_WM_RING_IDX)),
+		 mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(MCU_WM_RING_IDX)));
+	dev_info(&pdev->dev, "  Ring %d (FWDL) CIDX/DIDX: %d/%d\n", FWDL_RING_IDX,
 		 mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX)),
 		 mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(FWDL_RING_IDX)));
 	dev_info(&pdev->dev, "\n");
@@ -959,10 +1388,15 @@ static void test_remove(struct pci_dev *pdev)
 		dma_free_coherent(&pdev->dev, FW_CHUNK_SIZE,
 				  dev->dma_buf, dev->dma_buf_phys);
 
-	if (dev->ring)
+	if (dev->mcu_ring)
 		dma_free_coherent(&pdev->dev,
-				  FWDL_RING_SIZE * sizeof(struct mt7927_desc),
-				  dev->ring, dev->ring_dma);
+				  RING_SIZE * sizeof(struct mt7927_desc),
+				  dev->mcu_ring, dev->mcu_ring_dma);
+
+	if (dev->fwdl_ring)
+		dma_free_coherent(&pdev->dev,
+				  RING_SIZE * sizeof(struct mt7927_desc),
+				  dev->fwdl_ring, dev->fwdl_ring_dma);
 
 	/* Release firmware */
 	release_firmware(dev->fw_ram);
