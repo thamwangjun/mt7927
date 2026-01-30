@@ -45,7 +45,10 @@ struct test_desc {
     __le32 info;
 } __packed;
 
-#define FWDL_QUEUE_IDX      4   /* MT7927 uses ring 4 for FWDL, not 16 */
+/* Ring assignments: Using 15/16 to match MT7925 (shared firmware)
+ * Fallback: If rings 15/16 don't work, change to 4/5 */
+#define MCU_WM_QUEUE_IDX   15   /* MT7927: ring 15 (same as MT7925) */
+#define FWDL_QUEUE_IDX     16   /* MT7927: ring 16 (same as MT7925) */
 #define FWDL_RING_SIZE      128
 #define FW_CHUNK_SIZE       (64 * 1024)
 

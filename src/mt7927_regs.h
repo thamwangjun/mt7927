@@ -61,13 +61,13 @@
 #define HOST_TX_DONE_INT_ENA1           BIT(1)
 #define HOST_TX_DONE_INT_ENA2           BIT(2)
 #define HOST_TX_DONE_INT_ENA3           BIT(3)
-#define HOST_TX_DONE_INT_ENA4           BIT(4)   /* MT7927: FWDL */
-#define HOST_TX_DONE_INT_ENA5           BIT(5)   /* MT7927: MCU WM */
+#define HOST_TX_DONE_INT_ENA4           BIT(4)   /* Fallback: FWDL on ring 4 */
+#define HOST_TX_DONE_INT_ENA5           BIT(5)   /* Fallback: MCU WM on ring 5 */
 #define HOST_TX_DONE_INT_ENA6           BIT(6)
 #define HOST_TX_DONE_INT_ENA7           BIT(7)
-#define HOST_TX_DONE_INT_ENA15          BIT(25)  /* Not used on MT7927 */
-#define HOST_TX_DONE_INT_ENA16          BIT(26)  /* Not used on MT7927 */
-#define HOST_TX_DONE_INT_ENA17          BIT(27)  /* Not used on MT7927 */
+#define HOST_TX_DONE_INT_ENA15          BIT(25)  /* MT7927: MCU WM on ring 15 */
+#define HOST_TX_DONE_INT_ENA16          BIT(26)  /* MT7927: FWDL on ring 16 */
+#define HOST_TX_DONE_INT_ENA17          BIT(27)  /* MT7921 compat */
 
 /* RX Done Interrupts */
 #define HOST_RX_DONE_INT_ENA0           BIT(16)  /* MCU WM */
@@ -85,9 +85,10 @@
                                          MT_INT_RX_DONE_WM | \
                                          MT_INT_RX_DONE_WM2)
 
-/* MT7927 uses rings 4/5 for MCU, not 15/16/17 like MT7925 */
-#define MT_INT_TX_DONE_MCU_WM           HOST_TX_DONE_INT_ENA5
-#define MT_INT_TX_DONE_FWDL             HOST_TX_DONE_INT_ENA4
+/* MT7927 uses rings 15/16 to match MT7925 (shared firmware)
+ * Fallback: Change to HOST_TX_DONE_INT_ENA5/4 if rings 15/16 don't work */
+#define MT_INT_TX_DONE_MCU_WM           HOST_TX_DONE_INT_ENA15
+#define MT_INT_TX_DONE_FWDL             HOST_TX_DONE_INT_ENA16
 #define MT_INT_TX_DONE_BAND0            HOST_TX_DONE_INT_ENA0
 #define MT_INT_TX_DONE_MCU              (MT_INT_TX_DONE_MCU_WM | \
                                          MT_INT_TX_DONE_FWDL)
@@ -257,15 +258,25 @@
  * ============================================ */
 
 /* TX Queue IDs
- * 
- * IMPORTANT: MT7927 only has 8 TX rings (0-7), not 17 like MT7925!
- * We must use available rings for MCU communication.
+ *
+ * RING ASSIGNMENT STRATEGY (2026-01-31):
+ *
+ * Using rings 15/16 to match MT7925, based on:
+ * 1. Windows driver confirms MT7927 uses EXACT SAME firmware as MT7925
+ * 2. MT7925 driver code doesn't check CNT before writing (CNT=0 is OK)
+ * 3. MT7622 precedent: sparse ring numbering (0-5, then 15) works
+ * 4. Shared firmware suggests shared ring protocol
+ *
+ * FALLBACK: If rings 15/16 don't work, change to:
+ *   MT7927_TXQ_MCU_WM = 5
+ *   MT7927_TXQ_FWDL = 4
+ * And update interrupt bits in mt7927_pci.c accordingly.
  */
 enum mt7927_txq_id {
     MT7927_TXQ_BAND0 = 0,      /* Data TX */
     MT7927_TXQ_BAND1 = 1,      /* Data TX (if needed) */
-    MT7927_TXQ_FWDL = 4,       /* Firmware download - use ring 4 */
-    MT7927_TXQ_MCU_WM = 5,     /* MCU commands - use ring 5 */
+    MT7927_TXQ_MCU_WM = 15,    /* MCU commands - ring 15 (same as MT7925) */
+    MT7927_TXQ_FWDL = 16,      /* Firmware download - ring 16 (same as MT7925) */
 };
 
 /* RX Queue IDs */

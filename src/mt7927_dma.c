@@ -405,9 +405,14 @@ static void mt7927_dma_prefetch(struct mt7927_dev *dev)
     mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(1), PREFETCH(0x0200, 0x10));
     mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(2), PREFETCH(0x0300, 0x10));
     mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(3), PREFETCH(0x0400, 0x10));
-    /* MT7927 uses rings 4/5 for FWDL/MCU, not 15/16 like MT7925 */
-    mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(4), PREFETCH(0x0500, 0x4));  /* FWDL ring 4 */
-    mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(5), PREFETCH(0x0540, 0x4));  /* MCU WM ring 5 */
+
+    /* MT7927 uses rings 15/16 to match MT7925 (shared firmware)
+     * Fallback: If rings 15/16 don't work, change to rings 4/5:
+     *   mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(4), PREFETCH(0x0500, 0x4));
+     *   mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(5), PREFETCH(0x0540, 0x4));
+     */
+    mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(15), PREFETCH(0x0500, 0x4)); /* MCU WM ring 15 */
+    mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(16), PREFETCH(0x0540, 0x4)); /* FWDL ring 16 */
 
     dev_info(dev->dev, "DMA prefetch configured\n");
 }
