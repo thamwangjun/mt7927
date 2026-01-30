@@ -711,12 +711,12 @@ void mt7927_unregister_device(struct mt7927_dev *dev);
 ## WFDMA Base Offsets
 
 ### `MT_WFDMA0_BASE`
-- **Value:** `0x2000`
-- **Description:** Base offset for WFDMA0 registers in BAR0 address space. This is the real writable DMA control register space.
+- **Value:** `0xd4000`
+- **Description:** Base offset for WFDMA HOST DMA0 registers in BAR0 address space (chip address 0x7C024000). This is where firmware download rings 15/16 are configured.
 
 ### `MT_WFDMA0(ofs)`
 - **Macro:** `(MT_WFDMA0_BASE + (ofs))`
-- **Description:** Constructs WFDMA0 register address from offset.
+- **Description:** Constructs WFDMA0 register address from offset. For example, `MT_WFDMA0(0x208)` = 0xd4208 for GLO_CFG.
 
 ---
 

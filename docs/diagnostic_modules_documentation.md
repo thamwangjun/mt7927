@@ -2,6 +2,8 @@
 
 This document provides comprehensive documentation for all MT7927 diagnostic modules located in `/diag/`. These modules are used to probe, test, and understand the MT7927 WiFi 7 chip's register layout, power management, DMA functionality, and initialization sequences.
 
+> **⚠️ HISTORICAL NOTE (Phase 21)**: Many of these diagnostic modules were created when we incorrectly believed WFDMA HOST DMA0 was at BAR0+0x2000. The **correct address is BAR0+0xd4000** (chip address 0x7C024000). Modules that scan/write to 0x2000 were accessing the MCU DMA region, not the HOST DMA region needed for firmware loading. This explains why DMA tests at 0x2000 appeared to work but firmware loading never succeeded.
+
 ## Table of Contents
 
 1. [Pre-Flight Checks](#pre-flight-checks)

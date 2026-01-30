@@ -9,7 +9,7 @@ This document chronicles the development effort to create a Linux driver for the
 2. MT7927 ROM bootloader does **NOT support mailbox protocol** - this was the root cause of all DMA "blocker" issues
 3. Reference zouyonghao driver has correct polling-based FW loader functions, but **wiring is broken** (firmware never called)
 
-**Current Status (Phase 18)**: Root cause fully understood. Polling-based firmware loading protocol required. Reference code analyzed; implementation path clear. Need to wire firmware loader into MCU init correctly.
+**Current Status (Phase 21)**: **MAJOR BUG FOUND** - Driver was using wrong WFDMA base address (0x2000 = MCU DMA, should be 0xd4000 = HOST DMA). All ring register writes went to wrong address space. Polling protocol + correct addresses = solution path confirmed.
 
 ---
 
@@ -58,6 +58,8 @@ TX Q16: ring base write failed
   - TX Ring 8+: Invalid (CNT registers show 0x00000000)
 - MT7925 uses rings 15/16 for MCU_WM and FWDL queues, but these don't exist on MT7927
 
+> ⚠️ **DEBUNKED (Phase 15-16)**: CNT=0 means uninitialized, not absent! Rings 15/16 DO exist with sparse numbering. The firmware expects rings 15/16 per CONNAC3X standard. See Appendix A.1.
+
 ### Fix Applied
 Changed MCU queue assignments in `src/mt7927_regs.h`:
 ```c
@@ -69,6 +71,8 @@ MT7927_TXQ_FWDL = 16,
 MT7927_TXQ_FWDL = 4,       // Firmware download - use ring 4
 MT7927_TXQ_MCU_WM = 5,     // MCU commands - use ring 5
 ```
+
+> ⚠️ **DEBUNKED (Phase 16)**: This "fix" was WRONG! Rings 15/16 are correct. MT7927=MT6639 variant uses sparse ring layout. Reverted in Phase 15.
 
 Updated interrupt enable masks accordingly:
 ```c
@@ -387,6 +391,11 @@ MCU command 0x0010 timeout
 - RST=0x30: Rings writable, but DMA doesn't process
 - RST=0x00: DMA could process, but rings get wiped
 
+> ⚠️ **DEBUNKED (Phase 17+19)**: This Catch-22 was a RED HERRING caused by two separate wrong assumptions:
+> 1. DMA not processing → We were blocked on mailbox wait, never called DMA
+> 2. Rings get wiped → We were writing to wrong base address (0x2000 vs 0xd4000)
+> RST=0x30 is correct and DMA works fine with it. See Appendix C.
+
 ---
 
 ### Attempt 5: Fixed WFSYS Reset Timing (50ms + INIT_DONE)
@@ -498,21 +507,30 @@ The CPU successfully writes a TX descriptor (CIDX goes from 0 to 1), but the DMA
 - L0S power saving state
 - SWDEF_MODE value
 
+> ⚠️ **DEBUNKED (Phase 17)**: DMA WAS working! The real problem was we blocked BEFORE calling DMA, waiting for a mailbox response that the ROM never sends. DIDX never advanced because the code never reached the DMA send path. See Appendix A.2.
+
 ---
 
 ### Hypotheses for Next Investigation
 
+> ⚠️ **ALL DEBUNKED** - See Phase 17 for actual root cause (mailbox protocol not supported by ROM)
+
 1. **RST State Issue**: Maybe RST=0x30 (kept in reset for writability) prevents DMA from running?
    - Reference driver leaves RST=0x30 and DMA works
    - But maybe MT7927 is different?
+   > ❌ **DEBUNKED**: RST=0x30 is correct, DMA works fine
 
 2. **Different Register Offsets**: MT7927 might have different DMA register layout
+   > ✅ **PARTIALLY CORRECT**: WFDMA0 is at 0xd4000, not 0x2000 (Phase 19)
 
 3. **Missing Initialization Step**: There may be another enable bit or sequence we're missing
+   > ✅ **CORRECT**: Missing CB_INFRA PCIe remap (Phase 19-20)
 
 4. **Interrupt Routing**: The descriptor might need an interrupt or doorbell write
+   > ❌ **DEBUNKED**: No special doorbell needed
 
 5. **Firmware Pre-presence**: Maybe firmware needs to be partially running before DMA works?
+   > ❌ **DEBUNKED**: ROM handles DMA before firmware loads
 
 ---
 
@@ -1883,3 +1901,240 @@ The zouyonghao code is valuable as a **reference** for the correct polling proto
 1. Create a corrected test module that properly wires firmware loading
 2. Implement the complete polling-based sequence with correct call order
 3. Test firmware loading with proper initialization
+
+---
+
+## Phase 21: Complete Reference Code Analysis (2026-01-31)
+
+### What We Did
+
+Comprehensive analysis of both `reference_mtk_modules/` and `reference_gen4m/` directories to extract precise DMA firmware loading parameters. Cross-referenced MT6639 chip implementation, bus2chip address mapping, and WFDMA register definitions.
+
+### CRITICAL DISCOVERY: WFDMA HOST DMA0 Base Address
+
+**⚠️ MAJOR BUG FOUND**: Our driver has been writing to the WRONG address space!
+
+From `reference_gen4m/chips/mt6639/mt6639.c` bus2chip mapping (lines 235-292):
+
+```c
+struct PCIE_CHIP_CR_MAPPING mt6639_bus2chip_cr_mapping[] = {
+    /* chip addr, bus addr, range */
+    {0x54000000, 0x02000, 0x1000},  /* WFDMA PCIE0 MCU DMA0 */   ← NOT for host!
+    {0x7c020000, 0xd0000, 0x10000}, /* CONN_INFRA, wfdma */      ← HOST DMA here!
+    ...
+};
+```
+
+From `reference_gen4m/include/chips/coda/mt6639/wf_wfdma_host_dma0.h`:
+```c
+#define WF_WFDMA_HOST_DMA0_BASE  (0x18024000 + CONN_INFRA_REMAPPING_OFFSET)
+// = 0x18024000 + 0x64000000 = 0x7C024000 (chip address)
+```
+
+**Address Translation**:
+| Chip Address | BAR0 Offset | Description |
+|--------------|-------------|-------------|
+| 0x54000000 | 0x02000 | MCU DMA0 (for MCU's own use) |
+| 0x7C020000 | 0xd0000 | CONN_INFRA base |
+| **0x7C024000** | **0xd4000** | **WFDMA HOST DMA0** (what we need!) |
+
+**Conclusion**:
+- **WRONG**: BAR0+0x2000 (MCU DMA, used by Phases 1-20)
+- **CORRECT**: BAR0+0xd4000 (HOST DMA, for firmware loading)
+
+### Ring Register Offsets (from WFDMA HOST DMA0 base)
+
+From `wf_wfdma_host_dma0.h`:
+
+| Register | Offset | BAR0 Absolute |
+|----------|--------|---------------|
+| CONN_HIF_RST | +0x100 | 0xd4100 |
+| HOST_INT_STA | +0x200 | 0xd4200 |
+| HOST_INT_ENA | +0x204 | 0xd4204 |
+| WPDMA_GLO_CFG | +0x208 | 0xd4208 |
+| WPDMA_RST_DTX_PTR | +0x20C | 0xd420C |
+| WPDMA_RST_DRX_PTR | +0x280 | 0xd4280 |
+| **Ring 15 CTRL0** | +0x3f0 | 0xd43f0 |
+| Ring 15 CTRL1 | +0x3f4 | 0xd43f4 |
+| Ring 15 CTRL2 (CIDX) | +0x3f8 | 0xd43f8 |
+| Ring 15 CTRL3 (DIDX) | +0x3fc | 0xd43fc |
+| **Ring 16 CTRL0** | +0x400 | 0xd4400 |
+| Ring 16 CTRL1 | +0x404 | 0xd4404 |
+| Ring 16 CTRL2 (CIDX) | +0x408 | 0xd4408 |
+| Ring 16 CTRL3 (DIDX) | +0x40c | 0xd440c |
+| Ring 15 EXT_CTRL | +0x63C | 0xd463C |
+| Ring 16 EXT_CTRL | +0x640 | 0xd4640 |
+
+### Firmware Loading Protocol (Confirmed)
+
+From `reference_gen4m/chips/common/fw_dl.c` line 1332-1335:
+
+```c
+u4Status = wlanSendInitSetQueryCmd(prAdapter,
+    0, pucSecBuf, u4SecSize,
+    FALSE, FALSE,  /* fgCheckStatus = FALSE - NO RESPONSE EXPECTED */
+    0, NULL, 0);
+```
+
+**Key Protocol Points**:
+1. `fgCheckStatus = FALSE` - ROM bootloader NEVER acknowledges commands
+2. No mailbox wait between firmware chunks
+3. Loop sends chunks until complete
+4. Query status with `INIT_CMD_ID_QUERY_PENDING_ERROR` after all chunks sent
+
+### Ring Assignment (Reconfirmed)
+
+From `reference_gen4m/chips/mt6639/mt6639.c` bus_info structure:
+
+```c
+.tx_ring_fwdl_idx = CONNAC3X_FWDL_TX_RING_IDX,  // 16
+.tx_ring_cmd_idx = 15,                           // MCU_WM
+```
+
+From `reference_gen4m/include/chips/cmm_asic_connac3x.h`:
+
+```c
+#define CONNAC3X_FWDL_TX_RING_IDX         16
+#define CONNAC3X_CMD_TX_RING_IDX          17    // (not used for MT6639)
+```
+
+### Why Previous Tests Failed
+
+All our previous tests wrote ring configuration to **BAR0+0x2300** (Ring 15) and **BAR0+0x2400** (Ring 16), which is inside the MCU DMA0 address space (0x2000-0x2FFF). The MCU DMA is for the chip's internal MCU, NOT for host firmware loading!
+
+The host-side firmware loading must use registers at:
+- Ring 15: **BAR0+0xd43f0** (not 0x23f0)
+- Ring 16: **BAR0+0xd4400** (not 0x2400)
+
+This explains why:
+1. Ring writes appeared to "succeed" (MCU DMA registers are writable)
+2. But DMA never processed our descriptors (wrong DMA engine!)
+3. DIDX never advanced (MCU DMA wasn't even involved in our transfers)
+
+### Summary of Invalidated Assumptions
+
+| Assumption | Status | Correct Value |
+|------------|--------|---------------|
+| WFDMA0 at BAR0+0x2000 | ❌ **WRONG** | BAR0+0xd4000 |
+| Ring 15/16 at BAR0+0x23f0/0x2400 | ❌ **WRONG** | BAR0+0xd43f0/0xd4400 |
+| GLO_CFG at BAR0+0x2208 | ❌ **WRONG** | BAR0+0xd4208 |
+
+### Files Analyzed
+
+- `reference_gen4m/chips/mt6639/mt6639.c` - bus2chip mapping, bus_info
+- `reference_gen4m/chips/common/fw_dl.c` - firmware loading protocol
+- `reference_gen4m/include/chips/coda/mt6639/wf_wfdma_host_dma0.h` - register offsets
+- `reference_gen4m/include/chips/cmm_asic_connac3x.h` - ring index definitions
+
+### Next Steps
+
+1. **Update test_fw_load.c** with correct WFDMA base address (0xd4000)
+2. **Update all ring register offsets** to use correct absolute addresses
+3. **Rebuild and test** with corrected addresses
+4. **Verify DMA actually processes** descriptors at correct location
+
+---
+
+## Appendix A: Debunked Assumptions (Comprehensive List)
+
+This section documents all assumptions made during development that were later proven wrong, with citations to the evidence that debunked them.
+
+### A.1 Hardware Architecture Assumptions
+
+| Assumption | Phases | Why We Believed It | Evidence Debunking It |
+|------------|--------|--------------------|-----------------------|
+| **MT7927 is MT7925 variant** | 1-15 | Same firmware files, similar product positioning | Phase 16: MediaTek kernel modules explicitly map MT7927 to MT6639 (`pcie.c:170-171`) |
+| **MT7927 has only 8 TX rings (0-7)** | 2-15 | Ring scan showed CNT=512 for 0-7, CNT=0 for 8+ | Phase 15-16: CNT=0 is uninitialized state, not absence; MT6639 uses sparse layout (0-3, 15-16) |
+| **Rings 15/16 don't exist on MT7927** | 2-10 | Read CNT=0 from registers | Phase 15: Driver writes CNT, doesn't check it; MT7622 has sparse rings precedent |
+| **Must use rings 4/5 for MCU/FWDL** | 3-14 | They showed CNT=512, assumed "available" | Phase 16: MT6639 bus_info confirms rings 15/16 for MCU_WM/FWDL |
+| **WFDMA0 base is at BAR0+0x2000** | 1-20 | Copied from MT7921 reference | Phase 21: MT6639 bus2chip mapping confirms BAR0+0x2000 is MCU DMA, HOST DMA is at BAR0+0xd4000 |
+| **Ring 15/16 registers at 0x23f0/0x2400** | 1-20 | Calculated from WFDMA0 base 0x2000 | Phase 21: Correct offsets are 0xd43f0/0xd4400 (from HOST DMA base 0xd4000) |
+
+### A.2 DMA/Communication Protocol Assumptions
+
+| Assumption | Phases | Why We Believed It | Evidence Debunking It |
+|------------|--------|--------------------|-----------------------|
+| **ROM supports mailbox protocol** | 1-16 | All mt76 drivers use mailbox | Phase 17: zouyonghao code explicitly documents "ROM doesn't support mailbox" |
+| **PATCH_SEM_CONTROL required** | 1-16 | MT7925 driver sends it | Phase 17: Working driver skips semaphore entirely |
+| **DMA hardware was stuck** | 9-16 | DIDX never advanced | Phase 17: We were blocked on mailbox; Phase 21: Also writing to WRONG DMA engine (MCU DMA not HOST DMA) |
+| **FW_START command needed** | 1-16 | Standard mt76 protocol | Phase 17: Working driver sets SW_INIT_DONE manually instead |
+| **RST=0x30 prevents DMA processing** | 4-5 | DMA didn't advance with RST set | Phase 17: DMA wasn't called because we blocked on mailbox |
+
+### A.3 Power Management Assumptions
+
+| Assumption | Phases | Why We Believed It | Evidence Debunking It |
+|------------|--------|--------------------|-----------------------|
+| **ASPM L1 blocks DMA** | 15-16 | L1.1/L1.2 substates might block processing | Phase 17: Working driver has L1 enabled, only disables L0s |
+| **Need to disable all ASPM** | 15 | DMA blocker hypothesis | Phase 17: zouyonghao's `pci_mcu.c:218` only disables L0s |
+
+### A.4 Register Address Assumptions
+
+| Assumption | Phases | Why We Believed It | Evidence Debunking It |
+|------------|--------|--------------------|-----------------------|
+| **Crypto MCU ownership at 0x70025380** | 17-19 | Early documentation | Phase 20: cb_infra_slp_ctrl.h shows SET register at 0x70025034 |
+| **CB_INFRA not required** | 1-18 | Not documented in mt7925 driver | Phase 19-20: MT6639 vendor code shows mandatory PCIE_REMAP_WF = 0x74037001 |
+
+### A.5 Firmware Assumptions
+
+| Assumption | Phases | Why We Believed It | Evidence Debunking It |
+|------------|--------|--------------------|-----------------------|
+| **MT7927 needs unique firmware** | 1 | Different chip ID | Phase 14-15: Windows driver analysis proves same .bin files used |
+| **Firmware auto-detects chip** | 14 | Contains both 0x7925 and 0x7927 bytes | Not debunked, but clarified: Firmware works on both chips |
+
+### A.6 Reference Code Assumptions
+
+| Assumption | Phases | Why We Believed It | Evidence Debunking It |
+|------------|--------|--------------------|-----------------------|
+| **MT7925 kernel driver is good reference** | 1-15 | Similar product family | Phase 16: MT6639 is the actual parent chip architecture |
+| **zouyonghao driver loads firmware** | 17 | Comments say "firmware already loaded" | Phase 18: Critical gap - `mt792x_load_firmware()` never called! |
+
+---
+
+## Appendix B: Assumption Evolution Timeline
+
+```
+Phase 1-2:   Assumed MT7927 = MT7925 with 17+ rings
+             → WRONG: MT7927 = MT6639 with sparse ring layout
+
+Phase 2-4:   Assumed rings 15/16 don't exist (CNT=0)
+             → WRONG: CNT=0 = uninitialized, not absent
+
+Phase 3-10:  Assumed must use rings 4/5 for MCU/FWDL
+             → WRONG: Firmware expects rings 15/16 (CONNAC3X standard)
+
+Phase 1-18:  Assumed WFDMA0 at BAR0+0x2000
+             → WRONG: Correct base is BAR0+0xd4000 (MT6639 mapping)
+
+Phase 9-16:  Assumed DMA hardware was stuck
+             → WRONG: Hardware works, we blocked on mailbox wait
+
+Phase 15-16: Assumed ASPM L1 was the DMA blocker
+             → WRONG: Working driver has L1 enabled
+
+Phase 1-16:  Assumed ROM supports mailbox protocol
+             → WRONG: ROM only processes DMA, never responds
+
+Phase 17:    Assumed zouyonghao driver works end-to-end
+             → PARTIALLY WRONG: Correct components, broken wiring
+
+Phase 17-19: Assumed crypto MCU ownership at 0x70025380
+             → WRONG: Correct SET register is 0x70025034
+```
+
+---
+
+## Appendix C: Key Learning - The RST/Ring Catch-22 Explained
+
+During Phases 4-16, we documented a "Catch-22" situation:
+- RST=0x30: Rings writable, but DMA doesn't process
+- RST=0x00: DMA could process, but rings get wiped
+
+**This was a RED HERRING!**
+
+The real situation:
+1. RST=0x30 is the correct state during ring configuration
+2. DMA actually DOES work with RST=0x30
+3. We never SAW it work because we blocked on mailbox before DMA had a chance
+4. The "rings get wiped" with RST=0x00 was because we were writing to **wrong base address** (0x2000 instead of 0xd4000)
+
+**Lesson**: Multiple wrong assumptions can create false correlations. The RST state and the DMA blocker were unrelated issues that we incorrectly linked together.

@@ -37,15 +37,23 @@
 ## Key Register Locations (BAR0 offsets)
 
 ```c
-WFDMA0_BASE        = 0x2000      // Real writable DMA registers
-WFDMA0_RST         = 0x2100      // DMA reset control (bits 4,5)
-WFDMA0_GLO_CFG     = 0x2208      // DMA global config (TX/RX enable)
-TX_RING_BASE(n)    = 0x2300 + n*0x10
-RX_RING_BASE(n)    = 0x2500 + n*0x10
-LPCTL              = 0x7c060010  // Power management handshake
-WFSYS_SW_RST_B     = 0x7c000140  // WiFi subsystem reset
-PCIE_MAC_PM        = 0x74030194  // PCIe power management (L0S)
-SWDEF_MODE         = 0x0041f23c  // Firmware mode register
+// WFDMA HOST DMA0 (chip address 0x7C024000)
+WFDMA0_BASE        = 0xd4000     // Host DMA registers for firmware loading
+WFDMA0_RST         = 0xd4100     // DMA reset control (bits 4,5)
+WFDMA0_GLO_CFG     = 0xd4208     // DMA global config (TX/RX enable)
+TX_RING_BASE(n)    = 0xd4300 + n*0x10
+TX_RING15_CTRL0    = 0xd43F0     // Ring 15 (MCU_WM)
+TX_RING16_CTRL0    = 0xd4400     // Ring 16 (FWDL)
+RX_RING_BASE(n)    = 0xd4500 + n*0x10
+
+// Power/Reset registers
+LPCTL              = 0xe0010     // Power management handshake (chip 0x7c060010)
+WFSYS_SW_RST_B     = 0xf0140     // WiFi subsystem reset (chip 0x7c000140)
+PCIE_MAC_PM        = 0x1d0194    // PCIe power management (chip 0x74030194)
+
+// CB_INFRA registers (require L1 remap or fixed mapping)
+CB_INFRA_PCIE_REMAP_WF = 0x1f6554  // Set to 0x74037001 before WFDMA access
+CB_INFRA_CRYPTO_MCU    = 0x1f5034  // Set BIT(0) for MCU ownership
 ```
 
 ## Architecture Comparison

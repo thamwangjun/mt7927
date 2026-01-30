@@ -246,7 +246,7 @@ usleep_range(100, 200);
 Short delay to allow hardware to process the pointer resets before continuing.
 
 **Hardware Interaction**:
-- These registers are in the WFDMA0 region at BAR0+0x2000
+- These registers are in the WFDMA HOST DMA0 region at BAR0+0xd4000
 - Writing `0xffffffff` triggers hardware to reset internal DMA pointers
 - Must be called after disabling DMA to avoid race conditions
 
@@ -884,12 +884,12 @@ These registers are accessed via the fixed mapping table, which maps `0x7c000000
 
 ### WFDMA Region
 
-The WFDMA (WiFi Frontend DMA) region at `BAR0+0x2000` contains:
+The WFDMA HOST DMA0 region at `BAR0+0xd4000` (chip address 0x7C024000) contains:
 - **Interrupt registers**: Status, enable, disable
-- **Ring configuration**: Base addresses, counts, indices
+- **Ring configuration**: Base addresses, counts, indices for TX rings 0-20 and RX rings 0-11
 - **DMA control**: Reset, global configuration
 
-**Critical**: Always use `BAR0+0x2000+offset` for WFDMA writes. `BAR2` (which maps to `BAR0+0x10000`) is read-only.
+**Critical**: Always use `BAR0+0xd4000+offset` for WFDMA writes. `BAR2` (which maps to `BAR0+0x10000`) is read-only.
 
 ### Register Remapping
 

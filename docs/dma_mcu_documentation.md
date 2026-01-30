@@ -1247,7 +1247,7 @@ Lines 630-631: Clear MCU state
 
 2. **Reset Bits Remain Set**: The reference driver leaves `MT_WFDMA0_RST` bits SET during normal operation. DMA works correctly in this state.
 
-3. **BAR0 vs BAR2**: Real writable WFDMA registers are at BAR0+0x2000, not BAR2. BAR2 is read-only shadow.
+3. **BAR0 vs BAR2**: Real writable WFDMA HOST DMA0 registers are at BAR0+0xd4000 (chip address 0x7C024000). BAR2 is a read-only shadow of BAR0+0x10000.
 
 ---
 

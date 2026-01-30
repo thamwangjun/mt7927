@@ -8,16 +8,18 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 
 **Official Product Name**: MT7927 802.11be 320MHz 2x2 PCIe Wireless Network Adapter [Filogic 380]
 
-**Current Status**: **ROOT CAUSE FOUND (2026-01-31)** - MT7927 ROM bootloader does NOT support mailbox command protocol! Our driver waits for mailbox responses that the ROM will never send. DMA hardware works correctly; we're using the wrong communication protocol.
+**Current Status**: **ROOT CAUSES FOUND (Phase 21)** - Two critical issues identified:
+1. **Wrong WFDMA base address**: Driver wrote to BAR0+0x2000 (MCU DMA) instead of BAR0+0xd4000 (HOST DMA)
+2. **Mailbox protocol not supported**: MT7927 ROM doesn't respond to mailbox commands - must use polling
 
-**⚠️ SOLUTION**: Switch to polling-based firmware loading (no mailbox waits). Working reference driver from zouyonghao proves this approach. See ZOUYONGHAO_ANALYSIS.md for complete details.
+**⚠️ SOLUTION**: Use correct WFDMA base (0xd4000) + polling-based firmware loading. See docs/ZOUYONGHAO_ANALYSIS.md for implementation.
 
 ## Critical Files to Review First
 
 1. **docs/ZOUYONGHAO_ANALYSIS.md** - 🎯 **ROOT CAUSE FOUND** - No mailbox protocol in MT7927 ROM!
 2. **docs/MT6639_ANALYSIS.md** - Proves MT7927 is MT6639 variant, validates rings 15/16
 3. **docs/REFERENCE_SOURCES.md** - Analysis of reference code origins and authoritative sources
-4. **DEVELOPMENT_LOG.md** - Complete chronological history (Phase 17 = root cause discovery)
+4. **DEVELOPMENT_LOG.md** - Complete chronological history (Phase 21 = final root cause)
 5. **AGENTS.md** - Session bootstrap with current blocker details, hardware context, and what's been tried
 6. **HARDWARE_ANALYSIS.md** - lspci analysis (L1 ASPM hypothesis now invalidated)
 7. **README.md** - Project overview, build instructions, expected outputs
@@ -90,7 +92,7 @@ echo 1 | sudo tee /sys/bus/pci/rescan
 ```
 src/
 ├── mt7927_pci.c    # PCI probe, power management (LPCTL handshake), WFSYS reset
-├── mt7927_dma.c    # DMA ring allocation/configuration (8 TX, 16 RX rings)
+├── mt7927_dma.c    # DMA ring allocation/configuration (sparse TX: 0-3,8-11,14-16)
 ├── mt7927_mcu.c    # MCU protocol, firmware loading sequence
 ├── mt7927.h        # Core structures: mt7927_dev, mt7927_queue, descriptor format
 ├── mt7927_regs.h   # Register definitions, addresses, queue IDs
@@ -159,20 +161,34 @@ diag/               # 18 hardware exploration/diagnostic modules
 
 ### Key Register Locations (BAR0 offsets)
 
+**WFDMA0 Registers** (via bus2chip mapping: chip 0x7C024000 → BAR0 0xd4000):
 ```c
-WFDMA0_BASE        = 0x2000      // Real writable DMA registers
-WFDMA0_RST         = 0x2100      // DMA reset control (bits 4,5)
-WFDMA0_GLO_CFG     = 0x2208      // DMA global config (TX/RX enable)
-TX_RING_BASE(n)    = 0x2300 + n*0x10
-RX_RING_BASE(n)    = 0x2500 + n*0x10
-LPCTL              = 0x7c060010  // Power management handshake
-WFSYS_SW_RST_B     = 0x7c000140  // WiFi subsystem reset
-PCIE_MAC_PM        = 0x74030194  // PCIe power management (L0S)
-SWDEF_MODE         = 0x0041f23c  // Firmware mode register
+WFDMA0_BASE        = 0xd4000     // WFDMA Host DMA0 base (NOT 0x2000!)
+WFDMA0_RST         = 0xd4100     // DMA reset control (bits 4,5)
+WFDMA0_GLO_CFG     = 0xd4208     // DMA global config (TX/RX enable)
+TX_RING_BASE(n)    = 0xd4300 + n*0x10
+TX_RING15_CTRL0    = 0xd43F0     // Ring 15 (MCU_WM)
+TX_RING16_CTRL0    = 0xd4400     // Ring 16 (FWDL)
 ```
 
-## Root Cause (FOUND 2026-01-31)
+**Chip addresses via fixed_map translation** (0x7cXXXXXX → BAR0):
+```c
+LPCTL              = 0xe0010     // 0x7c060010 → BAR0 (power management)
+WFSYS_SW_RST_B     = 0xf0140     // 0x7c000140 → BAR0 (WiFi reset)
+MCU_ROMCODE_INDEX  = 0xc1604     // 0x81021604 → BAR0 (MCU state, expect 0x1D1E)
+```
 
+**CB_INFRA Registers** (via 0x70020000 mapping → BAR0 0x1f0000):
+```c
+CB_INFRA_PCIE_REMAP_WF     = 0x1f6554  // MUST set to 0x74037001 before WFDMA access!
+CB_INFRA_PCIE_REMAP_WF_BT  = 0x1f6558  // Set to 0x70007000
+CB_INFRA_WF_SUBSYS_RST     = 0x1f8600  // WF reset via CB_INFRA_RGU (bit 4)
+CB_INFRA_CRYPTO_MCU_OWN    = 0x1f5034  // Set BIT(0) for MCU ownership
+```
+
+## Root Cause (FOUND 2026-01-31, REFINED 2026-01-31)
+
+### Issue 1: Mailbox Protocol Not Supported
 **MT7927 ROM bootloader does NOT support mailbox command protocol!**
 
 The driver was:
@@ -181,27 +197,47 @@ The driver was:
 3. ROM bootloader never responds (mailbox not implemented)
 4. Driver times out, never proceeds to firmware loading
 
-**Why DMA appeared "stuck"**: DMA hardware works correctly! The problem was:
-- We sent a command the ROM doesn't understand
-- We waited for a response that never came
-- DMA_DIDX stays at 0 because we blocked before any real transfer
+### Issue 2: Wrong WFDMA Register Base Address
+**WFDMA registers were accessed at wrong BAR0 offset!**
 
-**Solution**: Polling-based firmware loading:
-- Skip semaphore command (ROM doesn't support it)
-- Send firmware without waiting for mailbox responses (`wait_resp=false`)
-- Use time-based delays (5-50ms) instead of mailbox waits
-- Set SW_INIT_DONE manually instead of FW_START command
+- Previous documentation said WFDMA0 at **0x2000** (wrong - this is MT7921)
+- Correct address: **0xd4000** (from MT6639 bus2chip mapping)
+- All ring configuration writes went to wrong addresses
 
-See **docs/ZOUYONGHAO_ANALYSIS.md** for complete implementation details.
+### Issue 3: Missing CB_INFRA Initialization
+**PCIe remap registers must be set before WFDMA access works!**
 
-### Invalidated Hypotheses
+From MediaTek vendor code `mt6639_mcu_init()`:
+```c
+// MANDATORY - set BEFORE any WFDMA register access
+writel(0x74037001, bar0 + 0x1f6554);  // PCIE_REMAP_WF
+writel(0x70007000, bar0 + 0x1f6558);  // PCIE_REMAP_WF_BT
+```
 
-| Hypothesis | Status | Evidence |
-|------------|--------|----------|
-| ~~ASPM L1 blocking DMA~~ | **DISPROVEN** | Working zouyonghao driver has L1 enabled |
-| ~~Ring 4/5 for MCU/FWDL~~ | **DISPROVEN** | MT6639 uses rings 15/16 (CONNAC3X standard) |
-| ~~DMA hardware broken~~ | **DISPROVEN** | Works with polling protocol |
-| ~~Missing init step~~ | **DISPROVEN** | All init steps correct |
+### Complete Solution
+
+1. **Set CB_INFRA PCIe remap** (0x74037001)
+2. **WF subsystem reset** via CB_INFRA_RGU (BAR0+0x1f8600), not just WFSYS_SW_RST_B
+3. **Set crypto MCU ownership** (BAR0+0x1f5034 = BIT(0))
+4. **Wait for MCU IDLE** (0x1D1E at BAR0+0xc1604)
+5. **Configure WFDMA** at correct base **0xd4000**
+6. **Polling-based firmware loading** (no mailbox waits)
+
+See **docs/ZOUYONGHAO_ANALYSIS.md** and **reference_mtk_modules/.../mt6639.c** for implementation details.
+
+### Phase 20 Findings (January 2026)
+
+**Deep analysis of reference_mtk_modules/ and reference_gen4m/** revealed:
+
+| Finding | Old Assumption | Correct Value | Source |
+|---------|----------------|---------------|--------|
+| Crypto MCU ownership | 0x70025380 | **0x70025034** (SET register) | cb_infra_slp_ctrl.h |
+| PCIe remap WF | Unknown | **0x74037001** | mt6639.c:2727 |
+| PCIe remap WF_BT | Unknown | **0x70007000** | mt6639.c:2728 |
+| GPIO_MODE5 | Placeholder | **0x80000000** | mt6639.c:2651 |
+| GPIO_MODE6 | Placeholder | **0x80** | mt6639.c:2653 |
+| Ring 16 prefetch | Unknown | **0x4** | mt6639.c:1395 |
+| FW loading mode | Mailbox wait | **Polling** (fgCheckStatus=FALSE) | fw_dl.c |
 
 ## Recent Fixes: test_fw_load.c (2026-01-30)
 
@@ -223,16 +259,19 @@ ret = pcim_iomap_regions(pdev, BIT(0), "mt7927_test");
 dev->regs = pcim_iomap_table(pdev)[0];  /* Use BAR0 (2MB) */
 ```
 
-### 2. Wrong WFDMA Register Offsets
-**Problem**: Registers were at BAR2-style offsets (0x02xx) instead of BAR0 offsets (0x22xx)
+### 2. Wrong WFDMA Register Offsets (FURTHER CORRECTED)
+**Problem**: Initial fix used 0x2000 base, but correct base is **0xd4000**!
 
-**Fix**: Added proper base offset:
+**Current correct values** (from MT6639 vendor code):
 ```c
-#define MT_WFDMA0_BASE              0x2000
-#define MT_WFDMA0_GLO_CFG           (MT_WFDMA0_BASE + 0x208)
-#define MT_WFDMA0_HOST_INT_STA      (MT_WFDMA0_BASE + 0x200)
+#define MT_WFDMA0_BASE              0xd4000  // NOT 0x2000!
+#define MT_WFDMA0_GLO_CFG           (MT_WFDMA0_BASE + 0x208)   // = 0xd4208
+#define MT_WFDMA0_HOST_INT_STA      (MT_WFDMA0_BASE + 0x200)   // = 0xd4200
 #define MT_WFDMA0_TX_RING_BASE(n)   (MT_WFDMA0_BASE + 0x300 + (n) * 0x10)
+// Ring 15 = 0xd43F0, Ring 16 = 0xd4400
 ```
+
+**Note**: test_fw_load.c was updated to use 0xd4000 in a previous session.
 
 ### 3. Ring Assignment Clarified
 **Note**: MT7927 uses **sparse ring layout** like MT6639 (rings 0,1,2,15,16), NOT dense layout like MT7925 (0-16).
@@ -326,64 +365,6 @@ if (intr & HOST_TX_DONE_INT_ENA16)
 
 All test modules had same BAR2 issue as test_fw_load.c - fixed to use BAR0 with proper offsets.
 
-## TX Ring Validation (2026-01-30) - CONFIRMED
-
-### Hardware Validation Results
-
-Created two diagnostic modules to validate the 8 TX ring hypothesis:
-
-1. **`diag/mt7927_ring_scan_readonly.c`** - Safe read-only scanner
-2. **`diag/mt7927_ring_scan_readwrite.c`** - Write test with safety features (dry_run default)
-
-### Scan Results
-
-```
-Ring | BASE       | CNT    | CIDX | DIDX | EXT_CTRL   | Status
------|------------|--------|------|------|------------|--------
-   0 | 0x00000000 |    512 |    0 |    0 | 0x04000040 | VALID
-   1 | 0x00000000 |    512 |    0 |    0 | 0x04000080 | VALID
-   2 | 0x00000000 |    512 |    0 |    0 | 0x040000c0 | VALID
-   3 | 0x00000000 |    512 |    0 |    0 | 0x04000100 | VALID
-   4 | 0x00000000 |    512 |    0 |    0 | 0x04000140 | VALID
-   5 | 0x00000000 |    512 |    0 |    0 | 0x04000180 | VALID
-   6 | 0x00000000 |    512 |    0 |    0 | 0x040001c0 | VALID
-   7 | 0x00000000 |    512 |    0 |    0 | 0x04000200 | VALID
-   8 | 0x00000000 |      0 |    0 |    0 | 0x04000240 | INVALID
-   9 | 0x00000000 |      0 |    0 |    0 | 0x04000280 | INVALID
-  10 | 0x00000000 |      0 |    0 |    0 | 0x040002c0 | INVALID
-  11 | 0x00000000 |      0 |    0 |    0 | 0x04000300 | INVALID
-  12 | 0x00000000 |      0 |    0 |    0 | 0x04000340 | INVALID
-  13 | 0x00000000 |      0 |    0 |    0 | 0x04000380 | INVALID
-  14 | 0x00000000 |      0 |    0 |    0 | 0x040003c0 | INVALID
-  15 | 0x00000000 |      0 |    0 |    0 | 0x04000400 | INVALID
-  16 | 0x00000000 |      0 |    0 |    0 | 0x04000440 | INVALID
-  17 | 0x00000000 |      0 |    0 |    0 | 0x04000480 | INVALID
-```
-
-### Key Findings
-
-| Finding | Status | Evidence |
-|---------|--------|----------|
-| MT7927 has 8 physical TX rings | **✓ CONFIRMED** | CNT=512 for rings 0-7 in uninitialized state |
-| Sparse ring layout (0,1,2,15,16) | **✓ CONFIRMED** | MT6639 analysis + MediaTek kernel modules |
-| Rings 15/16 are correct for MCU/FWDL | **✓ CONFIRMED** | MT6639 bus_info structure + zouyonghao driver |
-| CNT=0 for uninitialized rings is normal | **✓ CONFIRMED** | Driver sets CNT when configuring rings |
-| ASPM L1 is NOT the DMA blocker | **✓ CONFIRMED** | Working driver has L1 enabled |
-
-### Chip ID Location Clarified
-
-**Mystery solved**: Why `mt7927_diag.ko` reads Chip ID correctly but others read 0x00000000:
-- BAR2 is a read-only shadow of BAR0 at offset 0x10000
-- Chip ID is at BAR0+0x10000, NOT BAR0+0x0000
-- `mt7927_diag.c` maps BAR2, so BAR2+0x000 = correct Chip ID
-- Other modules using BAR0+0x0000 read SRAM (0x00000000)
-
-### Resolved Uncertainties (2026-01-31)
-
-1. **Ring assignment**: Rings 15/16 are correct for MCU_WM/FWDL. Validated via MT6639 MediaTek kernel modules and zouyonghao working driver.
-
-2. **ASPM L1**: NOT the blocker. Working zouyonghao driver has L1 enabled (same as ours). Root cause was mailbox protocol assumption.
-
 ## Code Style and Conventions
 
 ### Kernel Module Coding
@@ -401,10 +382,18 @@ u32 val = ioread32(dev->bar0 + offset);
 // Writing registers
 iowrite32(value, dev->bar0 + offset);
 
-// BAR0 vs BAR2
-// - BAR0: Main 2MB memory region (SRAM at 0x0, registers at 0x10000+, WFDMA at 0x2000)
-// - BAR2: 32KB read-only shadow of BAR0+0x10000 (do NOT use for writes)
-// - Chip ID: BAR0+0x10000 (or BAR2+0x0)
+// BAR0 memory map (2MB)
+// - 0x00000-0x0FFFF: SRAM
+// - 0x10000+: Chip registers (via BAR2 shadow)
+// - 0xc0000+: WF_TOP_MISC_ON (MCU ROMCODE at 0xc1604)
+// - 0xd0000+: CONN_INFRA WFDMA area
+// - 0xd4000+: WFDMA Host DMA0 registers (NOT 0x2000!)
+// - 0xe0000+: CONN_HOST_CSR_TOP (LPCTL at 0xe0010)
+// - 0xf0000+: CONN_INFRA (WFSYS_SW_RST_B at 0xf0140)
+// - 0x1f0000+: CB_INFRA/CBTOP (PCIe remap, WF reset, crypto)
+
+// BAR2 (32KB) - Read-only shadow of BAR0+0x10000
+// - Chip ID: BAR2+0x0 (or BAR0+0x10000)
 ```
 
 ### Error Handling
@@ -480,11 +469,41 @@ MT7927 driver development uses three reference sources in priority order:
 **Key files**:
 - `connectivity/wlan/core/gen4m/chips/mt6639/mt6639.c` - Complete chip implementation
 - `connectivity/wlan/core/gen4m/chips/mt6639/mt6639.h` - Chip-specific constants
-- `connectivity/wlan/core/gen4m/chips/mt6639/coda/mt6639/wf_wfdma_host_dma0.h` - DMA registers
-- `connectivity/wlan/core/gen4m/chips/mt6639/coda/mt6639/wf_pse_top.h` - PSE registers
-- `connectivity/wlan/core/gen4m/chips/mt6639/coda/mt6639/pcie_mac_ireg.h` - PCIe registers
+- `connectivity/wlan/core/gen4m/chips/common/fw_dl.c` - **Firmware download** (2995 lines, uses polling mode!)
+- `connectivity/wlan/core/gen4m/include/chips/coda/mt6639/cb_infra_*.h` - CB_INFRA register definitions
+- `connectivity/wlan/core/gen4m/include/chips/coda/mt6639/wf_wfdma_host_dma0.h` - DMA registers
+- `connectivity/wlan/core/gen4m/os/linux/hif/pcie/pcie.c` - PCI device table (MT7927→MT6639!)
 
 **When to use**: Architecture, register definitions, initialization sequences, DMA configuration
+
+#### Priority 1b: Gen4M WLAN Driver (reference_gen4m/) - **INITIALIZATION DETAILS**
+
+**Source**: MediaTek gen4m WLAN driver (same structure as reference_mtk_modules but separate repository)
+
+**Critical values discovered (Phase 20)**:
+```c
+// From reference_gen4m/chips/mt6639/mt6639.c:2727-2737
+CB_INFRA_PCIE_REMAP_WF     = 0x74037001  // MUST set before WFDMA access
+CB_INFRA_PCIE_REMAP_WF_BT  = 0x70007000
+
+// From reference_gen4m/chips/mt6639/mt6639.c:2651-2653
+CBTOP_GPIO_MODE5           = 0x80000000
+CBTOP_GPIO_MODE6           = 0x80
+
+// From reference_gen4m/chips/mt6639/mt6639.c:2660-2669
+WF_SUBSYS_RST_ASSERT       = 0x10351
+WF_SUBSYS_RST_DEASSERT     = 0x10340
+
+// From reference_gen4m/chips/mt6639/mt6639.c:1395
+RING_16_PREFETCH_CNT       = 0x4
+```
+
+**Key files**:
+- `chips/mt6639/mt6639.c` - Init sequences with CB_INFRA values (lines 2603-2838)
+- `chips/common/fw_dl.c` - Firmware loading (**fgCheckStatus=FALSE** = polling mode!)
+- `include/chips/coda/mt6639/cb_infra_slp_ctrl.h` - **Crypto MCU ownership at 0x70025034**
+
+**When to use**: CB_INFRA register values, GPIO mode setup, polling-mode firmware loading patterns
 
 #### Priority 2: Zouyonghao MT7927 Driver (reference_zouyonghao_mt7927/) - **REFERENCE IMPLEMENTATION**
 
@@ -534,6 +553,7 @@ The zouyonghao code has correct firmware loading *functions* (`mt7927_load_patch
 
 **Reference Priority Summary**:
 1. **Architecture & Registers** → reference_mtk_modules (MT6639 official code)
+1b. **CB_INFRA Values & Init Sequences** → reference_gen4m (exact register values for init)
 2. **Firmware Loading** → reference_zouyonghao_mt7927 (polling-based, proven working)
 3. **Network Operations** → Linux mt7925 (CONNAC3X family patterns, after init)
 
@@ -597,48 +617,22 @@ echo 1 | sudo tee /sys/bus/pci/rescan
 - **Don't access registers when chip is in error state** - Check for 0xffffffff first
 - **Don't assume device state is clean after failed tests** - Reboot if uncertain
 
-## Investigation Priorities
+## Implementation Path
 
-### 🎯 **ROOT CAUSE IDENTIFIED** (Phase 17 - 2026-01-31)
-
-**MT7927 ROM bootloader does NOT support mailbox command protocol!**
-
-Our driver:
-- Sends PATCH_SEM_CONTROL command
-- **Waits for mailbox response** ← **BLOCKS HERE FOREVER**
-- ROM bootloader never sends responses
-- Timeout after 5 seconds
-- Never proceeds to firmware loading
-
-**Solution**: Polling-based firmware loading (reference_zouyonghao_mt7927)
-
-### Implementation Path
-
-**Quick Test** (validate hypothesis):
-```c
-// In src/mt7927_mcu.c - change one line:
-ret = mt76_mcu_send_msg(&dev->mt76, MCU_CMD_PATCH_SEM_CONTROL,
-                       &req, sizeof(req), false);  // Don't wait!
-```
+**Root causes identified (Phase 21)**:
+1. **Wrong WFDMA base**: BAR0+0x2000 is MCU DMA; BAR0+0xd4000 is HOST DMA
+2. **Mailbox not supported**: MT7927 ROM doesn't respond to mailbox commands
 
 **Full Solution**:
-1. Create `src/mt7927_fw_load.c` (polling-based, no mailbox)
-2. Skip semaphore command entirely
-3. Add aggressive TX cleanup (before+after each chunk)
-4. Add polling delays (5-50ms for ROM processing)
-5. Skip FW_START, manually set SW_INIT_DONE (0x7C000140 bit 4)
-6. Poll status registers (0x7c060204, 0x7c0600f0)
+1. Set CB_INFRA PCIe remap (0x74037001 at BAR0+0x1f6554)
+2. Set crypto MCU ownership (BIT(0) at BAR0+0x1f5034)
+3. Configure WFDMA at correct base **0xd4000** (not 0x2000)
+4. Use polling-based firmware loading (no mailbox waits)
+5. Skip PATCH_SEM_CONTROL command entirely
+6. Add polling delays (5-50ms for ROM processing)
+7. Skip FW_START, manually set SW_INIT_DONE (0x7C000140 bit 4)
 
 See **docs/ZOUYONGHAO_ANALYSIS.md** for complete implementation details.
-
-### Invalidated Hypotheses
-
-1. ~~**L1 ASPM blocking DMA**~~ - Working driver has L1 enabled, same as ours
-2. ~~**Ring assignment wrong**~~ - Rings 15/16 validated via MT6639 analysis
-3. ~~**DMA configuration incorrect**~~ - Working driver uses same config
-4. ~~**Missing initialization step**~~ - All init steps are correct
-
-**The problem was always the mailbox protocol assumption!**
 
 ## Reference Documentation
 

@@ -4,3 +4,6 @@
 [submodule "reference_mtk_modules"]
 	path = reference_mtk_modules
 	url = https://github.com/MiCode/MTK_kernel_modules.git
+[submodule "reference_gen4m"]
+	path = reference_gen4m
+	url = https://github.com/MotorolaMobilityLLC/vendor-mediatek-kernel_modules-connectivity-wlan-core-gen4m.git

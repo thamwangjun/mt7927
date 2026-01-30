@@ -161,20 +161,59 @@
 #define MT_HIF_REMAP_L1_BASE            GENMASK(31, 16)
 #define MT_HIF_REMAP_BASE_L1            0x130000
 
-/* Addresses requiring L1 remap (0x70xxxxxx range) */
-#define CHIP_GPIO_MODE5_ADDR            0x7000535c
-#define CHIP_GPIO_MODE6_ADDR            0x7000536c
-#define CHIP_BT_SUBSYS_RST_ADDR         0x70028610
-#define CHIP_WF_SUBSYS_RST_ADDR         0x70028600
-#define CHIP_CRYPTO_MCU_OWN_ADDR        0x70025380
+/* ==========================================================================
+ * CB_INFRA Register Definitions (from reference_mtk_modules/coda/mt6639/)
+ *
+ * CRITICAL: These MUST be initialized BEFORE any WFDMA register access!
+ * Addresses in 0x70xxxxxx range require L1 remap for access.
+ * ========================================================================== */
 
-/* Reset sequence values from MTK mt6639 */
+/* CB_INFRA_MISC0 - PCIe Remap Configuration (0x70026000 base)
+ * From: reference_gen4m/chips/mt6639/mt6639.c:2727-2737 (set_cbinfra_remap)
+ */
+#define CB_INFRA_MISC0_BASE             0x70026000
+#define CB_INFRA_PCIE_REMAP_WF_ADDR     (CB_INFRA_MISC0_BASE + 0x554)  /* 0x70026554 */
+#define CB_INFRA_PCIE_REMAP_WF_BT_ADDR  (CB_INFRA_MISC0_BASE + 0x558)  /* 0x70026558 */
+#define CB_INFRA_PCIE_REMAP_WF_VALUE    0x74037001  /* From mt6639.c */
+#define CB_INFRA_PCIE_REMAP_WF_BT_VALUE 0x70007000  /* From mt6639.c */
+
+/* CB_INFRA_RGU - Reset Generation Unit (0x70028000 base)
+ * From: reference_mtk_modules/coda/mt6639/cb_infra_rgu.h
+ */
+#define CB_INFRA_RGU_BASE               0x70028000
+#define CB_INFRA_WF_SUBSYS_RST_ADDR     (CB_INFRA_RGU_BASE + 0x600)    /* 0x70028600 */
+#define CB_INFRA_BT_SUBSYS_RST_ADDR     (CB_INFRA_RGU_BASE + 0x610)    /* 0x70028610 */
+
+/* CB_INFRA_SLP_CTRL - Sleep Control (0x70025000 base)
+ * From: reference_mtk_modules/coda/mt6639/cb_infra_slp_ctrl.h
+ * IMPORTANT: Use the SET register (0x034) to grant MCU ownership, not status (0x030)
+ */
+#define CB_INFRA_SLP_CTRL_BASE          0x70025000
+#define CB_INFRA_CRYPTO_MCU_OWN_ADDR    (CB_INFRA_SLP_CTRL_BASE + 0x030)  /* Status */
+#define CB_INFRA_CRYPTO_MCU_OWN_SET_ADDR (CB_INFRA_SLP_CTRL_BASE + 0x034) /* SET register */
+
+/* CBTOP GPIO Mode Configuration (0x70005000 range)
+ * From: reference_gen4m/chips/mt6639/mt6639.c:2651-2653 (mt6639_mcu_reinit)
+ */
+#define CBTOP_GPIO_MODE5_ADDR           0x7000535c
+#define CBTOP_GPIO_MODE6_ADDR           0x7000536c
+#define GPIO_MODE5_VALUE                0x80000000  /* From mt6639.c */
+#define GPIO_MODE6_VALUE                0x80        /* From mt6639.c */
+
+/* Legacy compatibility aliases */
+#define CHIP_GPIO_MODE5_ADDR            CBTOP_GPIO_MODE5_ADDR
+#define CHIP_GPIO_MODE6_ADDR            CBTOP_GPIO_MODE6_ADDR
+#define CHIP_BT_SUBSYS_RST_ADDR         CB_INFRA_BT_SUBSYS_RST_ADDR
+#define CHIP_WF_SUBSYS_RST_ADDR         CB_INFRA_WF_SUBSYS_RST_ADDR
+#define CHIP_CRYPTO_MCU_OWN_ADDR        CB_INFRA_CRYPTO_MCU_OWN_SET_ADDR  /* Use SET register! */
+
+/* Reset sequence values from MTK mt6639
+ * From: reference_gen4m/chips/mt6639/mt6639.c:2660-2669
+ */
 #define WF_SUBSYS_RST_ASSERT            0x10351
 #define WF_SUBSYS_RST_DEASSERT          0x10340
 #define BT_SUBSYS_RST_ASSERT            0x10351
 #define BT_SUBSYS_RST_DEASSERT          0x10340
-#define GPIO_MODE5_VALUE                0x80000000
-#define GPIO_MODE6_VALUE                0x80
 
 /* WF_SUBSYS_RST bit fields for RMW */
 #define WF_SUBSYS_RST_WF_MASK           0x00000010
@@ -572,7 +611,51 @@ static int init_download(struct test_dev *dev, u32 addr, u32 len, u32 mode)
 }
 
 /* ============================================================
- * Phase 0: MT7927 WiFi/BT Subsystem Reset (CRITICAL - must run first!)
+ * Phase 0a: CB_INFRA PCIe Remap Initialization (CRITICAL - must run FIRST!)
+ * Reference: reference_gen4m/chips/mt6639/mt6639.c:2727-2737 (set_cbinfra_remap)
+ *
+ * This sets up the PCIe to WFDMA address translation.
+ * Without this, WFDMA registers may not be accessible!
+ * ============================================================ */
+
+static int init_cbinfra_remap(struct test_dev *dev)
+{
+	u32 val;
+
+	dev_info(&dev->pdev->dev, "=== Phase 0a: CB_INFRA PCIe Remap Initialization ===\n");
+
+	/* Step 1: Set PCIe remap for WiFi WFDMA access
+	 * From mt6639.c: HAL_MCR_WR(ad, CB_INFRA_MISC0_CBTOP_PCIE_REMAP_WF_ADDR, 0x74037001)
+	 * This maps PCIe address space to the correct WFDMA registers
+	 */
+	dev_info(&dev->pdev->dev, "  Setting CB_INFRA PCIE_REMAP_WF (0x%08x)...\n",
+		 CB_INFRA_PCIE_REMAP_WF_ADDR);
+	mt_wr_remap(dev, CB_INFRA_PCIE_REMAP_WF_ADDR, CB_INFRA_PCIE_REMAP_WF_VALUE);
+	val = mt_rr_remap(dev, CB_INFRA_PCIE_REMAP_WF_ADDR);
+	dev_info(&dev->pdev->dev, "    PCIE_REMAP_WF = 0x%08x (expected 0x%08x) %s\n",
+		 val, CB_INFRA_PCIE_REMAP_WF_VALUE,
+		 val == CB_INFRA_PCIE_REMAP_WF_VALUE ? "OK" : "MISMATCH!");
+
+	/* Step 2: Set PCIe remap for WiFi/BT shared area
+	 * From mt6639.c: HAL_MCR_WR(ad, CB_INFRA_MISC0_CBTOP_PCIE_REMAP_WF_BT_ADDR, 0x70007000)
+	 */
+	dev_info(&dev->pdev->dev, "  Setting CB_INFRA PCIE_REMAP_WF_BT (0x%08x)...\n",
+		 CB_INFRA_PCIE_REMAP_WF_BT_ADDR);
+	mt_wr_remap(dev, CB_INFRA_PCIE_REMAP_WF_BT_ADDR, CB_INFRA_PCIE_REMAP_WF_BT_VALUE);
+	val = mt_rr_remap(dev, CB_INFRA_PCIE_REMAP_WF_BT_ADDR);
+	dev_info(&dev->pdev->dev, "    PCIE_REMAP_WF_BT = 0x%08x (expected 0x%08x) %s\n",
+		 val, CB_INFRA_PCIE_REMAP_WF_BT_VALUE,
+		 val == CB_INFRA_PCIE_REMAP_WF_BT_VALUE ? "OK" : "MISMATCH!");
+
+	/* Step 3: Brief delay for remap to take effect */
+	usleep_range(100, 200);
+
+	dev_info(&dev->pdev->dev, "  CB_INFRA PCIe remap initialization complete\n");
+	return 0;
+}
+
+/* ============================================================
+ * Phase 0b: MT7927 WiFi/BT Subsystem Reset (CRITICAL - must run after remap!)
  * Reference: pci.c::mt7927_wfsys_reset()
  *
  * This resets the entire WiFi subsystem including WFDMA.
@@ -583,7 +666,7 @@ static int wfsys_reset(struct test_dev *dev)
 {
 	u32 val;
 
-	dev_info(&dev->pdev->dev, "=== Phase 0: WiFi/BT Subsystem Reset ===\n");
+	dev_info(&dev->pdev->dev, "=== Phase 0b: WiFi/BT Subsystem Reset ===\n");
 
 	/* Step 1: GPIO mode configuration */
 	dev_info(&dev->pdev->dev, "  Setting GPIO mode registers...\n");
@@ -1307,7 +1390,16 @@ static int test_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 	dev_info(&pdev->dev, "  RAM: %s (%zu bytes)\n", FW_RAM, dev->fw_ram->size);
 
-	/* Phase 0: MT7927 WiFi/BT subsystem reset - CRITICAL, must run first!
+	/* Phase 0a: CB_INFRA PCIe remap - CRITICAL, must run FIRST!
+	 * This enables proper PCIe to WFDMA address translation.
+	 * Reference: reference_gen4m/chips/mt6639/mt6639.c:2727-2737 */
+	ret = init_cbinfra_remap(dev);
+	if (ret) {
+		dev_err(&pdev->dev, "CB_INFRA remap failed: %d\n", ret);
+		/* Continue anyway - may work without it */
+	}
+
+	/* Phase 0b: MT7927 WiFi/BT subsystem reset - CRITICAL, must run after remap!
 	 * This enables WFDMA ring register writes. */
 	ret = wfsys_reset(dev);
 	if (ret) {
