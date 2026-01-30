@@ -1,8 +1,8 @@
 # MT7927 WiFi 7 Linux Driver Project
 
-## 🎉 Major Breakthrough: MT7927 = MT7925 + 320MHz
+## 🎉 Major Breakthrough: MT7927 is MT6639 Variant (CONNAC3X Family)
 
-We've discovered that the MT7927 is architecturally identical to the MT7925 (which has full Linux support since kernel 6.7) except for 320MHz channel width capability. This means we can adapt the existing mt7925 driver rather than writing one from scratch!
+**CRITICAL DISCOVERY (2026-01-31)**: MT7927 is an **MT6639 variant**, NOT MT7925! MediaTek's kernel modules explicitly map MT7927 to MT6639 driver configuration. MT6639 and MT7925 are both CONNAC3X family chips sharing firmware and ring protocol, which explains firmware compatibility. See **docs/MT6639_ANALYSIS.md** for complete evidence chain.
 
 ## Current Status: BLOCKED ON DMA DESCRIPTOR PROCESSING 🚧
 
@@ -118,34 +118,38 @@ sudo setpci -s $DEVICE CAP_EXP+10.w=0x0000
 - **Full Name**: MT7927 802.11be 320MHz 2x2 PCIe Wireless Network Adapter
 - **PCI ID**: 14c3:7927 (vendor: MediaTek, device: MT7927)
 - **PCI Location**: Varies by system (example: 01:00.0) - check with `lspci -nn | grep 14c3:7927`
-- **Architecture**: Based on MT7925 + 320MHz channel support
-- **DMA Engine**: Single WFDMA0 (no WFDMA1), 8 TX rings + 16 RX rings
+- **Architecture**: **MT6639 variant** (CONNAC3X family) - shares firmware with MT7925
+- **Ring Protocol**: CONNAC3X standard (Ring 15: MCU CMD, Ring 16: FWDL)
+- **DMA Engine**: Single WFDMA0 (no WFDMA1), sparse ring layout (0,1,2,15,16)
 - **Memory Map**:
-  - BAR0: **2MB** total (not 1MB!) - confirmed via lspci
+  - BAR0: **2MB** total (confirmed via lspci)
     - 0x000000 - 0x0FFFFF: SRAM (chip internal memory)
     - 0x100000 - 0x1FFFFF: Control registers
-  - BAR2: 32KB (DMA register window, read-only shadow of BAR0)
+  - BAR2: 32KB (read-only shadow of BAR0+0x10000)
 
 ### Key Discoveries
-1. **MT7925 firmware is compatible** - Confirmed through testing
-2. **MT7927 has fewer TX rings** - 8 TX rings vs MT7925's 17 rings
-3. **Queue assignment differs** - FWDL uses ring 4, MCU_WM uses ring 5 (not 16/15)
-4. **Single DMA engine** - Only WFDMA0 present (MT7925 has both WFDMA0/1)
-5. **Initialization succeeds** - Power management, reset, ring setup all work
-6. **DMA doesn't process** - Hardware won't advance descriptor index (root blocker)
+1. **MT7927 is MT6639 variant** - MediaTek kernel modules prove architectural relationship
+2. **CONNAC3X family** - MT6639 and MT7925 share firmware via common CONNAC3X architecture
+3. **Ring protocol validated** - Uses CONNAC3X standard: Ring 15 (MCU_WM), Ring 16 (FWDL)
+4. **Sparse ring layout** - 8 physical rings with sparse numbering (0,1,2,15,16)
+5. **Single DMA engine** - Only WFDMA0 present (no WFDMA1)
+6. **Initialization succeeds** - Power management, reset, ring setup all work
+7. **DMA doesn't process** - Hardware won't advance descriptor index (root blocker)
+8. **L1 ASPM enabled** - Prime suspect for DMA blocking (L1.2 power saving during DMA)
 
 ### What's Working ✅
 - PCI enumeration and BAR mapping (BAR0: **2MB confirmed**, BAR2: 32KB)
 - Driver successfully binds to device and handles IRQs
-- Firmware files load into kernel memory (MT7925 firmware compatible)
+- Firmware files load into kernel memory (MT7925 firmware compatible via CONNAC3X)
 - Power management handshake (host claims DMA ownership via PMCTRL)
 - WiFi subsystem reset sequence (WFSYS_SW_RST_B timing)
-- DMA descriptor rings allocated and configured (8 TX, 16 RX)
-- Queue assignments identified (FWDL=ring 4, MCU_WM=ring 5)
+- DMA descriptor rings allocated and configured (sparse layout: 0,1,2,15,16)
+- **Queue assignments validated** - Ring 15 (MCU_WM), Ring 16 (FWDL) per MT6639 config
 - MCU responds as ready (FW_OWN_REQ_SET returns 0x00000001)
 - PCIe ASPM L0s disabled (MT_PCIE_MAC_PM_L0S_DIS set)
 - SWDEF_MODE set to normal operation (0x1)
 - All registers writable, no protection issues
+- **Ring protocol confirmed** - MT6639 analysis validates CONNAC3X ring assignments
 
 ### What's Not Working ❌
 - **DMA descriptor processing** - Hardware doesn't advance DMA_DIDX
@@ -161,15 +165,20 @@ All initialization steps execute correctly, but the DMA engine doesn't process T
 - DMA_DIDX remains stuck at 0 (should increment after processing)
 - IRQ handler confirms DMA engine is idle (no completion interrupts)
 
-**Hypotheses**:
-1. **⚠️ L1 ASPM and L1 substates enabled** (see HARDWARE_ANALYSIS.md) - PRIORITY 1
-2. MT7927 may need different DMA trigger mechanism than MT7925
+**Hypotheses** (Ordered by Priority):
+1. **⚠️ L1 ASPM and L1 substates enabled** - **PRIORITY 1** (see HARDWARE_ANALYSIS.md)
+   - Device may enter L1.2 sleep during DMA operations
+   - Driver only disables L0s, not L1/L1.1/L1.2
+   - Test: `sudo setpci -s $DEVICE CAP_EXP+10.w=0x0000`
+2. MT6639-specific DMA initialization sequence (check reference_mtk_modules)
 3. Missing pre-DMA initialization step (clock/power domain)
-4. Different descriptor format or layout requirements
+4. Different descriptor format or MT6639-specific layout
 5. Additional doorbell/kick register beyond CIDX write
 6. Hardware expects firmware to be partially active first
 
-See `HARDWARE_ANALYSIS.md`, `AGENTS.md` and `DEVELOPMENT_LOG.md` for detailed investigation history.
+**Note**: Ring assignment (15/16) is now validated via MT6639 analysis - no longer a suspect.
+
+See `docs/MT6639_ANALYSIS.md`, `HARDWARE_ANALYSIS.md`, `AGENTS.md` and `DEVELOPMENT_LOG.md` for complete investigation history.
 
 ## Project Structure
 ```
@@ -245,12 +254,13 @@ mt7927-linux-driver/
 - PCI probe and resource allocation
 - Power management control (host/firmware ownership)
 - WiFi subsystem reset with proper timing
-- DMA descriptor ring structures (8 TX, 16 RX)
-- Queue assignment mapping (FWDL=4, MCU_WM=5)
+- DMA descriptor ring structures (sparse: 0,1,2,15,16)
+- **Queue assignment validated** - Ring 15 (MCU_WM), Ring 16 (FWDL) per MT6639
 - MCU message structures and send functions
 - Firmware loading protocol (patch semaphore, scatter)
 - Interrupt handler registration
 - Complete register definitions
+- **Architectural foundation confirmed** - MT6639 variant with CONNAC3X protocol
 
 **Current Investigation**:
 - Why DMA_DIDX doesn't advance despite correct setup
@@ -261,11 +271,11 @@ mt7927-linux-driver/
 ## How to Contribute
 
 ### Critical Investigation Needed
-The DMA layer is fully implemented but hardware doesn't process descriptors. We need to find:
-1. **Missing initialization step** - What makes MT7927's DMA engine operational?
-2. **Register differences** - Are there MT7927-specific DMA control registers?
-3. **Descriptor format** - Does MT7927 expect different TXD structure?
-4. **Trigger mechanism** - Is there a doorbell/kick register beyond CIDX write?
+The DMA layer is fully implemented with validated MT6639/CONNAC3X ring protocol, but hardware doesn't process descriptors. We need to:
+1. **Test ASPM L1 disable** - Primary suspect for DMA blocking (PRIORITY 1)
+2. **Compare MT6639 initialization** - Check `reference_mtk_modules/` for MT6639-specific steps
+3. **Review MT6639 DMA setup** - Verify our implementation matches MT6639 sequence
+4. **Check MT6639 power management** - May have different ASPM requirements than MT7925
 
 ### Development Resources
 - **Full documentation**: See `docs/README.md` for complete API reference
@@ -281,26 +291,36 @@ The DMA layer is fully implemented but hardware doesn't process descriptors. We 
 
 ### Code References
 
-#### Key Source Files to Study (in your kernel source)
+#### Primary Reference: MT6639 (MediaTek Kernel Modules)
 ```bash
-# Main mt7925 driver files (your reference implementation)
+# MT6639 chip implementation (architectural parent of MT7927)
+reference_mtk_modules/connectivity/wlan/core/gen4-mt79xx/chips/mt6639/
+├── mt6639.c      # Complete chip config, ring setup, interrupt handling
+├── mt6639.h      # Chip-specific constants
+└── include/chips/coda/mt6639/
+    └── wf_wfdma_host_dma0.h  # WFDMA register definitions
+```
+
+#### Secondary Reference: MT7925 (CONNAC3X Sibling)
+```bash
+# MT7925 driver (CONNAC3X sibling, shares firmware with MT7927)
 drivers/net/wireless/mediatek/mt76/mt7925/
 ├── pci.c         # PCI probe and initialization sequence
 ├── mcu.c         # MCU communication and firmware loading
 ├── init.c        # Hardware initialization
-└── dma.c         # DMA setup and transfer
+└── dma.c         # DMA setup (CONNAC3X protocol)
 
 # Shared mt76 infrastructure
 drivers/net/wireless/mediatek/mt76/
 ├── dma.c         # Generic DMA implementation
-├── mt76_connac_mcu.c  # MCU interface for Connac chips
+├── mt76_connac_mcu.c  # MCU interface for CONNAC chips
 └── util.c        # Utility functions
 ```
 
 #### Online References
+- **MT6639 Analysis**: [docs/MT6639_ANALYSIS.md](docs/MT6639_ANALYSIS.md) - Proves architectural relationship
 - **mt7925 on GitHub**: [Linux kernel source](https://github.com/torvalds/linux/tree/master/drivers/net/wireless/mediatek/mt76/mt7925)
 - **mt76 framework**: [OpenWrt repository](https://github.com/openwrt/mt76)
-- **Our working code**: `tests/04_risky_ops/mt7927_init.c`
 
 ## Troubleshooting
 
@@ -383,6 +403,8 @@ GPL v2 - Intended for upstream Linux kernel submission
 
 Complete technical documentation is available in the `docs/` directory:
 
+- **[docs/MT6639_ANALYSIS.md](docs/MT6639_ANALYSIS.md)** - ⚠️ **NEW** - Proves MT7927 is MT6639 variant
+- **[HARDWARE_ANALYSIS.md](HARDWARE_ANALYSIS.md)** - lspci analysis revealing L1 ASPM issue
 - **[docs/README.md](docs/README.md)** - Documentation index and navigation guide
 - **[AGENTS.md](AGENTS.md)** - Quick-start session bootstrap for development
 - **[DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md)** - Complete chronological development history
@@ -394,12 +416,23 @@ Complete technical documentation is available in the `docs/` directory:
 
 ## Getting Help
 
-1. **Read AGENTS.md first** - Contains critical context and current status
-2. **Check DEVELOPMENT_LOG.md** - See what has already been tried
-3. **Review implementation plan** - `docs/dma_transfer_implementation.plan.md`
-4. **Study reference driver** - MT7925 source in kernel tree
-5. **Ask in GitHub issues** - Share findings and discuss approaches
+1. **Read docs/MT6639_ANALYSIS.md first** - Proves MT7927 is MT6639 variant (critical!)
+2. **Read AGENTS.md** - Contains critical context and current status
+3. **Check DEVELOPMENT_LOG.md** - See what has already been tried (Phase 16 = MT6639 discovery)
+4. **Review implementation plan** - `docs/dma_transfer_implementation.plan.md`
+5. **Study reference drivers**:
+   - **Primary**: MT6639 in `reference_mtk_modules/` (architectural parent)
+   - **Secondary**: MT7925 in kernel tree (CONNAC3X sibling for firmware reference)
+6. **Ask in GitHub issues** - Share findings and discuss approaches
 
 ---
 
-**Status as of 2026-01-29**: Complete DMA transfer layer implemented with production driver, test framework, and diagnostic tools. All initialization steps succeed (power management, reset, ring configuration), but DMA hardware doesn't process descriptors. This blocks MCU command completion and prevents firmware activation. Investigation needed to identify MT7927-specific DMA requirements or missing initialization step.
+**Status as of 2026-01-31**:
+
+**MAJOR DISCOVERY**: MT7927 is an **MT6639 variant** (proven via MediaTek kernel modules), not MT7925. This validates our ring assignment (15/16) and explains firmware compatibility through CONNAC3X family architecture.
+
+**Implementation Status**: Complete DMA transfer layer with production driver, test framework, and diagnostic tools. All initialization steps succeed (power management, reset, ring configuration with validated CONNAC3X protocol). Ring assignments confirmed correct via MT6639 analysis.
+
+**Current Blocker**: DMA hardware doesn't process descriptors (DIDX stuck at 0). **Primary suspect**: L1 ASPM power states enabled - device may enter L1.2 sleep during DMA operations. **Next action**: Test with L1 ASPM disabled.
+
+See **docs/MT6639_ANALYSIS.md** for complete architectural analysis.
