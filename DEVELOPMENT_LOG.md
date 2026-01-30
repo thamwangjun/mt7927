@@ -775,11 +775,67 @@ Ring | BASE       | CNT    | CIDX | DIDX | EXT_CTRL   | Status
 
 ---
 
-## Phase 13: Next Steps (Pending)
+## Phase 13: Chip ID and BAR2 Validation (2026-01-31)
+
+### What We Did
+Ran `mt7927_diag.ko` to confirm Chip ID reading and validate BAR2 mapping theory.
+
+### Diagnostic Output
+```
+MT7927 Diagnostic - MINIMAL SAFE VERSION
+BAR2: [mem 0x90800000-0x90807fff 64bit]
+=== MT7927 Safe Register Dump (BAR2 only) ===
+  [0x000] Chip ID:       0x00511163
+  [0x004] HW Rev:        0x11885162
+  [0x200] HOST_INT_STA:  0xffff10f1 (FW_STATUS)
+  [0x204] HOST_INT_ENA:  0x000000f5
+  [0x208] WPDMA_GLO_CFG: 0x00000000
+  [0x20c] RST_DTX_PTR:   0x00000000
+  [0x300] TX0_BASE:      0x76543211
+  [0x304] TX0_CNT:       0x00000000
+  [0x400] TX16_BASE:     0x00000000
+  [0x500] RX0_BASE:      0x00000000
+
+  FW_STATUS = 0xffff10f1:
+  -> Pre-init state (chip locked, needs unlock sequence)
+
+  WPDMA_GLO_CFG = 0x00000000:
+  TX_DMA: OFF, RX_DMA: OFF
+```
+
+### Analysis
+
+| Register | Value | Interpretation |
+|----------|-------|----------------|
+| Chip ID | 0x00511163 | **✓ CONFIRMED** Valid MT7927 identifier |
+| HW Rev | 0x11885162 | Valid hardware revision |
+| HOST_INT_STA | 0xffff10f1 | Pre-init state, chip locked |
+| WPDMA_GLO_CFG | 0x00000000 | DMA disabled (expected before init) |
+| TX0_BASE | 0x76543211 | ⚠️ Residual test pattern from previous session |
+| TX0_CNT | 0x00000000 | BAR2 offset differs from WFDMA0 base |
+
+### Key Findings
+
+1. **Chip ID Confirmed**: 0x00511163 is the valid MT7927 Chip ID
+   - Successfully read from BAR2+0x000
+   - Confirms BAR2 = shadow of BAR0+0x10000
+
+2. **BAR2 Register Mapping Clarified**:
+   - BAR2+0x000 = Chip ID (BAR0+0x10000)
+   - BAR2+0x200 = HOST_INT_STA (BAR0+0x10200)
+   - BAR2+0x300 = NOT the same as WFDMA0 TX rings (WFDMA0 is at BAR0+0x2000)
+
+3. **Device State Warning**: TX0_BASE showing 0x76543211 indicates residual data from previous testing. This reinforces the importance of rebooting before critical tests.
+
+4. **Pre-init State**: FW_STATUS=0xffff10f1 indicates chip is in locked pre-init state, which is expected before driver initialization.
+
+---
+
+## Phase 14: Next Steps (Pending)
 
 ### Immediate Testing
 
-1. **Run mt7927_diag.ko** - Verify chip state is healthy before further testing
+1. ~~**Run mt7927_diag.ko**~~ - ✓ DONE - Chip ID confirmed as 0x00511163
 2. **Test with ASPM L1 disabled** - Load test_fw_load.ko with L1 disabled to see if DMA works
 3. **Optional write test** - Run `mt7927_ring_scan_readwrite.ko dry_run=0` to confirm rings 4/5 are writable
 

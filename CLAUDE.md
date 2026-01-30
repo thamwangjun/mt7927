@@ -138,6 +138,8 @@ diag/               # 18 hardware exploration/diagnostic modules
 
 | Property | Value |
 |----------|-------|
+| Chip ID | **0x00511163** (confirmed 2026-01-31) |
+| HW Revision | 0x11885162 |
 | PCI Location | 01:00.0 (varies by system) |
 | BAR0 | 2MB @ 0x90600000 (64-bit, non-prefetchable) |
 | BAR2 | 32KB @ 0x90800000 (64-bit, non-prefetchable) |
