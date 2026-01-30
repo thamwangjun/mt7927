@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# MT7927 DMA Implementation Test Modules
+#
+
+obj-m += test_power_ctrl.o
+obj-m += test_wfsys_reset.o
+obj-m += test_dma_queues.o
+obj-m += test_fw_load.o

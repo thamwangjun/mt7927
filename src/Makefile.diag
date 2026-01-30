@@ -1,0 +1,11 @@
+# Makefile for MT7927 Diagnostic Module (READ ONLY)
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+obj-m := mt7927_diag.o
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean

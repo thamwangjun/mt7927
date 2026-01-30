@@ -8,10 +8,9 @@ PWD := $(shell pwd)
 # Default target
 all: driver tests tools
 
-# Driver module (when ready)
+# Driver module
 driver:
-	@echo "Driver not yet implemented - in development"
-	@# $(MAKE) -C $(KDIR) M=$(PWD)/src modules
+	$(MAKE) -C $(KDIR) M=$(PWD)/src modules
 
 # Test modules
 tests:
@@ -24,7 +23,7 @@ tools:
 # Clean everything
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD)/tests clean
-	@# $(MAKE) -C $(KDIR) M=$(PWD)/src clean
+	$(MAKE) -C $(KDIR) M=$(PWD)/src clean
 	find . -name "*.log" -type f -delete
 	find . -name "*.o.cmd" -type f -delete
 	find . -name ".*.cmd" -type f -delete
@@ -34,11 +33,11 @@ clean:
 	find . -name "modules.order" -type f -delete
 	find . -name "Module.symvers" -type f -delete
 
-# Install driver (when ready)
-install:
-	@echo "Driver installation not yet available"
-	@# sudo cp src/mt7927.ko /lib/modules/$(shell uname -r)/kernel/drivers/net/wireless/
-	@# sudo depmod -a
+# Install driver
+install: driver
+	sudo cp src/mt7927.ko /lib/modules/$(shell uname -r)/kernel/drivers/net/wireless/
+	sudo depmod -a
+	@echo "Driver installed. Load with: sudo modprobe mt7927"
 
 # Check chip state
 check:

@@ -41,3 +41,9 @@ obj-m += tools/mt7927_final_analysis.o
 obj-m += 04_risky_ops/test_mcu_direct.o
 obj-m += 04_risky_ops/test_read_config.o
 obj-m += 04_risky_ops/test_trigger_fw.o
+
+# DMA Implementation tests (Phase 2)
+obj-m += 05_dma_impl/test_power_ctrl.o
+obj-m += 05_dma_impl/test_wfsys_reset.o
+obj-m += 05_dma_impl/test_dma_queues.o
+obj-m += 05_dma_impl/test_fw_load.o
