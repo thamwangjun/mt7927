@@ -16,10 +16,11 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 
 1. **docs/ZOUYONGHAO_ANALYSIS.md** - 🎯 **ROOT CAUSE FOUND** - No mailbox protocol in MT7927 ROM!
 2. **docs/MT6639_ANALYSIS.md** - Proves MT7927 is MT6639 variant, validates rings 15/16
-3. **DEVELOPMENT_LOG.md** - Complete chronological history (Phase 17 = root cause discovery)
-4. **AGENTS.md** - Session bootstrap with current blocker details, hardware context, and what's been tried
-5. **HARDWARE_ANALYSIS.md** - lspci analysis (L1 ASPM hypothesis now invalidated)
-6. **README.md** - Project overview, build instructions, expected outputs
+3. **docs/REFERENCE_SOURCES.md** - Analysis of reference code origins and authoritative sources
+4. **DEVELOPMENT_LOG.md** - Complete chronological history (Phase 17 = root cause discovery)
+5. **AGENTS.md** - Session bootstrap with current blocker details, hardware context, and what's been tried
+6. **HARDWARE_ANALYSIS.md** - lspci analysis (L1 ASPM hypothesis now invalidated)
+7. **README.md** - Project overview, build instructions, expected outputs
 
 ## Build System
 
@@ -462,20 +463,80 @@ sudo dmesg | tail -60
 
 ### Reference Implementations
 
-**Primary Reference: MT6639** (MediaTek Kernel Modules)
-The `reference_mtk_modules/connectivity/wlan/core/gen4-mt79xx/chips/mt6639/` directory contains MT6639 implementation. Key files:
-- `mt6639.c` - Complete chip configuration, ring setup, interrupt handling
-- `mt6639.h` - Chip-specific constants and definitions
-- `include/chips/coda/mt6639/wf_wfdma_host_dma0.h` - WFDMA register definitions
+**For complete analysis of all reference sources, see [docs/REFERENCE_SOURCES.md](docs/REFERENCE_SOURCES.md)**
 
-**Secondary Reference: MT7925** (Linux mt76 driver)
-The `reference/linux/drivers/net/wireless/mediatek/mt76/mt7925/` directory shows CONNAC3X sibling:
-- `pci.c` - PCI initialization sequence
-- `mcu.c` - MCU protocol and firmware loading
-- `dma.c` - DMA setup (CONNAC3X family shared protocol)
-- `../dma.c` - Shared mt76 DMA infrastructure
+MT7927 driver development uses three reference sources in priority order:
 
-**Note**: MT7927 uses MT6639 driver data, so MT6639 code is architecturally authoritative. MT7925 is useful for understanding CONNAC3X family patterns and firmware compatibility.
+#### Priority 1: MediaTek Vendor Kernel Modules (reference_mtk_modules/) - **MOST AUTHORITATIVE**
+
+**Source**: Official MediaTek BSP from Xiaomi "rodin" device kernel tree
+- Repository: https://github.com/Fede2782/MTK_modules (git submodule)
+- Origin: Xiaomi device kernel (Author: Yue Kang <yuekang@xiaomi.com>, Feb 2025)
+- License: BSD-2-Clause (WLAN core) + GPL-2.0 (chip drivers)
+
+**Why this is most authoritative**:
+1. **Official MediaTek code** - Not reverse-engineered or community code
+2. **Explicit MT7927→MT6639 mapping** - PCI device table proves architectural relationship:
+   ```c
+   // File: connectivity/wlan/core/gen4m/os/linux/hif/pcie/pcie.c:170-172
+   {   PCI_DEVICE(MTK_PCI_VENDOR_ID, NIC7927_PCIe_DEVICE_ID),  // 0x7927
+       .driver_data = (kernel_ulong_t)&mt66xx_driver_data_mt6639},
+   ```
+3. **Production-tested** - Shipped in millions of Xiaomi devices
+4. **Complete implementation** - All features, not just upstreamed subset
+5. **Register-level documentation** - coda/ headers have exact bit definitions
+
+**Key files**:
+- `connectivity/wlan/core/gen4m/chips/mt6639/mt6639.c` - Complete chip implementation
+- `connectivity/wlan/core/gen4m/chips/mt6639/mt6639.h` - Chip-specific constants
+- `connectivity/wlan/core/gen4m/chips/mt6639/coda/mt6639/wf_wfdma_host_dma0.h` - DMA registers
+- `connectivity/wlan/core/gen4m/chips/mt6639/coda/mt6639/wf_pse_top.h` - PSE registers
+- `connectivity/wlan/core/gen4m/chips/mt6639/coda/mt6639/pcie_mac_ireg.h` - PCIe registers
+
+**When to use**: Architecture, register definitions, initialization sequences, DMA configuration
+
+#### Priority 2: Zouyonghao MT7927 Driver (reference_zouyonghao_mt7927/) - **WORKING IMPLEMENTATION**
+
+**Source**: Community working driver
+- Repository: https://github.com/zouyonghao/mt7927 (git submodule)
+- Status: Successfully loads firmware and creates network interface
+
+**Why this is critical**:
+1. **Proven to work** - Firmware loading succeeds on MT7927 hardware
+2. **Root cause discovery** - Proves polling-based protocol works (no mailbox)
+3. **DMA validation** - Hardware works when correct protocol is used
+
+**Key files**:
+- `mt7927_fw_load.c` - Polling-based firmware loader (NO mailbox waits)
+
+**When to use**: Firmware loading protocol, polling delays, TX cleanup patterns
+
+#### Priority 3: Linux Kernel MT7925 (drivers/net/wireless/mediatek/mt76/mt7925/) - **CONNAC3X PATTERNS**
+
+**Source**: Upstream Linux kernel driver
+- License: GPL-2.0
+- Status: Well-documented, high quality, but different architecture
+
+**Why use with caution**:
+1. CONNAC3X family patterns (firmware format, descriptor structures)
+2. MT7925 has different ring layout (0-16 dense vs MT7927 sparse)
+3. MT7925 mailbox protocol works in ROM (MT7927 ROM doesn't support it)
+
+**Key files**:
+- `mt7925/pci.c` - PCI infrastructure (use for patterns, not specifics)
+- `mt7925/mcu.c` - MCU protocol (RUNTIME only, NOT firmware loading)
+- `mt7925/mac.c` - MAC layer operations
+
+**When to use**: General CONNAC3X patterns, mac80211 integration, power management (after firmware loads)
+
+**When NOT to use**: Firmware loading protocol, ring assignments, initialization sequence
+
+---
+
+**Reference Priority Summary**:
+1. **Architecture & Registers** → reference_mtk_modules (MT6639 official code)
+2. **Firmware Loading** → reference_zouyonghao_mt7927 (polling-based, proven working)
+3. **Network Operations** → Linux mt7925 (CONNAC3X family patterns, after init)
 
 ### Debugging DMA Issues
 1. Check ring indices via test modules (test_dma_queues.ko shows CIDX/DIDX/CPU_DIDX)
