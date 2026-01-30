@@ -586,3 +586,217 @@ The MT7927 driver has progressed significantly:
 - Firmware loads into memory
 
 The remaining blocker is that **DMA hardware doesn't process TX descriptors** - the CPU writes descriptors (CIDX advances) but hardware never picks them up (DIDX stays 0). This prevents MCU commands from being sent, which blocks firmware activation.
+
+---
+
+## Phase 11: Comprehensive Code Review and Fixes (2026-01-30)
+
+### What We Did
+Performed comprehensive code review of all source files to identify issues accumulated during development.
+
+### Issues Found and Fixed
+
+#### 1. Prefetch Configuration Using Wrong Rings
+**Location**: `src/mt7927_dma.c`
+**Problem**: Prefetch configuration was still referencing non-existent rings 15/16 (MT7925 style)
+**Fix**:
+```c
+// Before (WRONG - rings 15/16 don't exist):
+mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(15), PREFETCH(0x0500, 0x4));
+mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(16), PREFETCH(0x0540, 0x4));
+
+// After (CORRECT - use actual MT7927 rings):
+mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(4), PREFETCH(0x0500, 0x4));  /* FWDL ring 4 */
+mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(5), PREFETCH(0x0540, 0x4));  /* MCU WM ring 5 */
+```
+
+#### 2. Ring Config Wipe Detection Not Halting Initialization
+**Location**: `src/mt7927_dma.c`
+**Problem**: When ring configuration was wiped, code only warned but continued, leading to DMA attempts on invalid rings
+**Fix**:
+```c
+// Before: Just a warning, continued anyway
+if (tx5_base == 0)
+    dev_warn(dev->dev, "Ring config may have been wiped!\n");
+
+// After: Return error to halt initialization
+if (tx5_base == 0) {
+    dev_err(dev->dev, "Ring config was wiped during enable!\n");
+    return -EIO;
+}
+```
+
+#### 3. TX Interrupt Handler Swapped Queue Indices
+**Location**: `src/mt7927_pci.c`
+**Problem**: Interrupt handler for rings 4/5 had swapped tx_q indices
+**Fix**:
+```c
+// Before (WRONG - indices were swapped):
+if (intr & HOST_TX_DONE_INT_ENA4)
+    mt7927_tx_complete(dev, &dev->tx_q[1]);
+if (intr & HOST_TX_DONE_INT_ENA5)
+    mt7927_tx_complete(dev, &dev->tx_q[2]);
+
+// After (CORRECT):
+if (intr & HOST_TX_DONE_INT_ENA4)
+    mt7927_tx_complete(dev, &dev->tx_q[2]);  /* FWDL queue (ring 4) */
+if (intr & HOST_TX_DONE_INT_ENA5)
+    mt7927_tx_complete(dev, &dev->tx_q[1]);  /* MCU WM queue (ring 5) */
+```
+
+#### 4. MCU Response Sequence Mismatch Only Warned
+**Location**: `src/mt7927_mcu.c`
+**Problem**: When MCU response had wrong sequence number, code only warned but returned success
+**Fix**:
+```c
+// Before: Just warning, returned success
+if (rxd->seq != seq) {
+    dev_warn(...);
+}
+return skb;  // Still returned (potentially wrong) skb
+
+// After: Return error on mismatch
+if (rxd->seq != seq) {
+    dev_err(dev->dev, "MCU response seq mismatch: expected %d, got %d\n",
+            seq, rxd->seq);
+    dev_kfree_skb(resp_skb);
+    return -EIO;
+}
+```
+
+#### 5. wait_event_timeout Edge Case
+**Location**: `src/mt7927_mcu.c`
+**Problem**: wait_event_timeout can return 0 on timeout OR if condition was already true
+**Fix**:
+```c
+// Before: Only checked ret == 0
+if (!ret) return -ETIMEDOUT;
+
+// After: Check for both timeout cases
+if (ret <= 0) {
+    dev_err(dev->dev, "MCU command 0x%04x timeout (ret=%d)\n", cmd, ret);
+    return -ETIMEDOUT;
+}
+```
+
+#### 6. BAR Comments Were Misleading
+**Location**: `src/mt7927.h`
+**Problem**: Comments suggested BAR2 was the main register space
+**Fix**: Updated comments to clarify BAR0 is the main 2MB register space, BAR2 is read-only shadow
+
+#### 7. diag/Makefile Using $(PWD)
+**Location**: `diag/Makefile`
+**Problem**: $(PWD) doesn't work correctly in submake calls
+**Fix**: Changed to $(CURDIR) for reliable path resolution
+
+---
+
+## Phase 12: TX Ring Validation (2026-01-30)
+
+### What We Did
+Created and ran diagnostic modules to validate the hypothesis that MT7927 has exactly 8 TX rings (0-7), not 17+ like MT7925.
+
+### New Diagnostic Modules Created
+
+#### 1. `diag/mt7927_ring_scan_readonly.c`
+**Purpose**: Safely scan TX rings 0-17 using read-only register access
+**Features**:
+- Reads BASE, CNT, CIDX, DIDX, EXT_CTRL for each ring
+- Uses heuristic: CNT != 0 && CNT != 0xFFFFFFFF && CNT <= 0x10000 = likely valid
+- No writes performed - completely safe
+
+#### 2. `diag/mt7927_ring_scan_readwrite.c`
+**Purpose**: Write-test diagnostic with safety features
+**Features**:
+- Default dry_run=1 (no writes performed)
+- Writes test pattern, reads back, restores original value
+- Warns if RST bits indicate registers are read-only
+- Memory barriers to ensure write completion
+
+### Validation Results (Read-Only Scan)
+
+Ran `mt7927_ring_scan_readonly.ko` to confirm ring existence:
+
+```
+Ring | BASE       | CNT    | CIDX | DIDX | EXT_CTRL   | Status
+-----|------------|--------|------|------|------------|--------
+   0 | 0x00000000 |    512 |    0 |    0 | 0x04000040 | VALID
+   1 | 0x00000000 |    512 |    0 |    0 | 0x04000080 | VALID
+   2 | 0x00000000 |    512 |    0 |    0 | 0x040000c0 | VALID
+   3 | 0x00000000 |    512 |    0 |    0 | 0x04000100 | VALID
+   4 | 0x00000000 |    512 |    0 |    0 | 0x04000140 | VALID
+   5 | 0x00000000 |    512 |    0 |    0 | 0x04000180 | VALID
+   6 | 0x00000000 |    512 |    0 |    0 | 0x040001c0 | VALID
+   7 | 0x00000000 |    512 |    0 |    0 | 0x04000200 | VALID
+   8 | 0x00000000 |      0 |    0 |    0 | 0x04000240 | INVALID
+   9 | 0x00000000 |      0 |    0 |    0 | 0x04000280 | INVALID
+  10 | 0x00000000 |      0 |    0 |    0 | 0x040002c0 | INVALID
+  11 | 0x00000000 |      0 |    0 |    0 | 0x04000300 | INVALID
+  12 | 0x00000000 |      0 |    0 |    0 | 0x04000340 | INVALID
+  13 | 0x00000000 |      0 |    0 |    0 | 0x04000380 | INVALID
+  14 | 0x00000000 |      0 |    0 |    0 | 0x040003c0 | INVALID
+  15 | 0x00000000 |      0 |    0 |    0 | 0x04000400 | INVALID
+  16 | 0x00000000 |      0 |    0 |    0 | 0x04000440 | INVALID
+  17 | 0x00000000 |      0 |    0 |    0 | 0x04000480 | INVALID
+```
+
+**Key Findings**:
+- **Rings 0-7**: CNT=512 (0x200), VALID
+- **Rings 8-17**: CNT=0, INVALID (do not exist)
+- **CONFIRMED**: MT7927 has exactly 8 TX rings (0-7)
+- Using rings 4/5 for FWDL/MCU_WM is correct approach for MT7927
+
+### ASPM L1 Test
+
+**Question**: Does ASPM L1 state affect register reads?
+
+**Test Procedure**:
+1. Disabled L1 ASPM via setpci: `sudo setpci -s $DEVICE CAP_EXP+10.w=0x0000`
+2. Re-ran ring scan diagnostic
+3. Compared results
+
+**Result**: Identical results with L1 disabled. ASPM L1 does NOT affect register reads.
+
+**Implication**: If L1 is causing the DMA blocker issue, it affects DMA processing, not register access. Register scanning results are valid regardless of ASPM state.
+
+### Chip ID Location Clarification
+
+**Observation**: `mt7927_diag.ko` reads Chip ID correctly, but other modules read 0x00000000
+
+**Analysis**:
+- `mt7927_diag.c` maps BAR2 and reads from BAR2+0x000
+- BAR2 is a read-only shadow of BAR0 starting at offset 0x10000
+- Therefore: BAR2+0x000 = BAR0+0x10000 = Chip ID register
+- Modules reading BAR0+0x0000 get 0x00000000 (that's SRAM, not Chip ID)
+
+**Correct Chip ID locations**:
+- BAR2 + 0x0000 (if BAR2 is mapped)
+- BAR0 + 0x10000 (direct access)
+
+---
+
+## Phase 13: Next Steps (Pending)
+
+### Immediate Testing
+
+1. **Run mt7927_diag.ko** - Verify chip state is healthy before further testing
+2. **Test with ASPM L1 disabled** - Load test_fw_load.ko with L1 disabled to see if DMA works
+3. **Optional write test** - Run `mt7927_ring_scan_readwrite.ko dry_run=0` to confirm rings 4/5 are writable
+
+### Outstanding Questions
+
+1. **Why rings 4 and 5 specifically?**
+   - Validated: These rings physically exist (CNT=512)
+   - Not validated: Whether firmware expects commands on these specific rings
+   - Reference drivers use different ring assignments (MT7925 uses 15/16)
+   - Choice of 4/5 was made because they're available rings, not based on firmware requirements
+
+2. **Does ASPM L1 affect DMA processing?**
+   - Confirmed: L1 does NOT affect register reads
+   - Unknown: Whether L1 state prevents DMA from advancing DIDX
+   - Test: Load driver with L1 disabled via setpci before insmod
+
+3. **Is the RST catch-22 solvable?**
+   - RST=0x30: Rings writable, but DMA doesn't process
+   - RST=0x00: DMA could process, but rings get wiped
+   - Need to investigate if there's a state transition sequence that works

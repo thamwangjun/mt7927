@@ -405,8 +405,9 @@ static void mt7927_dma_prefetch(struct mt7927_dev *dev)
     mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(1), PREFETCH(0x0200, 0x10));
     mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(2), PREFETCH(0x0300, 0x10));
     mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(3), PREFETCH(0x0400, 0x10));
-    mt7927_wr(dev, MT_WFDMA0_TX_RING15_EXT_CTRL, PREFETCH(0x0500, 0x4));  /* MCU WM */
-    mt7927_wr(dev, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH(0x0540, 0x4));  /* FWDL */
+    /* MT7927 uses rings 4/5 for FWDL/MCU, not 15/16 like MT7925 */
+    mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(4), PREFETCH(0x0500, 0x4));  /* FWDL ring 4 */
+    mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(5), PREFETCH(0x0540, 0x4));  /* MCU WM ring 5 */
 
     dev_info(dev->dev, "DMA prefetch configured\n");
 }
@@ -542,7 +543,8 @@ int mt7927_dma_enable(struct mt7927_dev *dev)
         dev_info(dev->dev, "Ring verify: TX0=0x%08x TX4=0x%08x TX5=0x%08x\n",
                  tx0_base, tx4_base, tx5_base);
         if (tx5_base == 0) {
-            dev_err(dev->dev, "WARNING: Ring config was wiped during enable!\n");
+            dev_err(dev->dev, "Ring config was wiped during enable!\n");
+            return -EIO;
         }
     }
 

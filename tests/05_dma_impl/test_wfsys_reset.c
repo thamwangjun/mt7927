@@ -78,12 +78,28 @@ static int test_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (ret)
         goto err_free;
 
-    ret = pcim_iomap_regions(pdev, BIT(2), "mt7927_test");
+    ret = pcim_iomap_regions(pdev, BIT(0), "mt7927_test");
     if (ret)
         goto err_free;
 
-    dev->regs = pcim_iomap_table(pdev)[2];
+    dev->regs = pcim_iomap_table(pdev)[0];  /* Use BAR0 (2MB) for remap access */
+    if (!dev->regs) {
+        dev_err(&pdev->dev, "Failed to get BAR0 mapping\n");
+        ret = -ENOMEM;
+        goto err_free;
+    }
     pci_set_master(pdev);
+
+    /* Safety check: verify chip is responding */
+    {
+        u32 chip_id = readl(dev->regs + 0x0000);
+        dev_info(&pdev->dev, "Chip ID: 0x%08x\n", chip_id);
+        if (chip_id == 0xffffffff) {
+            dev_err(&pdev->dev, "Chip not responding\n");
+            ret = -EIO;
+            goto err_free;
+        }
+    }
 
     /* Test 1: Read current WiFi system state */
     dev_info(&pdev->dev, "Test 1: Reading WiFi system state\n");

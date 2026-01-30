@@ -104,8 +104,8 @@ struct mt7927_dev {
     struct device *dev;
 
     /* Memory mapped I/O */
-    void __iomem *regs;         /* BAR2: Control registers */
-    void __iomem *mem;          /* BAR0: Memory region */
+    void __iomem *regs;         /* BAR2: 32KB read-only shadow (not used for writes) */
+    void __iomem *mem;          /* BAR0: 2MB main register space (use this for all access) */
 
     /* Register remapping backup */
     u32 backup_l1;

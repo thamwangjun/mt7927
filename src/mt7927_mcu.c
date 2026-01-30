@@ -149,8 +149,8 @@ int mt7927_mcu_send_and_get_msg(struct mt7927_dev *dev, int cmd,
         ret = wait_event_timeout(dev->mcu.wait,
                                 !skb_queue_empty(&dev->mcu.res_q),
                                 timeout);
-        if (!ret) {
-            dev_err(dev->dev, "MCU command 0x%04x timeout\n", cmd);
+        if (ret <= 0) {
+            dev_err(dev->dev, "MCU command 0x%04x timeout (ret=%d)\n", cmd, ret);
             return -ETIMEDOUT;
         }
 
@@ -164,8 +164,10 @@ int mt7927_mcu_send_and_get_msg(struct mt7927_dev *dev, int cmd,
         /* Validate response sequence */
         rxd = (struct mt7927_mcu_rxd *)resp_skb->data;
         if (rxd->seq != seq) {
-            dev_warn(dev->dev, "MCU response seq mismatch: expected %d, got %d\n",
+            dev_err(dev->dev, "MCU response seq mismatch: expected %d, got %d\n",
                     seq, rxd->seq);
+            dev_kfree_skb(resp_skb);
+            return -EIO;
         }
 
         /* Return response SKB if requested */

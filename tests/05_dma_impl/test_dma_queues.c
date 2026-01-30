@@ -11,13 +11,14 @@
 #define MT7927_VENDOR_ID        0x14c3
 #define MT7927_DEVICE_ID        0x7927
 
-/* WFDMA registers */
-#define MT_WFDMA0_GLO_CFG       0x0208
-#define MT_WFDMA0_TX_RING0_BASE 0x0300
-#define MT_WFDMA0_TX_RING0_CNT  0x0304
-#define MT_WFDMA0_TX_RING0_CIDX 0x0308
-#define MT_WFDMA0_TX_RING0_DIDX 0x030c
-#define MT_WFDMA0_RST_DTX_PTR   0x020c
+/* WFDMA registers - BAR0 offsets (WFDMA at BAR0+0x2000) */
+#define MT_WFDMA0_BASE          0x2000
+#define MT_WFDMA0_GLO_CFG       (MT_WFDMA0_BASE + 0x208)
+#define MT_WFDMA0_TX_RING0_BASE (MT_WFDMA0_BASE + 0x300)
+#define MT_WFDMA0_TX_RING0_CNT  (MT_WFDMA0_BASE + 0x304)
+#define MT_WFDMA0_TX_RING0_CIDX (MT_WFDMA0_BASE + 0x308)
+#define MT_WFDMA0_TX_RING0_DIDX (MT_WFDMA0_BASE + 0x30c)
+#define MT_WFDMA0_RST_DTX_PTR   (MT_WFDMA0_BASE + 0x20c)
 
 /* DMA descriptor */
 struct test_desc {
@@ -55,12 +56,28 @@ static int test_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (ret)
         goto err_free;
 
-    ret = pcim_iomap_regions(pdev, BIT(2), "mt7927_test");
+    ret = pcim_iomap_regions(pdev, BIT(0), "mt7927_test");
     if (ret)
         goto err_free;
 
-    dev->regs = pcim_iomap_table(pdev)[2];
+    dev->regs = pcim_iomap_table(pdev)[0];  /* Use BAR0 (2MB) for register access */
+    if (!dev->regs) {
+        dev_err(&pdev->dev, "Failed to map BAR0\n");
+        ret = -ENOMEM;
+        goto err_free;
+    }
     pci_set_master(pdev);
+
+    /* Safety check: verify chip is responding */
+    {
+        u32 chip_id = readl(dev->regs + 0x0000);
+        dev_info(&pdev->dev, "Chip ID: 0x%08x\n", chip_id);
+        if (chip_id == 0xffffffff) {
+            dev_err(&pdev->dev, "Chip not responding\n");
+            ret = -EIO;
+            goto err_free;
+        }
+    }
 
     ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
     if (ret) {

@@ -219,13 +219,13 @@ void mt7927_irq_tasklet(unsigned long data)
         if (intr & MT_INT_TX_DONE_BAND0)
             mt7927_tx_complete(dev, &dev->tx_q[0]);
 
-        /* FWDL queue (ring 4) */
+        /* FWDL queue (ring 4) - tx_q[2] */
         if (intr & HOST_TX_DONE_INT_ENA4)
-            mt7927_tx_complete(dev, &dev->tx_q[1]);
-
-        /* MCU WM queue (ring 5) */
-        if (intr & HOST_TX_DONE_INT_ENA5)
             mt7927_tx_complete(dev, &dev->tx_q[2]);
+
+        /* MCU WM queue (ring 5) - tx_q[1] */
+        if (intr & HOST_TX_DONE_INT_ENA5)
+            mt7927_tx_complete(dev, &dev->tx_q[1]);
     }
 
     /* Process RX completion */

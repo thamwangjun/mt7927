@@ -234,8 +234,40 @@ echo 1 | sudo tee /sys/bus/pci/devices/0000:$DEVICE/remove
 
 1. ✅ Document actual BAR0 size (2MB, not 1MB)
 2. ⚠️ **Test disabling L1 ASPM and L1 substates** (high priority!)
-3. ⚠️ Verify register offset calculations account for 2MB BAR0
+3. ✅ Verify register offset calculations account for 2MB BAR0 - Validated via ring scan (2026-01-30)
 4. ⚠️ Test MSI interrupt mode
 5. ⚠️ Check if LTR thresholds interfere with DMA timing
 6. 📝 Update all documentation with correct PCI address (01:00.0)
 7. 📝 Update commands in Makefile and scripts
+
+---
+
+## Validation Log (2026-01-30)
+
+### TX Ring Hardware Validation
+
+**Methodology**: Created `diag/mt7927_ring_scan_readonly.c` to safely scan TX rings 0-17 by reading CNT registers.
+
+**Results**:
+- Rings 0-7: CNT=512 (0x200) - **VALID**
+- Rings 8-17: CNT=0 - **INVALID** (do not exist)
+
+**Conclusion**: MT7927 has exactly 8 TX rings (0-7), confirming our architecture assumption.
+
+### ASPM L1 Effect on Register Access
+
+**Test**: Ran ring scan with ASPM L1 enabled vs disabled (via `setpci -s $DEVICE CAP_EXP+10.w=0x0000`)
+
+**Result**: Identical scan results in both cases.
+
+**Conclusion**: ASPM L1 does NOT affect register reads. If L1 causes the DMA blocker, it's by interfering with DMA processing, not register access. Test with driver load after L1 disable is still pending.
+
+### Chip ID Location
+
+**Mystery**: `mt7927_diag.ko` reads Chip ID correctly, other modules read 0x00000000.
+
+**Resolution**:
+- BAR2 is read-only shadow of BAR0 starting at offset 0x10000
+- Chip ID is at BAR0+0x10000, NOT BAR0+0x0000
+- `mt7927_diag.c` uses BAR2, so BAR2+0x000 = Chip ID ✓
+- Other modules using BAR0+0x0000 read SRAM content (0x00000000)

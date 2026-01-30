@@ -106,7 +106,7 @@ diag/               # 18 hardware exploration/diagnostic modules
 ### Initialization Sequence
 
 1. **PCI Probe** (mt7927_pci.c)
-   - Map BAR0 (1MB SRAM) and BAR2 (DMA registers)
+   - Map BAR0 (2MB main register space) - **NOT BAR2** (read-only shadow)
    - Acquire power management ownership via LPCTL register (0x04 → 0x00)
    - Execute WFSYS reset (WFSYS_SW_RST_B timing, poll INIT_DONE)
    - Disable PCIe ASPM L0s power saving
@@ -125,14 +125,14 @@ diag/               # 18 hardware exploration/diagnostic modules
 
 ### Critical Hardware Differences from MT7925
 
-| Property | MT7925 | MT7927 |
-|----------|--------|--------|
-| TX Rings | 17 (0-16) | 8 (0-7) |
-| FWDL Queue | Ring 16 | Ring 4 |
-| MCU Queue | Ring 15 | Ring 5 |
-| WFDMA1 | Present | **NOT present** |
-| BAR0 Size | 1MB (unverified) | **2MB** (lspci confirmed) |
-| Register offsets | See mt7925 driver | Same as MT7925 |
+| Property | MT7925 | MT7927 | Validation Status |
+|----------|--------|--------|-------------------|
+| TX Rings | 17 (0-16) | 8 (0-7) | **✓ CONFIRMED** (2026-01-30) |
+| FWDL Queue | Ring 16 | Ring 4 | Ring exists; FW expectation unverified |
+| MCU Queue | Ring 15 | Ring 5 | Ring exists; FW expectation unverified |
+| WFDMA1 | Present | **NOT present** | **✓ CONFIRMED** (Phase 5) |
+| BAR0 Size | 1MB (unverified) | **2MB** (lspci confirmed) | **✓ CONFIRMED** |
+| Register offsets | See mt7925 driver | Same as MT7925 | Assumed |
 
 ### Hardware Configuration (from lspci)
 
@@ -264,6 +264,127 @@ if (chip_id == 0xffffffff) {
 2. Load module: `sudo insmod tests/05_dma_impl/test_fw_load.ko`
 3. Check output: `sudo dmesg | tail -40`
 
+## Production Driver Fixes (2026-01-30)
+
+Critical bugs found and fixed in production driver after comprehensive code review:
+
+### 1. DMA Prefetch Uses Wrong Ring Indices (CRITICAL)
+**File**: `src/mt7927_dma.c:395-412`
+
+**Problem**: Code configured prefetch for rings 15/16 (MT7925 style) but MT7927 uses rings 4/5:
+```c
+// Before (WRONG):
+mt7927_wr(dev, MT_WFDMA0_TX_RING15_EXT_CTRL, PREFETCH(...));  /* MCU WM */
+mt7927_wr(dev, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH(...));  /* FWDL */
+
+// After (CORRECT):
+mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(4), PREFETCH(...));  /* FWDL ring 4 */
+mt7927_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(5), PREFETCH(...));  /* MCU WM ring 5 */
+```
+
+### 2. TX Interrupt Handler Swapped Queue Indices (CRITICAL)
+**File**: `src/mt7927_pci.c:217-228`
+
+**Problem**: Ring 4 completion went to tx_q[1], Ring 5 to tx_q[2] - backwards!
+```c
+// Before (WRONG):
+if (intr & HOST_TX_DONE_INT_ENA4)
+    mt7927_tx_complete(dev, &dev->tx_q[1]);  /* Should be tx_q[2] */
+if (intr & HOST_TX_DONE_INT_ENA5)
+    mt7927_tx_complete(dev, &dev->tx_q[2]);  /* Should be tx_q[1] */
+
+// After (CORRECT):
+if (intr & HOST_TX_DONE_INT_ENA4)
+    mt7927_tx_complete(dev, &dev->tx_q[2]);  /* Ring 4 FWDL */
+if (intr & HOST_TX_DONE_INT_ENA5)
+    mt7927_tx_complete(dev, &dev->tx_q[1]);  /* Ring 5 MCU WM */
+```
+
+### 3. Ring Config Wipe Not Handled (HIGH)
+**File**: `src/mt7927_dma.c:544-546`
+
+**Problem**: Code detected ring config was wiped but continued execution with invalid DMA state.
+**Fix**: Return -EIO when ring config is lost.
+
+### 4. MCU Response Sequence Mismatch Only Warned (HIGH)
+**File**: `src/mt7927_mcu.c:164-169`
+
+**Problem**: Wrong response detected but processing continued anyway.
+**Fix**: Return -EIO and free SKB on sequence mismatch.
+
+### 5. wait_event_timeout Defensive Check (HIGH)
+**File**: `src/mt7927_mcu.c:149-155`
+
+**Problem**: Only checked `if (!ret)` but negative values indicate interruption.
+**Fix**: Changed to `if (ret <= 0)` for defensive handling.
+
+### 6. BAR Comments Clarified (MEDIUM)
+**File**: `src/mt7927.h:107-108`
+
+**Fix**: Updated comments to clarify BAR0 is 2MB main register space, BAR2 is 32KB read-only shadow.
+
+### 7. Test Modules Fixed (CRITICAL)
+**Files**: `tests/05_dma_impl/test_dma_queues.c`, `test_power_ctrl.c`, `test_wfsys_reset.c`
+
+All test modules had same BAR2 issue as test_fw_load.c - fixed to use BAR0 with proper offsets.
+
+## TX Ring Validation (2026-01-30) - CONFIRMED
+
+### Hardware Validation Results
+
+Created two diagnostic modules to validate the 8 TX ring hypothesis:
+
+1. **`diag/mt7927_ring_scan_readonly.c`** - Safe read-only scanner
+2. **`diag/mt7927_ring_scan_readwrite.c`** - Write test with safety features (dry_run default)
+
+### Scan Results
+
+```
+Ring | BASE       | CNT    | CIDX | DIDX | EXT_CTRL   | Status
+-----|------------|--------|------|------|------------|--------
+   0 | 0x00000000 |    512 |    0 |    0 | 0x04000040 | VALID
+   1 | 0x00000000 |    512 |    0 |    0 | 0x04000080 | VALID
+   2 | 0x00000000 |    512 |    0 |    0 | 0x040000c0 | VALID
+   3 | 0x00000000 |    512 |    0 |    0 | 0x04000100 | VALID
+   4 | 0x00000000 |    512 |    0 |    0 | 0x04000140 | VALID
+   5 | 0x00000000 |    512 |    0 |    0 | 0x04000180 | VALID
+   6 | 0x00000000 |    512 |    0 |    0 | 0x040001c0 | VALID
+   7 | 0x00000000 |    512 |    0 |    0 | 0x04000200 | VALID
+   8 | 0x00000000 |      0 |    0 |    0 | 0x04000240 | INVALID
+   9 | 0x00000000 |      0 |    0 |    0 | 0x04000280 | INVALID
+  10 | 0x00000000 |      0 |    0 |    0 | 0x040002c0 | INVALID
+  11 | 0x00000000 |      0 |    0 |    0 | 0x04000300 | INVALID
+  12 | 0x00000000 |      0 |    0 |    0 | 0x04000340 | INVALID
+  13 | 0x00000000 |      0 |    0 |    0 | 0x04000380 | INVALID
+  14 | 0x00000000 |      0 |    0 |    0 | 0x040003c0 | INVALID
+  15 | 0x00000000 |      0 |    0 |    0 | 0x04000400 | INVALID
+  16 | 0x00000000 |      0 |    0 |    0 | 0x04000440 | INVALID
+  17 | 0x00000000 |      0 |    0 |    0 | 0x04000480 | INVALID
+```
+
+### Key Findings
+
+| Finding | Status | Evidence |
+|---------|--------|----------|
+| MT7927 has 8 TX rings (0-7) | **✓ CONFIRMED** | CNT=512 for rings 0-7, CNT=0 for rings 8-17 |
+| Rings 4/5 physically exist | **✓ CONFIRMED** | Both show valid CNT=512 |
+| Rings 15/16 don't exist | **✓ CONFIRMED** | Both show CNT=0 |
+| ASPM L1 doesn't affect register reads | **✓ CONFIRMED** | Identical results with L1 disabled |
+
+### Chip ID Location Clarified
+
+**Mystery solved**: Why `mt7927_diag.ko` reads Chip ID correctly but others read 0x00000000:
+- BAR2 is a read-only shadow of BAR0 at offset 0x10000
+- Chip ID is at BAR0+0x10000, NOT BAR0+0x0000
+- `mt7927_diag.c` maps BAR2, so BAR2+0x000 = correct Chip ID
+- Other modules using BAR0+0x0000 read SRAM (0x00000000)
+
+### Outstanding Uncertainties
+
+1. **Ring 4/5 choice not firmware-validated**: These rings exist, but firmware may expect MCU commands on different rings. MT7925 uses 15/16, MT7921 uses different assignments again. Our choice is based on availability, not reverse-engineered firmware requirements.
+
+2. **ASPM L1 effect on DMA**: Register reads work, but DMA processing may still be blocked by L1 power states. Test with L1 disabled before concluding.
+
 ## Code Style and Conventions
 
 ### Kernel Module Coding
@@ -282,8 +403,9 @@ u32 val = ioread32(dev->bar0 + offset);
 iowrite32(value, dev->bar0 + offset);
 
 // BAR0 vs BAR2
-// - BAR0: Main 1MB memory region (SRAM + all registers)
-// - BAR2: DMA control registers (use BAR0 instead, BAR2 is read-only shadow)
+// - BAR0: Main 2MB memory region (SRAM at 0x0, registers at 0x10000+, WFDMA at 0x2000)
+// - BAR2: 32KB read-only shadow of BAR0+0x10000 (do NOT use for writes)
+// - Chip ID: BAR0+0x10000 (or BAR2+0x0)
 ```
 
 ### Error Handling

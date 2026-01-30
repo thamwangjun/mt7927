@@ -112,7 +112,7 @@ static int setup_power_control(struct test_dev *dev)
     dev_info(&dev->pdev->dev, "  LPCTL initial: 0x%08x\n", val);
 
     /* Give control to firmware first (SET_OWN = BIT 0) */
-    dev_info(&dev->pdev->dev, "  Writing SET_OWN (0x%x) to give FW control\n",
+    dev_info(&dev->pdev->dev, "  Writing SET_OWN (0x%lx) to give FW control\n",
              MT_CONN_ON_LPCTL_HOST_OWN);
     remap_write(dev, MT_CONN_ON_LPCTL, MT_CONN_ON_LPCTL_HOST_OWN);
     msleep(10);
@@ -121,7 +121,7 @@ static int setup_power_control(struct test_dev *dev)
     dev_info(&dev->pdev->dev, "  LPCTL after SET_OWN: 0x%08x\n", val);
 
     /* Take control back for driver (CLR_OWN = BIT 1) */
-    dev_info(&dev->pdev->dev, "  Writing CLR_OWN (0x%x) to claim driver control\n",
+    dev_info(&dev->pdev->dev, "  Writing CLR_OWN (0x%lx) to claim driver control\n",
              MT_CONN_ON_LPCTL_FW_OWN);
     remap_write(dev, MT_CONN_ON_LPCTL, MT_CONN_ON_LPCTL_FW_OWN);
 
@@ -229,7 +229,7 @@ static int setup_dma(struct test_dev *dev)
              readl(dev->regs + ring_base_reg + 12));
 
     /* Enable DMA: TX_DMA_EN | RX_DMA_EN | TX_WB_DDONE */
-    dev_info(&dev->pdev->dev, "  Enabling DMA (writing 0x%x to GLO_CFG)\n",
+    dev_info(&dev->pdev->dev, "  Enabling DMA (writing 0x%lx to GLO_CFG)\n",
              BIT(0) | BIT(2) | BIT(6));
     writel(BIT(0) | BIT(2) | BIT(6), dev->regs + MT_WFDMA0_GLO_CFG);
     wmb();
