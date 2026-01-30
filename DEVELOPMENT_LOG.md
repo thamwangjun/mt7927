@@ -942,3 +942,102 @@ sudo dmesg | tail -60
 - "ASPM L0s and L1 disabled" message confirming fix is active
 - Whether DIDX advances from 0 when CIDX is incremented
 - MCU command completion vs timeout
+
+### Ring Assignment Investigation
+
+**Critical Question Raised**: Are we using the correct rings (4 & 5) for MCU/FWDL?
+
+**Reference Driver Analysis**:
+
+| Chip | Total TX Rings | MCU Queue | FWDL Queue | Pattern |
+|------|----------------|-----------|------------|---------|
+| MT7921 | 17+ | Ring 17 | Ring 16 | High numbered rings |
+| MT7925 | 17+ | Ring 15 | Ring 16 | High numbered rings |
+| MT7622 | 6 data + sparse | Ring 15 | Ring 3 | **Sparse numbering!** |
+| **MT7927** | **8 (0-7)** | **Ring ?** | **Ring ?** | **Unknown** |
+
+**Key Findings from MT792x Shared Code** (`mt792x_dma.c`):
+
+```c
+// MT7925 configuration:
+mt76_wr(dev, MT_WFDMA0_TX_RING15_EXT_CTRL, PREFETCH(0x0500, 0x4));
+mt76_wr(dev, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH(0x0540, 0x4));
+
+// MT7921 configuration:
+mt76_wr(dev, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH(0x340, 0x4));
+mt76_wr(dev, MT_WFDMA0_TX_RING17_EXT_CTRL, PREFETCH(0x380, 0x4));
+```
+
+**MT7925 Queue Initialization** (`mt7925/pci.c:233-240`):
+```c
+ret = mt76_init_mcu_queue(&dev->mt76, MT_MCUQ_WM, MT7925_TXQ_MCU_WM,
+                          MT7925_TX_MCU_RING_SIZE, MT_TX_RING_BASE);
+// MT7925_TXQ_MCU_WM = 15
+
+ret = mt76_init_mcu_queue(&dev->mt76, MT_MCUQ_FWDL, MT7925_TXQ_FWDL,
+                          MT7925_TX_FWDL_RING_SIZE, MT_TX_RING_BASE);
+// MT7925_TXQ_FWDL = 16
+```
+
+**The Paradox**:
+
+1. **MT7925 firmware expects rings 15 & 16** for MCU/FWDL (confirmed in source)
+2. **MT7927 shares this exact firmware** (same binary files)
+3. **MT7927 hardware scan shows only 8 rings** (0-7) with CNT=512
+4. **Rings 15/16 registers exist** at offsets 0x23f0/0x2400 but read CNT=0
+
+**Register Offset Verification**:
+- Ring 0-7: BASE at 0x2300-0x2370, all show CNT=512 ✓
+- Ring 15: BASE at 0x23f0, shows CNT=0 ✗
+- Ring 16: BASE at 0x2400, shows CNT=0 ✗
+- Ring 17: BASE at 0x2410, shows CNT=0 ✗
+
+**Important Discovery - MT7622 Precedent**:
+
+MT7622 has only 6 data queues but uses **sparse ring numbering**:
+- Rings 0-5: Data queues
+- **Rings 6-14: Unused (sparse!)**
+- **Ring 15: MCU queue**
+
+This proves MediaTek chips can have non-contiguous ring assignments!
+
+**Possible Explanations**:
+
+1. **Registers Not Pre-Initialized**:
+   - Rings 15/16 registers exist but CNT=0 is reset state
+   - Writing to them might activate them
+   - Our scan only read, never wrote
+
+2. **Hardware Remapping**:
+   - Writing to "ring 15" registers might use physical ring 6 or 7
+   - Transparent mapping we haven't discovered
+
+3. **Firmware Adaptation**:
+   - Firmware detects chip variant via Chip ID (0x00511163)
+   - Adapts to use rings 4/5 instead of 15/16 for MT7927
+   - No source code evidence for this
+
+4. **Different Firmware Required**:
+   - MT7927 might need variant firmware despite sharing files
+   - Firmware internally branches based on hardware detection
+
+**Current Implementation Status**:
+
+Our driver uses **rings 4 & 5** because:
+- ✓ They physically exist (CNT=512)
+- ✓ They're available (not used by data)
+- ✗ **NOT validated**: Firmware expectation unknown
+- ✗ **NOT tested**: Never attempted rings 15/16
+
+**Recommended Next Steps**:
+
+1. **Test Current Approach**: Load test_fw_load.ko with ASPM disabled and see if rings 4/5 work
+2. **If Fails**: Try writing to rings 15/16 despite CNT=0 reading
+3. **If Still Fails**: Systematically test all ring pairs (0-7) to find working combination
+4. **Documentation Search**: Look for MT7927-specific firmware or configuration files
+
+**Risk Assessment**:
+
+- **Low Risk**: Testing rings 4/5 (current approach)
+- **Medium Risk**: Writing to rings 15/16 (might hang chip if truly absent)
+- **High Risk**: Random ring testing without understanding (could corrupt state)
