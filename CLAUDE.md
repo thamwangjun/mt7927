@@ -8,44 +8,46 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 
 **Official Product Name**: MT7927 802.11be 320MHz 2x2 PCIe Wireless Network Adapter [Filogic 380]
 
-**Current Status**: **RING CONFIG INVESTIGATION (Phase 26)** - Implemented Phase 25 findings, investigating GLO_CFG timing:
-- ✅ **MCU reaches IDLE state (0x1D1E)** - First time confirmed!
+**Current Status**: **PHASE 27b - RX_DMA_EN FIX** - Pending test:
+- ✅ **MCU reaches IDLE state (0x1D1E)** - Confirmed!
 - ✅ **CB_INFRA and WFDMA global registers work correctly**
-- ❌ **Ring configuration registers not accepting writes** - Analysis found likely causes below
+- ✅ **Ring configuration registers accept writes** - Phase 27 GLO_CFG timing fix worked!
+- ✅ **TX rings 0-16 all have valid BASE addresses** - Phase 27 unused ring fix worked!
+- ✅ **RX_DMA_EN identified as remaining page fault source** - Phase 27b finding
+- 🔧 **Fix implemented**: Only enable TX_DMA_EN during firmware loading (RX rings not configured)
 
-Previous root causes (Phase 21-23) were addressed in test_fw_load.c:
-1. ✅ Fixed WFDMA base address: Now using BAR0+0xd4000 (HOST DMA)
-2. ✅ Polling-based firmware loading (no mailbox waits)
-3. ✅ GLO_CFG with clk_gate_dis (BIT 30) = 0x5030B870
-4. ✅ Complete CB_INFRA initialization (PCIe remap, MCU ownership, reset)
-5. ✅ WFDMA extension configuration (MSI, HIF_PERF, delay interrupts)
+**Phase 27b Analysis**:
+1. ✅ TX ring fix worked - All 17 TX rings now have valid BASE addresses
+2. ❌ **3 remaining page faults** - RX rings still have BASE=0
+3. ❌ **DIDX stuck at 0** - Page fault halts DMA engine
+4. ✅ **Root cause**: `RX_DMA_EN` enabled but RX rings not initialized
 
-**⚠️ LIKELY ROOT CAUSES (Phase 25-26 Findings)** - Comparison with zouyonghao revealed differences:
+**Phase 27b Fix Applied** (test_fw_load.c Step 7c):
+```c
+/* Enable TX DMA ONLY - RX rings not configured!
+ * Phase 27b fix: RX rings have BASE=0, enabling RX_DMA causes
+ * DMA engine to scan RX rings → access 0x0 → IOMMU page fault → DMA halts */
+val = MT_WFDMA0_GLO_CFG_SETUP |
+      MT_WFDMA0_GLO_CFG_TX_DMA_EN;
+/* NOTE: RX_DMA_EN intentionally NOT set */
+```
 
-**Fixed in test_fw_load.c (Phase 26)**:
-1. ✅ **DMA priority registers**: Added `INT_RX_PRI=0x0F00`, `INT_TX_PRI=0x7F00`
-2. ✅ **GLO_CFG_EXT1 BIT(28)**: Added MT7927-specific enable bit
-3. ✅ **WFDMA_DUMMY_CR flag**: Added `MT_WFDMA_NEED_REINIT`
-4. ✅ **Reset scope**: Changed to `~0` (all rings)
-5. ✅ **Descriptor init**: Set DMA_DONE bit on all descriptors (was memset to 0)
-6. ✅ **DIDX write**: Now write both CIDX and DIDX to 0
+**Next Step**: Test the fix to verify page faults eliminated and DIDX starts incrementing.
 
-**⚠️ REMAINING DIFFERENCE - GLO_CFG Timing**:
-- **Zouyonghao**: Sets CLK_GAT_DIS **AFTER** ring configuration (in `mt792x_dma_enable()`)
-- **Our code**: Sets CLK_GAT_DIS **BEFORE** ring configuration
-- Ring config happens with GLO_CFG in "cleared" state in zouyonghao, but with CLK_GAT_DIS set in our code
-- This timing difference may be significant - see `docs/ZOUYONGHAO_ANALYSIS.md` section "2a. Critical GLO_CFG Timing Difference"
-
-**Next Steps**: Consider reordering GLO_CFG setup to match zouyonghao (set CLK_GAT_DIS AFTER ring config).
+See **docs/ZOUYONGHAO_ANALYSIS.md** sections "2b", "2c", and "2d" for complete analysis.
 
 ## Critical Files to Review First
 
 1. **docs/ZOUYONGHAO_ANALYSIS.md** - 🎯 **ROOT CAUSE FOUND** - No mailbox protocol in MT7927 ROM!
-2. **docs/MT6639_ANALYSIS.md** - Proves MT7927 is MT6639 variant, validates rings 15/16
-3. **docs/REFERENCE_SOURCES.md** - Analysis of reference code origins and authoritative sources
-4. **DEVELOPMENT_LOG.md** - Complete chronological history (26 phases, Phase 26 = current)
-5. **AGENTS.md** - Session bootstrap with current blocker details, hardware context, and what's been tried
-6. **HARDWARE_ANALYSIS.md** - lspci analysis (L1 ASPM hypothesis now invalidated)
+   - Section "2a": GLO_CFG timing difference (Phase 26)
+   - Section "2b": Phase 27 findings - DMA page fault analysis
+   - Section "2c": Phase 27 fix - Unused TX rings initialization
+   - Section "2d": **Phase 27b fix** - RX_DMA_EN timing (current)
+2. **docs/ROADMAP.md** - Current status, blockers, and next steps
+3. **docs/MT6639_ANALYSIS.md** - Proves MT7927 is MT6639 variant, validates rings 15/16
+4. **docs/REFERENCE_SOURCES.md** - Analysis of reference code origins and authoritative sources
+5. **DEVELOPMENT_LOG.md** - Complete chronological history (27 phases, Phase 27 = current)
+6. **AGENTS.md** - Session bootstrap with current blocker details, hardware context, and what's been tried
 7. **README.md** - Project overview, build instructions, expected outputs
 
 ## Build System

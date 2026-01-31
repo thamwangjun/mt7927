@@ -1034,6 +1034,336 @@ Our assumption that CLK_GAT_DIS must be set BEFORE ring config may be **incorrec
 
 ---
 
+### 2b. Phase 27 Findings - GLO_CFG Timing Fix Results (2026-01-31)
+
+**Date**: 2026-01-31
+**Status**: GLO_CFG timing fix **IMPLEMENTED AND VERIFIED** - Ring registers now accept writes!
+
+#### Fix Applied
+
+The GLO_CFG timing fix was implemented in `test_fw_load.c`:
+
+```c
+/* Step 1: CLEAR GLO_CFG (NO clk_gate_dis yet!) */
+mt_wr(dev, MT_WFDMA0_GLO_CFG, 0);
+
+/* Steps 4-6: Configure rings while GLO_CFG is cleared */
+mt_wr(dev, MT_WFDMA0_TX_RING_BASE(15), dma_addr);
+mt_wr(dev, MT_WFDMA0_TX_RING_CNT(15), ring_size);
+// ... configure both rings 15 and 16 ...
+
+/* Step 7b: NOW set GLO_CFG with CLK_GAT_DIS (AFTER rings!) */
+mt_wr(dev, MT_WFDMA0_GLO_CFG, MT_WFDMA0_GLO_CFG_SETUP);  // 0x5030b870
+
+/* Step 7c: Enable DMA */
+mt_wr(dev, MT_WFDMA0_GLO_CFG, MT_WFDMA0_GLO_CFG_SETUP | TX_DMA_EN | RX_DMA_EN);
+```
+
+#### Results - Ring Configuration Now Works!
+
+| Register | Before Fix | After Fix | Status |
+|----------|------------|-----------|--------|
+| Ring 15 BASE | 0x00000000 | 0xffff9000 | ✅ **FIXED** |
+| Ring 15 EXT_CTRL | 0x00000000 | 0x05000004 | ✅ **FIXED** |
+| Ring 16 BASE | 0x00000000 | 0xffff8000 | ✅ **FIXED** |
+| Ring 16 EXT_CTRL | 0x00000000 | 0x05400004 | ✅ **FIXED** |
+| GLO_CFG | 0x5030b870 | 0x5030b877 | ✅ Correct |
+
+#### New Blocker: AMD-Vi IO_PAGE_FAULT at Address 0x0
+
+After the GLO_CFG timing fix, a **new issue** was discovered:
+
+```
+AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x000e address=0x0 flags=0x0000]
+```
+
+**Symptoms**:
+- DMA engine tries to access IOVA address 0x0
+- DIDX stays at 0 (no descriptors consumed)
+- CIDX increments (driver submits descriptors)
+- `tx_coherent_int_sts` (bit 21) set in INT_STA - indicates coherency error
+
+**INT_STA Analysis** (0x02200000):
+- Bit 25 (`tx_done_int_sts_15`) = Ring 15 interrupt generated
+- Bit 21 (`tx_coherent_int_sts`) = TX coherency error (from page fault)
+
+#### Descriptor Format Analysis
+
+MediaTek `struct TXD_STRUCT` from `reference_mtk_modules`:
+
+```c
+struct TXD_STRUCT {
+    /* Word 0 */ uint32_t SDPtr0;      // Buffer 0 address (lower 32 bits)
+    /* Word 1 */ uint32_t SDLen1:14; LastSec1:1; Burst:1; SDLen0:14; LastSec0:1; DMADONE:1;
+    /* Word 2 */ uint32_t SDPtr1;      // Buffer 1 address (lower 32 bits) - scatter/gather
+    /* Word 3 */ uint16_t SDPtr0Ext;   // Buffer 0 address UPPER 16 bits
+                 uint16_t SDPtr1Ext;   // Buffer 1 address UPPER 16 bits
+};
+```
+
+**Our struct** (test_fw_load.c):
+```c
+struct mt7927_desc {
+    __le32 buf0;   // SDPtr0 - correct
+    __le32 ctrl;   // Word 1 - correct
+    __le32 buf1;   // We set upper_32_bits here - SHOULD be SDPtr1 (0 for no scatter)
+    __le32 info;   // We set 0 - SHOULD have SDPtr0Ext for 64-bit addresses
+};
+```
+
+**For 32-bit DMA addresses** (below 4GB): Our format happens to work because:
+- `buf1` = `upper_32_bits(addr)` = 0 (correct - SDPtr1 should be 0)
+- `info` = 0 (correct - SDPtr0Ext is 0 for 32-bit addresses)
+
+#### Possible Causes of Address 0x0 Access
+
+| Possibility | Analysis | Likelihood |
+|-------------|----------|------------|
+| Data buffer (`dma_buf_phys`) is 0 | Never printed to verify | **Check first** |
+| Uninitialized TX rings (0-14) have BASE=0 | DMA might scan all rings | **Medium** |
+| Ring BASE upper bits wrong | For 32-bit addresses, should be 0 | Low |
+| Descriptor write ordering | We use wmb() barriers | Low |
+
+#### Recommended Debug Steps
+
+1. **Print `dma_buf_phys`** after allocation to verify it's non-zero
+2. **Check all ring BASE registers** (rings 0-14) - if any have BASE=0 with DMA enabled
+3. **Dump descriptor contents** before kicking CIDX to verify buf0 is set correctly
+4. **Try disabling prefetch** (EXT_CTRL) temporarily to simplify
+
+#### Test Results Log (Excerpt)
+
+```
+Ring 15: BASE=0xffff9000 CTRL1=0x00000080 CIDX=0 DIDX=0
+Ring 16: BASE=0xffff8000 CTRL1=0x00000080 CIDX=0 DIDX=0
+Ring 15 EXT_CTRL: 0x05000004 (expected 0x05000004)
+Ring 16 EXT_CTRL: 0x05400004 (expected 0x05400004)
+GLO_CFG after setup: 0x5030b870 (expected 0x5030b870)
+DMA enabled, GLO_CFG=0x5030b875 (expected 0x5030b875)
+...
+AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x000e address=0x0 flags=0x0000]
+Ring 16 DMA timeout (CIDX=1, DIDX=0)
+...
+WFDMA INT_STA: 0x02200000
+Ring 15 (MCU_WM) CIDX/DIDX: 7/0
+Ring 16 (FWDL) CIDX/DIDX: 50/0
+```
+
+---
+
+### 2c. Phase 27 Continued - Root Cause Found and Fixed (2026-01-31)
+
+**Date**: 2026-01-31
+**Status**: **ROOT CAUSE IDENTIFIED** - Unused rings with BASE=0 cause IOMMU page faults
+
+#### Diagnostic Results
+
+Added diagnostic logging to identify the source of the 0x0 address access:
+
+**1. DMA Buffer Address - VALID**
+```
+DMA buffer allocated: virt=ffffd3a2402af000 phys=0xffff4000 (lower=0xffff4000 upper=0x00000000)
+```
+- `dma_buf_phys` = 0xffff4000 - Valid, non-zero address ✅
+- This is NOT the source of the fault
+
+**2. Ring BASE Register Scan - PROBLEM FOUND**
+```
+Ring 15: BASE_LO=0xffff6000 CTRL1=0x00000080 (CNT=128)
+Ring 16: BASE_LO=0xffff5000 CTRL1=0x00000080 (CNT=128)
+WARNING: 15 TX rings have BASE=0 (potential IOMMU fault source!)
+```
+- Rings 15 and 16 correctly configured ✅
+- **15 TX rings (0-14) have BASE=0** ❌ - THIS IS THE PROBLEM
+
+**3. Descriptor Contents - CORRECT**
+```
+[DIAG] Ring 15 desc[0] before kick:
+  buf0=0xffff4000 (SDPtr0 lower32)
+  ctrl=0x0000404c (len=76, LAST_SEC0=1, DONE=0)
+  buf1=0x00000000 (SDPtr1 - correct for no scatter-gather)
+  info=0x00000000 (SDPtr0Ext - correct for 32-bit address)
+  dma_buf_phys=0xffff4000
+```
+- Descriptor format is correct for 32-bit DMA addresses ✅
+
+#### Root Cause
+
+When the DMA engine is enabled with `TX_DMA_EN`, it scans ALL configured TX rings, including uninitialized ones. Rings 0-14 had `BASE=0`, causing the DMA to fetch descriptors from IOVA address 0x0.
+
+```
+DMA Engine Enabled → Scans All TX Rings → Ring 0-14 have BASE=0 → IOMMU Page Fault at 0x0
+```
+
+#### Fix Applied
+
+Added Step 3b in `test_fw_load.c` to initialize all unused rings to valid DMA memory:
+
+```c
+/* Step 3b: Initialize ALL unused TX rings to valid DMA address
+ * Phase 27 fix: The DMA engine may scan all rings when enabled.
+ * Rings with BASE=0 cause IOMMU page fault at address 0.
+ * Point unused rings (0-14) to our mcu_ring_dma (valid memory).
+ * Set CNT=1 and CIDX=DIDX=0 so DMA thinks they're empty/done. */
+for (ring = 0; ring <= 14; ring++) {
+    mt_wr(dev, MT_WFDMA0_TX_RING_BASE(ring), lower_32_bits(dev->mcu_ring_dma));
+    mt_wr(dev, MT_WFDMA0_TX_RING_BASE(ring) + 4,
+          (upper_32_bits(dev->mcu_ring_dma) & 0x000F0000) | 1);  /* CNT=1 */
+    mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(ring), 0);
+    mt_wr(dev, MT_WFDMA0_TX_RING_DIDX(ring), 0);
+}
+```
+
+**Key Points**:
+- All unused rings now point to `mcu_ring_dma` (valid allocated memory)
+- `mcu_ring` already has descriptors with `DMA_DONE=1` set
+- `CNT=1` and `CIDX=DIDX=0` means ring appears empty
+- No ring has `BASE=0` anymore
+
+#### Expected Results After Fix
+
+1. No more `AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x000e address=0x0]`
+2. `WARNING: 0 TX rings have BASE=0` (instead of 15)
+3. `DIDX` should start incrementing (DMA processing descriptors)
+
+---
+
+### 2d. Phase 27b - RX_DMA_EN Timing Analysis (2026-01-31)
+
+**Date**: 2026-01-31
+**Status**: RX_DMA_EN identified as source of remaining page faults
+
+#### Problem After TX Ring Fix
+
+After implementing the unused TX ring fix (section 2c), test results showed:
+- ✅ All TX rings 0-16 now have valid BASE addresses
+- ❌ Still seeing 3 `IO_PAGE_FAULT` errors at address 0x0
+- ❌ DIDX never increments (Ring 15: CIDX=7/DIDX=0, Ring 16: CIDX=50/DIDX=0)
+- ❌ DMA engine appears halted
+
+#### Root Cause
+
+The remaining page faults occur because **RX rings have not been initialized** (BASE=0), but `RX_DMA_EN` was enabled alongside `TX_DMA_EN`:
+
+```c
+/* Previous code - problematic */
+val = MT_WFDMA0_GLO_CFG_SETUP |
+      MT_WFDMA0_GLO_CFG_TX_DMA_EN |
+      MT_WFDMA0_GLO_CFG_RX_DMA_EN;   /* ← RX rings not configured! */
+```
+
+When `RX_DMA_EN` is set, the DMA engine scans RX ring descriptors. Since RX rings have `BASE=0`, the hardware fetches from address 0x0 → IOMMU page fault → DMA engine halts → DIDX never increments.
+
+#### Page Fault Timeline
+
+```
+[16541.099501] DMA enabled, GLO_CFG=0x5030b875 (with RX_DMA_EN)
+[16541.099747] AMD-Vi: Event logged [IO_PAGE_FAULT ... address=0x0]  ← 0.2ms after enable!
+[16541.143375] AMD-Vi: Event logged [IO_PAGE_FAULT ... address=0x0]
+[16541.154621] AMD-Vi: Event logged [IO_PAGE_FAULT ... address=0x0]
+[16541.348268] Ring 16 DMA timeout (CIDX=1, DIDX=0)  ← DMA halted
+```
+
+The page faults occur immediately after `RX_DMA_EN` is set, confirming RX ring scanning as the cause.
+
+#### RX_DMA_EN Timing in Driver Initialization
+
+**When to enable RX_DMA_EN:**
+
+| Phase | RX_DMA_EN | Reason |
+|-------|-----------|--------|
+| **Firmware Loading** | ❌ NO | Only TX rings 15/16 used; RX not needed |
+| **After RX Ring Init** | ✅ YES | RX rings properly configured with valid BASE |
+| **Normal Operation** | ✅ YES | Required for receiving packets and MCU events |
+
+#### Two Implementation Approaches
+
+**Approach 1: TX-Only During FWDL (Current Approach)**
+
+Only enable `TX_DMA_EN` during firmware loading. Enable `RX_DMA_EN` later after RX rings are configured.
+
+```c
+/* Firmware loading phase - TX only */
+val = MT_WFDMA0_GLO_CFG_SETUP |
+      MT_WFDMA0_GLO_CFG_TX_DMA_EN;
+/* NOTE: RX_DMA_EN intentionally NOT set - RX rings have BASE=0! */
+mt_wr(dev, MT_WFDMA0_GLO_CFG, val);
+
+/* ... firmware loading completes ... */
+
+/* Later, after RX rings are configured: */
+mt_set(dev, MT_WFDMA0_GLO_CFG, MT_WFDMA0_GLO_CFG_RX_DMA_EN);
+```
+
+**Pros**: Simpler, minimal changes, sufficient for firmware loading test
+**Cons**: Must remember to enable RX later for normal operation
+
+**Approach 2: Initialize All Rings Upfront (Complete Approach)**
+
+Initialize both TX and RX rings to valid DMA addresses before enabling DMA, matching the zouyonghao/mt76 pattern:
+
+```c
+/* Initialize ALL rings before DMA enable */
+for (ring = 0; ring < NUM_TX_RINGS; ring++) {
+    mt_wr(dev, MT_WFDMA0_TX_RING_BASE(ring), tx_ring_dma[ring]);
+    /* ... configure CNT, CIDX, DIDX ... */
+}
+for (ring = 0; ring < NUM_RX_RINGS; ring++) {
+    mt_wr(dev, MT_WFDMA0_RX_RING_BASE(ring), rx_ring_dma[ring]);
+    /* ... configure CNT, CIDX, DIDX ... */
+}
+
+/* Now safe to enable both */
+val = MT_WFDMA0_GLO_CFG_SETUP |
+      MT_WFDMA0_GLO_CFG_TX_DMA_EN |
+      MT_WFDMA0_GLO_CFG_RX_DMA_EN;
+```
+
+**Pros**: Matches production driver pattern, no deferred enable needed
+**Cons**: More code, RX rings not used during FWDL anyway
+
+#### Zouyonghao Reference
+
+In zouyonghao's complete driver (mt76 branch), `mt7925_dma_init()` calls:
+
+```c
+mt76_init_mcu_queue(MT_MCUQ_WM, 15);   // TX ring 15
+mt76_init_mcu_queue(MT_MCUQ_FWDL, 16); // TX ring 16
+mt76_queue_alloc(MT_RXQ_MCU);          // RX ring for MCU events
+mt76_queue_alloc(MT_RXQ_MAIN);         // RX ring for data
+mt792x_dma_enable(dev);                // Enable BOTH TX and RX DMA
+```
+
+All rings are allocated BEFORE `mt792x_dma_enable()` sets both `TX_DMA_EN` and `RX_DMA_EN`.
+
+#### Fix Applied (Approach 1)
+
+For the firmware loading test module, we use Approach 1 - only enable TX_DMA_EN:
+
+```c
+/* Step 7c: Enable TX DMA ONLY
+ * Phase 27b fix: Do NOT enable RX_DMA_EN during firmware loading!
+ * RX rings have not been initialized (BASE=0), so enabling RX_DMA causes
+ * the DMA engine to scan RX ring descriptors at address 0x0, triggering
+ * AMD-Vi IO_PAGE_FAULT and halting the DMA engine (DIDX never increments).
+ */
+dev_info(&dev->pdev->dev, "  Step 7c: Enable DMA (TX_DMA_EN only - RX not configured!)...\n");
+val = MT_WFDMA0_GLO_CFG_SETUP |
+      MT_WFDMA0_GLO_CFG_TX_DMA_EN;
+/* NOTE: RX_DMA_EN intentionally NOT set - RX rings have BASE=0! */
+mt_wr(dev, MT_WFDMA0_GLO_CFG, val);
+```
+
+#### Expected Results
+
+After this fix:
+1. No more `AMD-Vi: Event logged [IO_PAGE_FAULT]` errors
+2. GLO_CFG = `0x5030b871` (TX_DMA_EN only, not 0x5030b875)
+3. DIDX should increment (DMA processing descriptors)
+4. Fewer or no "Ring 16 DMA timeout" messages
+
+---
+
 ### 3. Firmware Loading Comparison
 
 Both implementations use the **same core patterns**:

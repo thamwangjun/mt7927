@@ -624,6 +624,24 @@ static int send_mcu_cmd(struct test_dev *dev, u8 cmd, const void *data, size_t l
 	desc->info = 0;
 	wmb();
 
+	/* DIAGNOSTIC: Dump descriptor before DMA kick (first MCU cmd only) */
+	{
+		static int mcu_dump_count;
+		if (mcu_dump_count < 2) {
+			dev_info(&dev->pdev->dev, "  [DIAG] Ring 15 desc[%d] before kick:\n", idx);
+			dev_info(&dev->pdev->dev, "    buf0=0x%08x (SDPtr0 lower32)\n", le32_to_cpu(desc->buf0));
+			dev_info(&dev->pdev->dev, "    ctrl=0x%08x (len=%d, LAST_SEC0=%d, DONE=%d)\n",
+				 le32_to_cpu(desc->ctrl),
+				 le32_to_cpu(desc->ctrl) & 0x3FFF,
+				 (le32_to_cpu(desc->ctrl) >> 14) & 1,
+				 (le32_to_cpu(desc->ctrl) >> 31) & 1);
+			dev_info(&dev->pdev->dev, "    buf1=0x%08x (SDPtr1 - should be 0 or upper32?)\n", le32_to_cpu(desc->buf1));
+			dev_info(&dev->pdev->dev, "    info=0x%08x (SDPtr0Ext:SDPtr1Ext - should have upper bits!)\n", le32_to_cpu(desc->info));
+			dev_info(&dev->pdev->dev, "    dma_buf_phys=0x%llx\n", (unsigned long long)dev->dma_buf_phys);
+			mcu_dump_count++;
+		}
+	}
+
 	/* Kick DMA on Ring 15 */
 	dev->mcu_ring_head = (idx + 1) % RING_SIZE;
 	mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(MCU_WM_RING_IDX), dev->mcu_ring_head);
@@ -1108,29 +1126,50 @@ static int setup_dma_ring(struct test_dev *dev)
 		return -ENOMEM;
 	}
 
+	/* DIAGNOSTIC: Verify dma_buf_phys is valid (Phase 27 debug) */
+	dev_info(&dev->pdev->dev, "  DMA buffer allocated: virt=%px phys=0x%llx (lower=0x%08x upper=0x%08x)\n",
+		 dev->dma_buf,
+		 (unsigned long long)dev->dma_buf_phys,
+		 lower_32_bits(dev->dma_buf_phys),
+		 upper_32_bits(dev->dma_buf_phys));
+	if (dev->dma_buf_phys == 0) {
+		dev_err(&dev->pdev->dev, "  ERROR: dma_buf_phys is 0! This will cause IOMMU fault.\n");
+		return -EINVAL;
+	}
+
 	/* =====================================================================
-	 * CRITICAL: DMA Reset Sequence (from mt792x_dma_disable + asicConnac3xWfdmaControl)
-	 * The WFDMA hardware ignores ring register writes until properly reset!
+	 * CRITICAL: DMA Reset Sequence - ZOUYONGHAO TIMING FIX (Phase 27)
 	 *
-	 * Key insight from MediaTek code:
-	 * 1. asicConnac3xWfdmaControl(enable=FALSE) sets various GLO_CFG bits
-	 * 2. Ring configuration happens (BASE, CNT, CIDX)
-	 * 3. asicConnac3xWfdmaControl(enable=TRUE) enables TX/RX_DMA
+	 * Key insight from zouyonghao mt792x_dma.c analysis:
+	 * 1. mt792x_dma_disable() - CLEAR GLO_CFG (no CLK_GAT_DIS yet!)
+	 * 2. Ring configuration happens (BASE, CNT, CIDX, DIDX)
+	 * 3. Prefetch configuration (EXT_CTRL)
+	 * 4. mt792x_dma_enable() - NOW set CLK_GAT_DIS and enable DMA
 	 *
-	 * CRITICAL: clk_gate_dis MUST be set for register writes to work!
+	 * CRITICAL TIMING DIFFERENCE:
+	 * - OLD (broken): Set CLK_GAT_DIS BEFORE ring configuration
+	 * - NEW (correct): Set CLK_GAT_DIS AFTER ring configuration
+	 *
+	 * Zouyonghao's mt792x_dma_disable() clears TX/RX_DMA_EN and polls for
+	 * DMA not busy, but does NOT set CLK_GAT_DIS until mt792x_dma_enable().
 	 * ===================================================================== */
-	dev_info(&dev->pdev->dev, "  Step 1: Configure GLO_CFG (disable DMA, enable clk_gate_dis)...\n");
+	dev_info(&dev->pdev->dev, "  Step 1: Clear GLO_CFG (disable DMA, NO clk_gate_dis yet!)...\n");
 	val = mt_rr(dev, MT_WFDMA0_GLO_CFG);
 	dev_info(&dev->pdev->dev, "    GLO_CFG before: 0x%08x\n", val);
 
-	/* Set full GLO_CFG setup WITHOUT TX/RX_DMA_EN - matches MediaTek pdmaSetup(FALSE)
-	 * CRITICAL: clk_gate_dis (BIT 30) must be set for ring register writes to work! */
-	val = MT_WFDMA0_GLO_CFG_SETUP;
-	mt_wr(dev, MT_WFDMA0_GLO_CFG, val);
+	/* CLEAR GLO_CFG - disable DMA and clear config bits
+	 * This matches zouyonghao's mt792x_dma_disable() which clears DMA_EN bits
+	 * and polls for not busy. CLK_GAT_DIS is set LATER in mt792x_dma_enable().
+	 *
+	 * Per mt792x_dma_disable():
+	 *   mt76_clear(dev, MT_WFDMA0_GLO_CFG, MT_WFDMA0_GLO_CFG_OMIT_TX_INFO |
+	 *              MT_WFDMA0_GLO_CFG_OMIT_RX_INFO | ... | TX_DMA_EN | RX_DMA_EN);
+	 */
+	mt_wr(dev, MT_WFDMA0_GLO_CFG, 0);
 	wmb();
 	usleep_range(1000, 2000);
-	dev_info(&dev->pdev->dev, "    GLO_CFG after setup (no DMA_EN): 0x%08x (expected 0x%08x)\n",
-		 mt_rr(dev, MT_WFDMA0_GLO_CFG), MT_WFDMA0_GLO_CFG_SETUP);
+	dev_info(&dev->pdev->dev, "    GLO_CFG after clear: 0x%08x (expected 0x00000000)\n",
+		 mt_rr(dev, MT_WFDMA0_GLO_CFG));
 
 	dev_info(&dev->pdev->dev, "  Step 2: Disable DMASHDL...\n");
 	val = mt_rr(dev, MT_WFDMA0_GLO_CFG_EXT0);
@@ -1149,6 +1188,33 @@ static int setup_dma_ring(struct test_dev *dev)
 	val = mt_rr(dev, MT_WFDMA0_RST);
 	dev_info(&dev->pdev->dev, "  Step 3: DMA Reset state check (NOT modifying!)...\n");
 	dev_info(&dev->pdev->dev, "    RST = 0x%08x (leaving unchanged)\n", val);
+
+	/* Step 3b: Initialize ALL unused TX rings to valid DMA address
+	 * Phase 27 fix: The DMA engine may scan all rings when enabled.
+	 * Rings with BASE=0 cause IOMMU page fault at address 0.
+	 * Point unused rings (0-14) to our mcu_ring_dma (valid memory).
+	 * Set CNT=1 and CIDX=DIDX=0 so DMA thinks they're empty/done. */
+	dev_info(&dev->pdev->dev, "  Step 3b: Initialize unused rings (0-14) to prevent BASE=0...\n");
+	{
+		int ring;
+		for (ring = 0; ring <= 14; ring++) {
+			/* Skip rings 15 and 16 - configured separately */
+			if (ring == MCU_WM_RING_IDX || ring == FWDL_RING_IDX)
+				continue;
+
+			/* Point to valid DMA memory (reuse mcu_ring which has DMA_DONE set) */
+			mt_wr(dev, MT_WFDMA0_TX_RING_BASE(ring), lower_32_bits(dev->mcu_ring_dma));
+			/* CTRL1: upper bits + CNT=1 (minimal ring) */
+			mt_wr(dev, MT_WFDMA0_TX_RING_BASE(ring) + 4,
+			      (upper_32_bits(dev->mcu_ring_dma) & 0x000F0000) | 1);
+			/* CIDX=DIDX=0 means ring is empty */
+			mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(ring), 0);
+			mt_wr(dev, MT_WFDMA0_TX_RING_DIDX(ring), 0);
+		}
+		wmb();
+	}
+	dev_info(&dev->pdev->dev, "    Unused rings 0-14 now point to valid DMA addr 0x%pad\n",
+		 &dev->mcu_ring_dma);
 
 	/* Step 4: Configure Ring 15 (MCU_WM) - configure BEFORE EXT_CTRL
 	 * MediaTek's halWpdmaAllocRing() order: CTRL0, CTRL1, CTRL2, then EXT_CTRL
@@ -1212,23 +1278,55 @@ static int setup_dma_ring(struct test_dev *dev)
 	dev_info(&dev->pdev->dev, "  Step 7: Resetting ALL ring DMA pointers (~0)...\n");
 	mt_wr(dev, MT_WFDMA0_RST_DTX_PTR, ~0);
 	wmb();
-	msleep(5);
 
-	/* Enable DMA by adding TX_DMA_EN and RX_DMA_EN to the setup value
-	 * This matches MediaTek's pdmaSetup(TRUE) which adds DMA enables to existing config
+	/* Step 7a: Set delay interrupt to 0 (per mt792x_dma_enable, before GLO_CFG) */
+	mt_wr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0, 0);
+	wmb();
+	dev_info(&dev->pdev->dev, "    PRI_DLY_INT_CFG0 = 0\n");
+
+	/* Step 7b: NOW set GLO_CFG with CLK_GAT_DIS (AFTER ring configuration!)
 	 *
-	 * Full config = MT_WFDMA0_GLO_CFG_SETUP + TX_DMA_EN + RX_DMA_EN
-	 * Expected value: 0x5030B875 (from MediaTek analysis)
+	 * THIS IS THE CRITICAL TIMING FIX!
+	 * Zouyonghao's mt792x_dma_enable() sets GLO_CFG bits AFTER rings are configured.
+	 * Our old code set CLK_GAT_DIS BEFORE ring config which caused ring registers
+	 * to not accept writes.
+	 *
+	 * Per mt792x_dma_enable():
+	 *   mt76_set(dev, MT_WFDMA0_GLO_CFG,
+	 *            MT_WFDMA0_GLO_CFG_TX_WB_DDONE |
+	 *            MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN |
+	 *            MT_WFDMA0_GLO_CFG_CLK_GAT_DIS |  <-- SET HERE, AFTER RINGS!
+	 *            MT_WFDMA0_GLO_CFG_OMIT_TX_INFO | ...);
 	 */
+	dev_info(&dev->pdev->dev, "  Step 7b: NOW set GLO_CFG with CLK_GAT_DIS (AFTER rings!)...\n");
+	val = MT_WFDMA0_GLO_CFG_SETUP;  /* Includes CLK_GAT_DIS but NOT DMA_EN */
+	mt_wr(dev, MT_WFDMA0_GLO_CFG, val);
+	wmb();
+	msleep(1);
+	dev_info(&dev->pdev->dev, "    GLO_CFG after setup: 0x%08x (expected 0x%08x)\n",
+		 mt_rr(dev, MT_WFDMA0_GLO_CFG), (u32)MT_WFDMA0_GLO_CFG_SETUP);
+
+	/* Step 7c: Enable TX DMA ONLY
+	 * Phase 27b fix: Do NOT enable RX_DMA_EN during firmware loading!
+	 * RX rings have not been initialized (BASE=0), so enabling RX_DMA causes
+	 * the DMA engine to scan RX ring descriptors at address 0x0, triggering
+	 * AMD-Vi IO_PAGE_FAULT and halting the DMA engine (DIDX never increments).
+	 *
+	 * For firmware loading, only TX DMA is needed (rings 15 and 16).
+	 * RX_DMA_EN should be enabled later after RX rings are configured.
+	 *
+	 * Expected value: 0x5030B871 (setup + TX_DMA_EN only)
+	 */
+	dev_info(&dev->pdev->dev, "  Step 7c: Enable DMA (TX_DMA_EN only - RX not configured!)...\n");
 	val = MT_WFDMA0_GLO_CFG_SETUP |
-	      MT_WFDMA0_GLO_CFG_TX_DMA_EN |
-	      MT_WFDMA0_GLO_CFG_RX_DMA_EN;
+	      MT_WFDMA0_GLO_CFG_TX_DMA_EN;
+	/* NOTE: RX_DMA_EN intentionally NOT set - RX rings have BASE=0! */
 	mt_wr(dev, MT_WFDMA0_GLO_CFG, val);
 	wmb();
 
 	dev_info(&dev->pdev->dev, "  DMA enabled, GLO_CFG=0x%08x (expected 0x%08x)\n",
 		 mt_rr(dev, MT_WFDMA0_GLO_CFG),
-		 MT_WFDMA0_GLO_CFG_SETUP | MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
+		 (u32)(MT_WFDMA0_GLO_CFG_SETUP | MT_WFDMA0_GLO_CFG_TX_DMA_EN));
 
 	/* Step 8: MT7927-specific DMA configuration (from mt792x_dma_enable)
 	 * These are REQUIRED for MT7925/MT7927 per zouyonghao mt792x_dma.c:153-158
@@ -1281,11 +1379,38 @@ static int setup_dma_ring(struct test_dev *dev)
 	dev_info(&dev->pdev->dev, "    WFDMA_DUMMY_CR after:  0x%08x (set NEED_REINIT)\n",
 		 mt_rr(dev, MT_WFDMA_DUMMY_CR));
 
-	/* Configure delay interrupt (set to 0 per mt792x_dma_enable) */
-	mt_wr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0, 0);
-	wmb();
-	dev_info(&dev->pdev->dev, "    PRI_DLY_INT_CFG0 = 0x%08x (set to 0)\n",
-		 mt_rr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0));
+	/* PRI_DLY_INT_CFG0 already set to 0 in Step 7a (before GLO_CFG setup) */
+
+	/* DIAGNOSTIC: Scan ALL ring BASE registers to find any with address 0
+	 * Phase 27 debug: DMA engine might scan uninitialized rings with BASE=0 */
+	dev_info(&dev->pdev->dev, "  === DIAGNOSTIC: All TX Ring BASE registers ===\n");
+	{
+		int ring;
+		u32 base_lo, base_hi;
+		int zero_base_count = 0;
+
+		for (ring = 0; ring <= 16; ring++) {
+			base_lo = mt_rr(dev, MT_WFDMA0_TX_RING_BASE(ring));
+			base_hi = mt_rr(dev, MT_WFDMA0_TX_RING_BASE(ring) + 4);
+
+			/* Only print details for rings with interesting state */
+			if (ring == MCU_WM_RING_IDX || ring == FWDL_RING_IDX ||
+			    base_lo != 0 || (base_hi & 0x000F0000) != 0) {
+				dev_info(&dev->pdev->dev, "    Ring %2d: BASE_LO=0x%08x CTRL1=0x%08x (CNT=%d)\n",
+					 ring, base_lo, base_hi, base_hi & 0xFFF);
+			}
+
+			/* Count rings with BASE=0 (potential DMA fault sources) */
+			if (base_lo == 0 && (base_hi & 0x000F0000) == 0)
+				zero_base_count++;
+		}
+
+		if (zero_base_count > 0) {
+			dev_warn(&dev->pdev->dev, "  WARNING: %d TX rings have BASE=0 (potential IOMMU fault source!)\n",
+				 zero_base_count);
+			dev_info(&dev->pdev->dev, "    Rings with BASE=0 might be scanned by DMA even if not used.\n");
+		}
+	}
 
 	dev_info(&dev->pdev->dev, "  DMA setup complete!\n");
 	return 0;
@@ -1338,6 +1463,24 @@ static int send_fw_chunk(struct test_dev *dev, const void *data, size_t len)
 	ctrl = FIELD_PREP(MT_DMA_CTL_SD_LEN0, len) | MT_DMA_CTL_LAST_SEC0;
 	desc->ctrl = cpu_to_le32(ctrl);
 	desc->info = 0;
+
+	/* DIAGNOSTIC: Dump descriptor before DMA kick (first FWDL chunk only) */
+	{
+		static int fwdl_dump_count;
+		if (fwdl_dump_count < 2) {
+			dev_info(&dev->pdev->dev, "  [DIAG] Ring 16 desc[%d] before kick:\n", idx);
+			dev_info(&dev->pdev->dev, "    buf0=0x%08x (SDPtr0 lower32)\n", le32_to_cpu(desc->buf0));
+			dev_info(&dev->pdev->dev, "    ctrl=0x%08x (len=%d, LAST_SEC0=%d, DONE=%d)\n",
+				 le32_to_cpu(desc->ctrl),
+				 le32_to_cpu(desc->ctrl) & 0x3FFF,
+				 (le32_to_cpu(desc->ctrl) >> 14) & 1,
+				 (le32_to_cpu(desc->ctrl) >> 31) & 1);
+			dev_info(&dev->pdev->dev, "    buf1=0x%08x (SDPtr1 - should be 0 or upper32?)\n", le32_to_cpu(desc->buf1));
+			dev_info(&dev->pdev->dev, "    info=0x%08x (SDPtr0Ext:SDPtr1Ext - should have upper bits!)\n", le32_to_cpu(desc->info));
+			dev_info(&dev->pdev->dev, "    dma_buf_phys=0x%llx\n", (unsigned long long)dev->dma_buf_phys);
+			fwdl_dump_count++;
+		}
+	}
 	wmb();
 
 	/* Advance ring head and kick DMA on Ring 16 */

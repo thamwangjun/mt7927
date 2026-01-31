@@ -2,20 +2,32 @@
 
 ## Current Status
 
-**Status as of 2026-01-31**: **PHASE 26 - IMPLEMENTATION FIXES COMPLETE**
+**Status as of 2026-01-31**: **PHASE 27b - RX_DMA_EN FIX IMPLEMENTED**
 
 **Progress**:
 - ✅ Root cause found (Phase 17): ROM doesn't support mailbox protocol
 - ✅ Correct WFDMA base address (Phase 21): 0xd4000 (not 0x2000)
 - ✅ MCU reaches IDLE state (Phase 24): 0x1D1E confirmed!
 - ✅ Phase 26 fixes implemented: DMA priority, GLO_CFG_EXT1, descriptor init, etc.
-- 🔧 Ring configuration still failing - likely GLO_CFG timing issue
+- ✅ **GLO_CFG timing fix (Phase 27)**: Ring registers NOW accept writes!
+- ✅ **TX ring fix (Phase 27)**: All 17 TX rings now have valid BASE addresses
+- ✅ **RX_DMA_EN identified (Phase 27b)**: RX rings have BASE=0, causing remaining page faults
+- 🔧 **Fix implemented (Phase 27b)**: Only enable TX_DMA_EN during firmware loading
 
-**Current Blocker**: Ring registers (BASE, EXT_CTRL) not accepting writes. Zouyonghao sets CLK_GAT_DIS AFTER ring configuration, our code sets it BEFORE.
+**Root Cause Analysis (Phase 27b)**:
+1. ✅ TX ring fix worked - All TX rings 0-16 have valid BASE
+2. ❌ **RX rings still have BASE=0** - RX_DMA_EN enabled but RX not configured
+3. ❌ **DIDX stuck at 0** - Page fault halts DMA engine
 
-**Next Step**: Fix GLO_CFG timing (set CLK_GAT_DIS after ring config, not before).
+**Two Approaches for RX_DMA_EN Timing**:
+1. **Approach 1 (Current)**: Only enable TX_DMA_EN during FWDL, enable RX later
+2. **Approach 2**: Initialize all RX rings upfront, enable both TX and RX together
 
-See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** section "2a. Critical GLO_CFG Timing Difference" for details.
+**Fix Applied (Approach 1)**: Only enable `TX_DMA_EN` during firmware loading. `RX_DMA_EN` should be enabled after RX rings are properly configured.
+
+**Next Step**: Test the fix to verify page faults eliminated and DIDX starts incrementing.
+
+See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** sections "2b", "2c", and "2d" for complete analysis.
 
 ## Phase 1: Get It Working 🎯 CURRENT PHASE
 
@@ -36,14 +48,29 @@ See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** section "2a. Critical G
 
 ### In Progress 🔧
 
-- [ ] **Fix ring configuration** ← Current task
-  - Ring registers (BASE, EXT_CTRL) not accepting writes
-  - GLO_CFG timing difference identified (see ZOUYONGHAO_ANALYSIS.md)
-  - Need to reorder: set CLK_GAT_DIS AFTER ring config, not before
+- [x] ~~**Fix ring configuration**~~ - DONE (Phase 27)
+  - ~~Ring registers (BASE, EXT_CTRL) not accepting writes~~
+  - ✅ GLO_CFG timing fix applied: Clear GLO_CFG → configure rings → set CLK_GAT_DIS
+  - ✅ Ring BASE and EXT_CTRL now show correct DMA addresses
+
+- [x] ~~**Fix DMA page fault (TX rings)**~~ - DONE (Phase 27)
+  - ✅ Root cause: 15 unused TX rings (0-14) had BASE=0
+  - ✅ Fix implemented: Initialize all TX rings to valid DMA address
+
+- [x] ~~**Fix DMA page fault (RX rings)**~~ - ROOT CAUSE FOUND (Phase 27b)
+  - ✅ Root cause: RX rings have BASE=0 but RX_DMA_EN was enabled
+  - ✅ Fix implemented: Only enable TX_DMA_EN during firmware loading
+  - 🔧 Pending test to verify fix eliminates page faults
+
+- [ ] **Verify DMA descriptor processing** ← Current task
+  - Test the RX_DMA_EN fix
+  - Verify DIDX increments (hardware consuming descriptors)
+  - Verify no more IOMMU page faults
+  - See ZOUYONGHAO_ANALYSIS.md sections "2b", "2c", and "2d"
 
 ### Blocked (Pending Implementation) ⏸️
 
-- [ ] Fix DMA descriptor processing (blocked on firmware loader)
+- [ ] Fix DMA descriptor processing (blocked on page fault investigation)
 - [ ] Achieve MCU command completion
 - [ ] Complete firmware transfer and activation
 - [ ] Create network interface (wlan0)

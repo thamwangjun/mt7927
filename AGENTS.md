@@ -36,14 +36,25 @@
    - **Descriptor init**: Set DMA_DONE bit on all descriptors (was memset to 0)
    - **DIDX write**: Now write both CIDX and DIDX to 0
 
-10. **⚠️ REMAINING DIFFERENCE (Phase 26)**: GLO_CFG timing differs from zouyonghao:
-    - **Zouyonghao**: Sets CLK_GAT_DIS **AFTER** ring configuration
-    - **Our code**: Sets CLK_GAT_DIS **BEFORE** ring configuration
-    - This timing difference may prevent ring registers from accepting writes
+10. **✅ GLO_CFG TIMING FIX (Phase 27)**: Fixed ring configuration by reordering:
+    - Clear GLO_CFG BEFORE ring configuration
+    - Set CLK_GAT_DIS AFTER ring configuration
+    - Ring 15/16 BASE and EXT_CTRL now accept writes!
+
+11. **✅ PAGE FAULT ROOT CAUSE (Phase 27)**: DMA page faults at address 0x0 were caused by:
+    - **15 unused TX rings (0-14) had BASE=0**
+    - DMA engine scans ALL rings when enabled → tries to fetch from 0x0 → IOMMU fault
+    - **Fix implemented**: Initialize all unused rings to valid DMA address
+
+12. **✅ RX_DMA_EN TIMING (Phase 27b)**: After TX ring fix, 3 page faults remained:
+    - **RX rings have BASE=0** (not initialized) but `RX_DMA_EN` was enabled
+    - DMA engine scans RX rings → access 0x0 → IOMMU fault → DMA halts → DIDX stuck at 0
+    - **Fix implemented**: Only enable `TX_DMA_EN` during firmware loading
+    - RX_DMA_EN should be enabled later after RX rings are properly configured
 
 ## Current Status
 
-**Status**: ⚠️ RING CONFIG INVESTIGATION (Phase 26) - Ring registers not accepting writes
+**Status**: 🔧 PHASE 27b - RX_DMA_EN FIX IMPLEMENTED - Pending test
 **Last Updated**: January 2026
 
 ### What's Working ✅
@@ -51,43 +62,43 @@
 - Power management handshake completes (LPCTL: 0x04 → 0x00)
 - WiFi subsystem reset completes (INIT_DONE achieved)
 - CB_INFRA PCIe remap configured (0x74037001)
-- **MCU reaches IDLE state (0x1D1E)** - First time confirmed! ✅
+- **MCU reaches IDLE state (0x1D1E)** - Confirmed! ✅
 - CONN_INFRA version correct (0x03010002)
-- GLO_CFG setup with CLK_GATE_DIS works (0x5030B870)
+- GLO_CFG setup with CLK_GATE_DIS works
 - WFDMA extensions configured correctly
-- Ring assignments validated (Ring 15: MCU, Ring 16: FWDL)
+- **Ring configuration registers NOW work** (Phase 27 GLO_CFG timing fix)
+  - Ring 15 BASE=0xffff8000, EXT_CTRL=0x05000004 ✅
+  - Ring 16 BASE=0xffff9000, EXT_CTRL=0x05400004 ✅
+- **All TX rings 0-16 have valid BASE addresses** (Phase 27 unused ring fix)
 - Correct WFDMA base address (0xd4000)
 - L0S and L1 ASPM disabled
 - Firmware files load into kernel memory (1.4MB RAM code + patch)
 
-### What's Not Working ❌
-- **Ring configuration registers not accepting writes**
-  - Ring 15/16 EXT_CTRL reads back 0x00000000 (expected prefetch values)
-  - Ring 15/16 BASE reads back 0x00000000 (expected DMA addresses)
-  - Ring CNT shows 512 (expected 128)
-  - DMA DIDX stuck at 0 (descriptors never processed)
+### What Was Fixed (Phase 27b) 🔧
+- **Remaining page fault root cause found**: RX rings have BASE=0 but RX_DMA_EN was enabled
+- IOMMU page fault halts DMA engine → DIDX never increments
+- **Fix implemented**: Only enable TX_DMA_EN during firmware loading
+- **Two approaches documented**:
+  1. TX-only during FWDL (current) - enable RX_DMA_EN after RX rings configured
+  2. Initialize all rings upfront - enable both TX and RX together
 
 ### Next Step 🔧
 
-**Investigate GLO_CFG timing difference:**
+**Test the RX_DMA_EN fix:**
 
-Zouyonghao configures rings while GLO_CFG is cleared, then sets CLK_GAT_DIS AFTER ring config:
-
-```c
-// Zouyonghao sequence:
-mt792x_dma_disable();              // Clear GLO_CFG
-mt76_init_mcu_queue(rings 15, 16); // Configure rings (GLO_CFG cleared!)
-mt792x_dma_enable();               // Set CLK_GAT_DIS + TX/RX_DMA_EN AFTER
-
-// Our sequence (potentially wrong):
-GLO_CFG = SETUP with CLK_GAT_DIS;  // Set CLK_GAT_DIS BEFORE
-configure_rings(15, 16);           // Configure rings (CLK_GAT_DIS set!)
-GLO_CFG |= TX/RX_DMA_EN;           // Enable DMA
+```bash
+sudo rmmod test_fw_load 2>/dev/null
+sudo insmod tests/05_dma_impl/test_fw_load.ko
+sudo dmesg | tail -100
 ```
 
-**Potential fix**: Reorder `test_fw_load.c` to match zouyonghao timing - set CLK_GAT_DIS AFTER ring configuration, not before.
+**Expected results**:
+1. No more `AMD-Vi: Event logged [IO_PAGE_FAULT]` errors
+2. GLO_CFG = `0x5030b871` (TX_DMA_EN only, not 0x5030b875)
+3. DIDX should start incrementing (DMA consuming descriptors)
+4. Fewer or no "Ring 16 DMA timeout" messages
 
-See **docs/ZOUYONGHAO_ANALYSIS.md** section "2a. Critical GLO_CFG Timing Difference" for details.
+See **docs/ZOUYONGHAO_ANALYSIS.md** sections "2b", "2c", and "2d" for complete analysis.
 
 ---
 
