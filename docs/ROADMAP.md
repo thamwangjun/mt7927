@@ -2,13 +2,20 @@
 
 ## Current Status
 
-**Status as of 2026-01-31**: **ROOT CAUSE FOUND**
+**Status as of 2026-01-31**: **PHASE 26 - IMPLEMENTATION FIXES COMPLETE**
 
-**Discovery**: MT7927 ROM bootloader does NOT support mailbox command protocol! Our driver waits for mailbox responses that the ROM will never send. DMA hardware works correctly - we're using the wrong communication protocol.
+**Progress**:
+- ✅ Root cause found (Phase 17): ROM doesn't support mailbox protocol
+- ✅ Correct WFDMA base address (Phase 21): 0xd4000 (not 0x2000)
+- ✅ MCU reaches IDLE state (Phase 24): 0x1D1E confirmed!
+- ✅ Phase 26 fixes implemented: DMA priority, GLO_CFG_EXT1, descriptor init, etc.
+- 🔧 Ring configuration still failing - likely GLO_CFG timing issue
 
-**Solution**: Implement polling-based firmware loading (validated by zouyonghao working driver).
+**Current Blocker**: Ring registers (BASE, EXT_CTRL) not accepting writes. Zouyonghao sets CLK_GAT_DIS AFTER ring configuration, our code sets it BEFORE.
 
-See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** for complete root cause analysis.
+**Next Step**: Fix GLO_CFG timing (set CLK_GAT_DIS after ring config, not before).
+
+See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** section "2a. Critical GLO_CFG Timing Difference" for details.
 
 ## Phase 1: Get It Working 🎯 CURRENT PHASE
 
@@ -22,14 +29,17 @@ See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** for complete root cause
 - [x] Implement MCU communication protocol structures
 - [x] Implement firmware download sequence (mailbox-based - wrong protocol)
 - [x] **Identify root cause** - Mailbox protocol not supported by ROM bootloader
+- [x] **Fix WFDMA base address** - Changed from 0x2000 to 0xd4000
+- [x] **Implement CB_INFRA initialization** - PCIe remap, crypto MCU ownership
+- [x] **Confirm MCU IDLE state** - 0x1D1E reached successfully!
+- [x] **Phase 26 fixes** - DMA priority, GLO_CFG_EXT1, descriptor init, RST_DTX_PTR
 
 ### In Progress 🔧
 
-- [ ] **Implement polling-based firmware loader** ← Current task
-  - Based on zouyonghao reference implementation
-  - Skip mailbox waits, use time-based delays
-  - Aggressive TX cleanup before and after operations
-  - Status register polling instead of interrupt waiting
+- [ ] **Fix ring configuration** ← Current task
+  - Ring registers (BASE, EXT_CTRL) not accepting writes
+  - GLO_CFG timing difference identified (see ZOUYONGHAO_ANALYSIS.md)
+  - Need to reorder: set CLK_GAT_DIS AFTER ring config, not before
 
 ### Blocked (Pending Implementation) ⏸️
 
@@ -40,38 +50,47 @@ See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** for complete root cause
 
 ### Implementation Approaches
 
-#### Quick Test (30 minutes)
-Validate the mailbox hypothesis with minimal code changes:
+#### Current Approach: Fix GLO_CFG Timing
 
-**File**: `src/mt7927_mcu.c`
+**File**: `tests/05_dma_impl/test_fw_load.c`
+
+Reorder initialization sequence to match zouyonghao:
+
 ```c
-// OLD (wrong - waits for mailbox response):
-ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_CMD_PATCH_SEM_CONTROL,
-                                &req, sizeof(req), true, &skb);
+// Phase 1: Clear/minimize GLO_CFG
+mt_wr(dev, MT_WFDMA0_GLO_CFG, 0);  // Or minimal value
 
-// NEW (correct - don't wait):
-ret = mt76_mcu_send_msg(&dev->mt76, MCU_CMD_PATCH_SEM_CONTROL,
-                       &req, sizeof(req), false);  // Don't wait!
-// Skip response parsing - ROM doesn't send it
+// Phase 2: Configure rings (GLO_CFG cleared!)
+mt_wr(dev, MT_WFDMA0_TX_RING_BASE(15), dma_addr_15);
+mt_wr(dev, MT_WFDMA0_TX_RING_CNT(15), ring_count);
+mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(15), 0);
+mt_wr(dev, MT_WFDMA0_TX_RING_DIDX(15), 0);
+// ... same for ring 16 ...
+
+// Phase 3: Configure prefetch
+mt_wr(dev, MT_WFDMA0_TX_RING15_EXT_CTRL, PREFETCH_RING15);
+mt_wr(dev, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH_RING16);
+
+// Phase 4: NOW set GLO_CFG with CLK_GAT_DIS (AFTER rings!)
+mt_wr(dev, MT_WFDMA0_GLO_CFG, MT_WFDMA0_GLO_CFG_SETUP);
+
+// Phase 5: Enable TX/RX DMA
+mt_set(dev, MT_WFDMA0_GLO_CFG, TX_DMA_EN | RX_DMA_EN);
 ```
 
-**Expected Result**: DMA_DIDX should advance because we're not blocking on mailbox response.
+**Expected Result**: Ring registers should accept writes when GLO_CFG is in cleared state.
 
-#### Full Solution (2-3 hours)
-Complete polling-based firmware loader:
+#### Already Implemented (Phase 26)
 
-**Create**: `src/mt7927_fw_load.c` (based on `reference_zouyonghao_mt7927/mt7927_fw_load.c`)
+1. ✅ DMA priority registers (INT_RX_PRI=0x0F00, INT_TX_PRI=0x7F00)
+2. ✅ GLO_CFG_EXT1 BIT(28) for MT7927
+3. ✅ WFDMA_DUMMY_CR with NEED_REINIT flag
+4. ✅ RST_DTX_PTR = ~0 (reset all rings)
+5. ✅ Descriptor init with DMA_DONE bit
+6. ✅ DIDX register writes
+7. ✅ Polling-based firmware loading (no mailbox waits)
 
-**Key Components**:
-1. **Skip semaphore command** - ROM doesn't support it
-2. **Never wait for mailbox responses** - Set `wait_resp = false` in all mcu_send_msg calls
-3. **Aggressive TX cleanup** - Force cleanup before AND after each chunk
-4. **Polling delays** - 5-10ms between operations for ROM processing
-5. **Skip FW_START** - Manually set SW_INIT_DONE bit instead
-6. **MCU IDLE check** - Poll 0x81021604 for 0x1D1E before firmware loading
-7. **Status register polling** - Check 0x7c060204 and 0x7c0600f0 for completion
-
-See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) lines 274-293 for complete requirements.
+See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) section "2a. Critical GLO_CFG Timing Difference" for details.
 
 ### Expected Output (Current State)
 
@@ -179,36 +198,38 @@ See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) lines 274-293 for complete 
 - Driver successfully binds to device and handles IRQs
 - Firmware files load into kernel memory (MT7925 firmware compatible via CONNAC3X)
 - Power management handshake (host claims DMA ownership via PMCTRL)
-- WiFi subsystem reset sequence (WFSYS_SW_RST_B timing)
-- DMA descriptor rings allocated and configured (sparse layout: 0,1,2,15,16)
+- WiFi/BT subsystem reset sequence via CB_INFRA_RGU
+- DMA descriptor rings allocated (sparse layout: 0,1,2,15,16)
 - **Queue assignments validated** - Ring 15 (MCU_WM), Ring 16 (FWDL) per MT6639 config
-- MCU responds as ready (FW_OWN_REQ_SET returns 0x00000001)
-- PCIe ASPM L0s disabled (MT_PCIE_MAC_PM_L0S_DIS set)
-- SWDEF_MODE set to normal operation (0x1)
-- All registers writable, no protection issues
+- PCIe ASPM L0s and L1 disabled
+- **CB_INFRA initialization** - PCIe remap (0x74037001) configured
+- **CONN_INFRA version** - 0x03010002 confirmed
+- **MCU reaches IDLE (0x1D1E)** - First time confirmed! ✅
+- **GLO_CFG setup** - Clock gating disabled, WFDMA extensions configured
 - **Ring protocol confirmed** - MT6639 analysis validates CONNAC3X ring assignments
 - **Architectural foundation confirmed** - MT7927 is MT6639 variant with CONNAC3X protocol
 
 ### What's Not Working ❌
 
-- **DMA descriptor processing** - Hardware doesn't advance DMA_DIDX (blocked on firmware loader)
-- MCU command timeouts (patch semaphore never completes - root cause: mailbox protocol)
-- Firmware transfer blocked by non-functional DMA (blocked on firmware loader)
+- **Ring register writes** - BASE, EXT_CTRL not accepting writes (likely GLO_CFG timing)
+- **DMA descriptor processing** - DIDX stuck at 0 (blocked on ring config)
+- Firmware transfer (blocked on ring config)
 - Network interface creation (requires successful initialization)
 
 ### Root Cause Analysis
 
-**CONFIRMED (Phase 17)**: MT7927 ROM bootloader does NOT support mailbox command protocol!
+**Phase 17-21 (RESOLVED)**: Mailbox protocol and WFDMA base address
+- ✅ ROM doesn't support mailbox → Polling-based approach implemented
+- ✅ Wrong WFDMA base (0x2000 vs 0xd4000) → Fixed to use 0xd4000
 
-All initialization steps execute correctly, but the communication protocol is wrong:
-1. **PATCH_SEM_CONTROL sent** → ROM ignores it (doesn't understand mailbox protocol)
-2. **Driver waits for response** → ROM never responds
-3. **DMA_DIDX never advances** → Because we're waiting in wrong place!
-4. **Timeout after 5 seconds** → MCU command never completes
+**Phase 24-26 (CURRENT)**: Ring configuration registers
+- ❌ Ring registers (BASE, EXT_CTRL) not accepting writes
+- Likely cause: **GLO_CFG timing difference**
+  - Zouyonghao: Sets CLK_GAT_DIS **AFTER** ring configuration
+  - Our code: Sets CLK_GAT_DIS **BEFORE** ring configuration
+  - Hardware may require ring config while GLO_CFG is in "disabled" state
 
-**The real blockers**:
-1. Mailbox protocol assumption (ROM doesn't support it)
-2. Wrong WFDMA base address (0x2000 is MCU DMA, 0xd4000 is HOST DMA)
+**Current Blocker**: GLO_CFG timing (Phase 26 finding)
 
 ## Testing and Validation
 

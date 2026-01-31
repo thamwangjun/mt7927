@@ -47,6 +47,13 @@
 #define MT_WFDMA0_HOST_INT_ENA      (MT_WFDMA0_BASE + 0x204)
 #define MT_WFDMA0_GLO_CFG           (MT_WFDMA0_BASE + 0x208)
 #define MT_WFDMA0_RST_DTX_PTR       (MT_WFDMA0_BASE + 0x20c)
+#define MT_WFDMA0_RST_DRX_PTR       (MT_WFDMA0_BASE + 0x280)
+
+/* DMA priority and delay interrupt registers (from mt792x_regs.h)
+ * These are REQUIRED for MT7927 per mt792x_dma_enable() */
+#define MT_WFDMA0_INT_RX_PRI        (MT_WFDMA0_BASE + 0x298)
+#define MT_WFDMA0_INT_TX_PRI        (MT_WFDMA0_BASE + 0x29c)
+#define MT_WFDMA0_PRI_DLY_INT_CFG0  (MT_WFDMA0_BASE + 0x2f0)
 
 /* DMA reset control - CRITICAL: Must reset before ring config works! */
 #define MT_WFDMA0_RST               (MT_WFDMA0_BASE + 0x100)
@@ -55,7 +62,18 @@
 
 /* GLO_CFG extension for DMASHDL */
 #define MT_WFDMA0_GLO_CFG_EXT0      (MT_WFDMA0_BASE + 0x2b0)
+#define MT_WFDMA0_GLO_CFG_EXT1      (MT_WFDMA0_BASE + 0x2b4)  /* MT7927-specific enable */
 #define MT_WFDMA0_CSR_TX_DMASHDL_ENABLE BIT(6)
+
+/* MT_UWFDMA0_GLO_CFG_EXT1 - Same as MT_WFDMA0_GLO_CFG_EXT1, chip address 0x7c0242b4
+ * BIT(28) MUST be set for MT7927 per mt792x_dma_enable() */
+#define MT_WFDMA0_GLO_CFG_EXT1_MT7927_EN  BIT(28)
+
+/* WFDMA_DUMMY_CR - MCU address 0x54000120 (needs MCU register access)
+ * Used to signal reinit needed. For simplicity, we use direct WFDMA0 offset.
+ * Note: This may need L1 remap in some implementations. */
+#define MT_WFDMA_DUMMY_CR           (MT_WFDMA0_BASE + 0x120)
+#define MT_WFDMA_NEED_REINIT        BIT(1)
 
 #define MT_WFDMA0_TX_RING_BASE(n)   (MT_WFDMA0_BASE + 0x300 + (n) * 0x10)
 #define MT_WFDMA0_TX_RING_CNT(n)    (MT_WFDMA0_BASE + 0x304 + (n) * 0x10)
@@ -165,6 +183,13 @@
 /* WFDMA Host DMA extension registers (0x7C024xxx → BAR0 0x0d4xxx) */
 #define MT_WFDMA_GLO_CFG_EXT1                           0x0d42B4    /* 0x7C0242B4 */
 #define MT_WFDMA_GLO_CFG_EXT2                           0x0d42B8    /* 0x7C0242B8 */
+#define MT_WFDMA_HOST_PER_DLY_INT_CFG                   0x0d42E8    /* 0x7C0242E8 */
+#define MT_WFDMA_PAUSE_RX_Q_TH10                        0x0d4260    /* 0x7C024260 */
+#define MT_WFDMA_PAUSE_RX_Q_TH1110                      0x0d4274    /* 0x7C024274 */
+
+/* WFDMA EXT_WRAP_CSR registers (0x7C027xxx → BAR0 0x0d7xxx) */
+#define MT_WFDMA_HIF_PERF_MAVG_DIV                      0x0d70C0    /* 0x7C0270C0 */
+#define MT_WFDMA_DLY_IDX_CFG_0                          0x0d70E8    /* 0x7C0270E8 */
 
 /* MT7927 MSI configuration values (from MTK driver) */
 #define MT7927_MSI_NUM_SINGLE                           0
@@ -176,6 +201,12 @@
 /* WFDMA flow control values */
 #define MT7927_WPDMA_GLO_CFG_EXT1_VALUE                 0x8C800404
 #define MT7927_WPDMA_GLO_CFG_EXT2_VALUE                 0x44
+
+/* WFDMA additional configuration values (from zouyonghao mt7927_regs.h) */
+#define MT7927_WFDMA_HIF_PERF_MAVG_DIV_VALUE            0x36        /* Moving average divisor */
+#define MT7927_PER_DLY_INT_CFG_VALUE                    0xF00008    /* Periodic delay interrupt */
+#define MT7927_DLY_IDX_CFG_RING4_7_VALUE                0x40654065  /* Ring 4-7 delay config */
+#define MT7927_RX_RING_THRESHOLD_DEFAULT                0x22        /* Default threshold = 2 */
 
 /* L1 Remap registers (for 0x70xxxxxx addresses) */
 #define MT_HIF_REMAP_L1                 0x155024
@@ -970,6 +1001,40 @@ static int configure_pcie_wfdma(struct test_dev *dev)
 	dev_info(&dev->pdev->dev, "    GLO_CFG_EXT1 = 0x%08x, EXT2 = 0x%08x\n",
 		 mt_rr(dev, MT_WFDMA_GLO_CFG_EXT1), mt_rr(dev, MT_WFDMA_GLO_CFG_EXT2));
 
+	/* Step 4: Configure HIF performance moving average divisor
+	 * From zouyonghao pci_mcu.c: mt7927e_mcu_init() */
+	dev_info(&dev->pdev->dev, "  Configuring WFDMA HIF performance...\n");
+	mt_wr(dev, MT_WFDMA_HIF_PERF_MAVG_DIV, MT7927_WFDMA_HIF_PERF_MAVG_DIV_VALUE);
+	dev_info(&dev->pdev->dev, "    HIF_PERF_MAVG_DIV = 0x%08x\n",
+		 mt_rr(dev, MT_WFDMA_HIF_PERF_MAVG_DIV));
+
+	/* Step 5: Configure RX ring thresholds
+	 * From zouyonghao pci_mcu.c: Loop from TH10 to TH1110 */
+	dev_info(&dev->pdev->dev, "  Configuring RX ring thresholds...\n");
+	{
+		u32 addr;
+		for (addr = MT_WFDMA_PAUSE_RX_Q_TH10;
+		     addr <= MT_WFDMA_PAUSE_RX_Q_TH1110;
+		     addr += 0x4) {
+			mt_wr(dev, addr, MT7927_RX_RING_THRESHOLD_DEFAULT);
+		}
+	}
+	dev_info(&dev->pdev->dev, "    RX thresholds set to 0x%02x\n",
+		 MT7927_RX_RING_THRESHOLD_DEFAULT);
+
+	/* Step 6: Configure periodic delayed interrupt
+	 * From zouyonghao pci_mcu.c */
+	dev_info(&dev->pdev->dev, "  Configuring delay interrupts...\n");
+	mt_wr(dev, MT_WFDMA_HOST_PER_DLY_INT_CFG, MT7927_PER_DLY_INT_CFG_VALUE);
+	dev_info(&dev->pdev->dev, "    PER_DLY_INT_CFG = 0x%08x\n",
+		 mt_rr(dev, MT_WFDMA_HOST_PER_DLY_INT_CFG));
+
+	/* Step 7: Configure ring 4-7 delay interrupt
+	 * From zouyonghao pci_mcu.c */
+	mt_wr(dev, MT_WFDMA_DLY_IDX_CFG_0, MT7927_DLY_IDX_CFG_RING4_7_VALUE);
+	dev_info(&dev->pdev->dev, "    DLY_IDX_CFG_0 = 0x%08x\n",
+		 mt_rr(dev, MT_WFDMA_DLY_IDX_CFG_0));
+
 	dev_info(&dev->pdev->dev, "  PCIE/WFDMA configuration complete\n");
 	return 0;
 }
@@ -993,7 +1058,20 @@ static int setup_dma_ring(struct test_dev *dev)
 		dev_err(&dev->pdev->dev, "  Failed to allocate MCU ring\n");
 		return -ENOMEM;
 	}
-	memset(dev->mcu_ring, 0, RING_SIZE * sizeof(struct mt7927_desc));
+	/* CRITICAL: Initialize ALL descriptors with DMA_DONE bit set!
+	 * mt76 does this in __mt76_dma_queue_reset() - sets ctrl to DMA_DONE
+	 * for all descriptors. Hardware expects unused descriptors to have
+	 * DMA_DONE set to indicate "available/completed". Using memset(0)
+	 * leaves DMA_DONE=0 which may cause hardware to think all are pending. */
+	{
+		int i;
+		for (i = 0; i < RING_SIZE; i++) {
+			dev->mcu_ring[i].buf0 = 0;
+			dev->mcu_ring[i].ctrl = cpu_to_le32(MT_DMA_CTL_DMA_DONE);
+			dev->mcu_ring[i].buf1 = 0;
+			dev->mcu_ring[i].info = 0;
+		}
+	}
 	dev->mcu_ring_head = 0;
 
 	dev_info(&dev->pdev->dev, "  Ring 15 (MCU_WM) allocated at DMA 0x%pad\n",
@@ -1007,7 +1085,16 @@ static int setup_dma_ring(struct test_dev *dev)
 		dev_err(&dev->pdev->dev, "  Failed to allocate FWDL ring\n");
 		return -ENOMEM;
 	}
-	memset(dev->fwdl_ring, 0, RING_SIZE * sizeof(struct mt7927_desc));
+	/* Same for FWDL ring - set DMA_DONE on all descriptors */
+	{
+		int i;
+		for (i = 0; i < RING_SIZE; i++) {
+			dev->fwdl_ring[i].buf0 = 0;
+			dev->fwdl_ring[i].ctrl = cpu_to_le32(MT_DMA_CTL_DMA_DONE);
+			dev->fwdl_ring[i].buf1 = 0;
+			dev->fwdl_ring[i].info = 0;
+		}
+	}
 	dev->fwdl_ring_head = 0;
 
 	dev_info(&dev->pdev->dev, "  Ring 16 (FWDL) allocated at DMA 0x%pad\n",
@@ -1052,71 +1139,80 @@ static int setup_dma_ring(struct test_dev *dev)
 	mt_wr(dev, MT_WFDMA0_GLO_CFG_EXT0, val);
 	wmb();
 
-	dev_info(&dev->pdev->dev, "  Step 3: DMA Logic Reset (CRITICAL!)...\n");
+	/* Step 3: Check DMA Reset state - DO NOT manipulate RST register!
+	 * Analysis of test failure showed that clearing RST bits may prevent ring
+	 * registers from accepting writes. MediaTek's asicConnac3xWfdmaControl()
+	 * does NOT explicitly manipulate the RST register - it just configures GLO_CFG.
+	 *
+	 * The RST register value of 0x30 (bits 4,5 set) is the power-on default.
+	 * Instead of clearing it, we'll leave it alone and see if rings work. */
 	val = mt_rr(dev, MT_WFDMA0_RST);
-	dev_info(&dev->pdev->dev, "    RST before: 0x%08x\n", val);
+	dev_info(&dev->pdev->dev, "  Step 3: DMA Reset state check (NOT modifying!)...\n");
+	dev_info(&dev->pdev->dev, "    RST = 0x%08x (leaving unchanged)\n", val);
 
-	/* Assert reset: set reset bits */
-	val |= (MT_WFDMA0_RST_LOGIC_RST | MT_WFDMA0_RST_DMASHDL_ALL_RST);
-	mt_wr(dev, MT_WFDMA0_RST, val);
+	/* Step 4: Configure Ring 15 (MCU_WM) - configure BEFORE EXT_CTRL
+	 * MediaTek's halWpdmaAllocRing() order: CTRL0, CTRL1, CTRL2, then EXT_CTRL
+	 * mt76 also writes DIDX (dma_idx) to 0 in mt76_dma_queue_reset() */
+	dev_info(&dev->pdev->dev, "  Step 4: Configuring Ring %d (MCU_WM)...\n", MCU_WM_RING_IDX);
+	mt_wr(dev, MT_WFDMA0_TX_RING_BASE(MCU_WM_RING_IDX), lower_32_bits(dev->mcu_ring_dma));
 	wmb();
-	usleep_range(1000, 2000);  /* Hold reset for 1-2ms */
-
-	/* Deassert reset: clear reset bits - THIS WAS MISSING! */
-	val &= ~(MT_WFDMA0_RST_LOGIC_RST | MT_WFDMA0_RST_DMASHDL_ALL_RST);
-	mt_wr(dev, MT_WFDMA0_RST, val);
+	/* CTRL1 contains upper address bits AND max count - write as combined value */
+	val = (upper_32_bits(dev->mcu_ring_dma) & 0x000F0000) | RING_SIZE;
+	mt_wr(dev, MT_WFDMA0_TX_RING_BASE(MCU_WM_RING_IDX) + 4, val);
 	wmb();
-	msleep(5);  /* Give hardware time to come out of reset */
+	/* Write BOTH CIDX and DIDX to 0 (mt76 does this in queue_reset) */
+	mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(MCU_WM_RING_IDX), 0);
+	mt_wr(dev, MT_WFDMA0_TX_RING_DIDX(MCU_WM_RING_IDX), 0);
+	wmb();
+	msleep(1);
 
-	dev_info(&dev->pdev->dev, "    RST after deassert: 0x%08x (should be 0x00)\n",
-		 mt_rr(dev, MT_WFDMA0_RST));
+	val = mt_rr(dev, MT_WFDMA0_TX_RING_BASE(MCU_WM_RING_IDX));
+	dev_info(&dev->pdev->dev, "    Ring %d: BASE=0x%08x CTRL1=0x%08x CIDX=%d DIDX=%d\n",
+		 MCU_WM_RING_IDX, val,
+		 mt_rr(dev, MT_WFDMA0_TX_RING_BASE(MCU_WM_RING_IDX) + 4),
+		 mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(MCU_WM_RING_IDX)),
+		 mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(MCU_WM_RING_IDX)));
 
-	/* Step 4: Configure prefetch/EXT_CTRL for rings 15/16
+	/* Step 5: Configure Ring 16 (FWDL) */
+	dev_info(&dev->pdev->dev, "  Step 5: Configuring Ring %d (FWDL)...\n", FWDL_RING_IDX);
+	mt_wr(dev, MT_WFDMA0_TX_RING_BASE(FWDL_RING_IDX), lower_32_bits(dev->fwdl_ring_dma));
+	wmb();
+	val = (upper_32_bits(dev->fwdl_ring_dma) & 0x000F0000) | RING_SIZE;
+	mt_wr(dev, MT_WFDMA0_TX_RING_BASE(FWDL_RING_IDX) + 4, val);
+	wmb();
+	/* Write BOTH CIDX and DIDX to 0 (mt76 does this in queue_reset) */
+	mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX), 0);
+	mt_wr(dev, MT_WFDMA0_TX_RING_DIDX(FWDL_RING_IDX), 0);
+	wmb();
+	msleep(1);
+
+	val = mt_rr(dev, MT_WFDMA0_TX_RING_BASE(FWDL_RING_IDX));
+	dev_info(&dev->pdev->dev, "    Ring %d: BASE=0x%08x CTRL1=0x%08x CIDX=%d DIDX=%d\n",
+		 FWDL_RING_IDX, val,
+		 mt_rr(dev, MT_WFDMA0_TX_RING_BASE(FWDL_RING_IDX) + 4),
+		 mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX)),
+		 mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(FWDL_RING_IDX)));
+
+	/* Step 6: Configure prefetch/EXT_CTRL AFTER ring setup
 	 * From mt792x_dma.c: mt792x_dma_prefetch() */
-	dev_info(&dev->pdev->dev, "  Step 4: Configuring prefetch (EXT_CTRL)...\n");
+	dev_info(&dev->pdev->dev, "  Step 6: Configuring prefetch (EXT_CTRL)...\n");
 	mt_wr(dev, MT_WFDMA0_TX_RING15_EXT_CTRL, PREFETCH_RING15);
 	mt_wr(dev, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH_RING16);
 	wmb();
+	msleep(1);
 	dev_info(&dev->pdev->dev, "    Ring 15 EXT_CTRL: 0x%08x (expected 0x%08x)\n",
 		 mt_rr(dev, MT_WFDMA0_TX_RING15_EXT_CTRL), PREFETCH_RING15);
 	dev_info(&dev->pdev->dev, "    Ring 16 EXT_CTRL: 0x%08x (expected 0x%08x)\n",
 		 mt_rr(dev, MT_WFDMA0_TX_RING16_EXT_CTRL), PREFETCH_RING16);
 
-	/* Step 5: Reset DMA pointers for ALL TX rings */
-	dev_info(&dev->pdev->dev, "  Step 5: Resetting DMA pointers...\n");
-	mt_wr(dev, MT_WFDMA0_RST_DTX_PTR, ~0U);
+	/* Step 7: Reset ring pointers AFTER configuration
+	 * CRITICAL: mt76 uses ~0 to reset ALL rings, not just specific ones.
+	 * Previous code used BIT(15)|BIT(16) which only reset rings 15/16.
+	 * Per mt792x_dma_enable(): mt76_wr(dev, MT_WFDMA0_RST_DTX_PTR, ~0); */
+	dev_info(&dev->pdev->dev, "  Step 7: Resetting ALL ring DMA pointers (~0)...\n");
+	mt_wr(dev, MT_WFDMA0_RST_DTX_PTR, ~0);
 	wmb();
 	msleep(5);
-
-	/* Configure Ring 15 (MCU_WM) */
-	dev_info(&dev->pdev->dev, "  Configuring Ring %d (MCU_WM)...\n", MCU_WM_RING_IDX);
-	mt_wr(dev, MT_WFDMA0_TX_RING_BASE(MCU_WM_RING_IDX), lower_32_bits(dev->mcu_ring_dma));
-	mt_wr(dev, MT_WFDMA0_TX_RING_BASE(MCU_WM_RING_IDX) + 4, upper_32_bits(dev->mcu_ring_dma));
-	mt_wr(dev, MT_WFDMA0_TX_RING_CNT(MCU_WM_RING_IDX), RING_SIZE);
-	mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(MCU_WM_RING_IDX), 0);
-	wmb();
-
-	val = mt_rr(dev, MT_WFDMA0_TX_RING_BASE(MCU_WM_RING_IDX));
-	dev_info(&dev->pdev->dev, "  Ring %d: BASE=0x%08x CNT=%d CIDX=%d DIDX=%d\n",
-		 MCU_WM_RING_IDX, val,
-		 mt_rr(dev, MT_WFDMA0_TX_RING_CNT(MCU_WM_RING_IDX)),
-		 mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(MCU_WM_RING_IDX)),
-		 mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(MCU_WM_RING_IDX)));
-
-	/* Configure Ring 16 (FWDL) */
-	dev_info(&dev->pdev->dev, "  Configuring Ring %d (FWDL)...\n", FWDL_RING_IDX);
-	mt_wr(dev, MT_WFDMA0_TX_RING_BASE(FWDL_RING_IDX), lower_32_bits(dev->fwdl_ring_dma));
-	mt_wr(dev, MT_WFDMA0_TX_RING_BASE(FWDL_RING_IDX) + 4, upper_32_bits(dev->fwdl_ring_dma));
-	mt_wr(dev, MT_WFDMA0_TX_RING_CNT(FWDL_RING_IDX), RING_SIZE);
-	mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX), 0);
-	wmb();
-
-	val = mt_rr(dev, MT_WFDMA0_TX_RING_BASE(FWDL_RING_IDX));
-	dev_info(&dev->pdev->dev, "  Ring %d: BASE=0x%08x CNT=%d CIDX=%d DIDX=%d\n",
-		 FWDL_RING_IDX, val,
-		 mt_rr(dev, MT_WFDMA0_TX_RING_CNT(FWDL_RING_IDX)),
-		 mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX)),
-		 mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(FWDL_RING_IDX)));
 
 	/* Enable DMA by adding TX_DMA_EN and RX_DMA_EN to the setup value
 	 * This matches MediaTek's pdmaSetup(TRUE) which adds DMA enables to existing config
@@ -1134,6 +1230,64 @@ static int setup_dma_ring(struct test_dev *dev)
 		 mt_rr(dev, MT_WFDMA0_GLO_CFG),
 		 MT_WFDMA0_GLO_CFG_SETUP | MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
 
+	/* Step 8: MT7927-specific DMA configuration (from mt792x_dma_enable)
+	 * These are REQUIRED for MT7925/MT7927 per zouyonghao mt792x_dma.c:153-158
+	 *
+	 * if (is_mt7925(&dev->mt76) || is_mt7927(&dev->mt76)) {
+	 *     mt76_rmw(dev, MT_UWFDMA0_GLO_CFG_EXT1, BIT(28), BIT(28));
+	 *     mt76_set(dev, MT_WFDMA0_INT_RX_PRI, 0x0F00);
+	 *     mt76_set(dev, MT_WFDMA0_INT_TX_PRI, 0x7F00);
+	 * }
+	 * mt76_set(dev, MT_WFDMA_DUMMY_CR, MT_WFDMA_NEED_REINIT);
+	 */
+	dev_info(&dev->pdev->dev, "  Step 8: MT7927-specific DMA configuration...\n");
+
+	/* Set GLO_CFG_EXT1 BIT(28) - MT7927-specific enable bit */
+	val = mt_rr(dev, MT_WFDMA0_GLO_CFG_EXT1);
+	dev_info(&dev->pdev->dev, "    GLO_CFG_EXT1 before: 0x%08x\n", val);
+	val |= MT_WFDMA0_GLO_CFG_EXT1_MT7927_EN;  /* BIT(28) */
+	mt_wr(dev, MT_WFDMA0_GLO_CFG_EXT1, val);
+	wmb();
+	dev_info(&dev->pdev->dev, "    GLO_CFG_EXT1 after:  0x%08x (set BIT(28))\n",
+		 mt_rr(dev, MT_WFDMA0_GLO_CFG_EXT1));
+
+	/* Set DMA RX priority - 0x0F00 */
+	val = mt_rr(dev, MT_WFDMA0_INT_RX_PRI);
+	dev_info(&dev->pdev->dev, "    INT_RX_PRI before: 0x%08x\n", val);
+	val |= 0x0F00;
+	mt_wr(dev, MT_WFDMA0_INT_RX_PRI, val);
+	wmb();
+	dev_info(&dev->pdev->dev, "    INT_RX_PRI after:  0x%08x (set 0x0F00)\n",
+		 mt_rr(dev, MT_WFDMA0_INT_RX_PRI));
+
+	/* Set DMA TX priority - 0x7F00 */
+	val = mt_rr(dev, MT_WFDMA0_INT_TX_PRI);
+	dev_info(&dev->pdev->dev, "    INT_TX_PRI before: 0x%08x\n", val);
+	val |= 0x7F00;
+	mt_wr(dev, MT_WFDMA0_INT_TX_PRI, val);
+	wmb();
+	dev_info(&dev->pdev->dev, "    INT_TX_PRI after:  0x%08x (set 0x7F00)\n",
+		 mt_rr(dev, MT_WFDMA0_INT_TX_PRI));
+
+	/* Set WFDMA_DUMMY_CR reinit flag
+	 * NOTE: MT_WFDMA_DUMMY_CR is at MCU address 0x54000120 in mt76.
+	 * We use the WFDMA0 base offset (0x120) which may or may not work.
+	 * If this doesn't work, it may need L1 remap like other MCU regs. */
+	val = mt_rr(dev, MT_WFDMA_DUMMY_CR);
+	dev_info(&dev->pdev->dev, "    WFDMA_DUMMY_CR before: 0x%08x\n", val);
+	val |= MT_WFDMA_NEED_REINIT;  /* BIT(1) */
+	mt_wr(dev, MT_WFDMA_DUMMY_CR, val);
+	wmb();
+	dev_info(&dev->pdev->dev, "    WFDMA_DUMMY_CR after:  0x%08x (set NEED_REINIT)\n",
+		 mt_rr(dev, MT_WFDMA_DUMMY_CR));
+
+	/* Configure delay interrupt (set to 0 per mt792x_dma_enable) */
+	mt_wr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0, 0);
+	wmb();
+	dev_info(&dev->pdev->dev, "    PRI_DLY_INT_CFG0 = 0x%08x (set to 0)\n",
+		 mt_rr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0));
+
+	dev_info(&dev->pdev->dev, "  DMA setup complete!\n");
 	return 0;
 }
 

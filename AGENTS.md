@@ -24,46 +24,70 @@
    - Ring 16 should be at **0xd4400** (not 0x2400)
    - From MT6639 bus2chip: `{0x7c020000, 0xd0000, 0x10000}` → chip 0x7c024000 = BAR0+0xd4000
 
+7. **✅ MCU IDLE CONFIRMED (Phase 24)**: First successful MCU IDLE (0x1D1E) - hardware initialization progresses correctly!
+
+8. **⚠️ RING CONFIG FAILURE (Phase 25)**: Ring configuration registers not accepting writes despite correct WFDMA base. Missing DMA initialization steps identified.
+
+9. **🔧 PHASE 26 FIXES**: Implemented 6 critical differences from zouyonghao reference:
+   - **DMA priority registers**: Added `INT_RX_PRI=0x0F00`, `INT_TX_PRI=0x7F00`
+   - **GLO_CFG_EXT1 BIT(28)**: Added MT7927-specific enable bit
+   - **WFDMA_DUMMY_CR**: Added `MT_WFDMA_NEED_REINIT` flag
+   - **Reset scope**: Changed `RST_DTX_PTR` to `~0` (all rings)
+   - **Descriptor init**: Set DMA_DONE bit on all descriptors (was memset to 0)
+   - **DIDX write**: Now write both CIDX and DIDX to 0
+
+10. **⚠️ REMAINING DIFFERENCE (Phase 26)**: GLO_CFG timing differs from zouyonghao:
+    - **Zouyonghao**: Sets CLK_GAT_DIS **AFTER** ring configuration
+    - **Our code**: Sets CLK_GAT_DIS **BEFORE** ring configuration
+    - This timing difference may prevent ring registers from accepting writes
+
 ## Current Status
 
-**Status**: ⚠️ CRITICAL BUG FOUND (Phase 21) - Wrong WFDMA base address used (0x2000 vs 0xd4000)
+**Status**: ⚠️ RING CONFIG INVESTIGATION (Phase 26) - Ring registers not accepting writes
 **Last Updated**: January 2026
 
 ### What's Working ✅
 - Driver successfully binds to MT7927 hardware (PCI ID: 14c3:7927)
 - Power management handshake completes (LPCTL: 0x04 → 0x00)
 - WiFi subsystem reset completes (INIT_DONE achieved)
-- DMA descriptor rings allocate and configure correctly
+- CB_INFRA PCIe remap configured (0x74037001)
+- **MCU reaches IDLE state (0x1D1E)** - First time confirmed! ✅
+- CONN_INFRA version correct (0x03010002)
+- GLO_CFG setup with CLK_GATE_DIS works (0x5030B870)
+- WFDMA extensions configured correctly
 - Ring assignments validated (Ring 15: MCU, Ring 16: FWDL)
-- L0S power saving disabled
+- Correct WFDMA base address (0xd4000)
+- L0S and L1 ASPM disabled
 - Firmware files load into kernel memory (1.4MB RAM code + patch)
-- Interrupts registered and enabled
-- **Root cause identified** - mailbox protocol not supported by ROM
+
+### What's Not Working ❌
+- **Ring configuration registers not accepting writes**
+  - Ring 15/16 EXT_CTRL reads back 0x00000000 (expected prefetch values)
+  - Ring 15/16 BASE reads back 0x00000000 (expected DMA addresses)
+  - Ring CNT shows 512 (expected 128)
+  - DMA DIDX stuck at 0 (descriptors never processed)
 
 ### Next Step 🔧
 
-**Implement polling-based firmware loading:**
+**Investigate GLO_CFG timing difference:**
 
-The zouyonghao driver has correct patterns but broken wiring. The fix requires:
+Zouyonghao configures rings while GLO_CFG is cleared, then sets CLK_GAT_DIS AFTER ring config:
 
 ```c
-// In mt7927e_mcu_init() - ADD this call (currently missing!):
-err = mt792x_load_firmware(dev);  // This calls mt7927_load_patch/ram
-if (err)
-    return err;
+// Zouyonghao sequence:
+mt792x_dma_disable();              // Clear GLO_CFG
+mt76_init_mcu_queue(rings 15, 16); // Configure rings (GLO_CFG cleared!)
+mt792x_dma_enable();               // Set CLK_GAT_DIS + TX/RX_DMA_EN AFTER
 
-// Then set MCU running (skip mailbox post-init):
-set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+// Our sequence (potentially wrong):
+GLO_CFG = SETUP with CLK_GAT_DIS;  // Set CLK_GAT_DIS BEFORE
+configure_rings(15, 16);           // Configure rings (CLK_GAT_DIS set!)
+GLO_CFG |= TX/RX_DMA_EN;           // Enable DMA
 ```
 
-Key polling protocol patterns (from mt7927_fw_load.c):
-- `mt76_mcu_send_msg(dev, cmd, data, len, false)` - **false = no mailbox wait**
-- Force TX cleanup before AND after each chunk
-- 5-50ms delays between operations
-- Skip PATCH_SEM_CONTROL and FW_START commands
-- Manually set SW_INIT_DONE (0x7C000140 bit 4)
+**Potential fix**: Reorder `test_fw_load.c` to match zouyonghao timing - set CLK_GAT_DIS AFTER ring configuration, not before.
 
-See **docs/ZOUYONGHAO_ANALYSIS.md** for complete probe sequence and implementation details.
+See **docs/ZOUYONGHAO_ANALYSIS.md** section "2a. Critical GLO_CFG Timing Difference" for details.
 
 ---
 
@@ -190,34 +214,48 @@ Ring 16:    FWDL            // **Firmware download** ← Use this
 | Ring 15 (MCU_WM) | BAR0+0xd43f0 | wf_wfdma_host_dma0.h |
 | Ring 16 (FWDL) | BAR0+0xd4400 | wf_wfdma_host_dma0.h |
 
+**Phase 26 Additions (from zouyonghao comparison):**
+
+| Register | Value | Source |
+|----------|-------|--------|
+| INT_RX_PRI | 0x0F00 | mt792x_dma.c:mt792x_dma_enable() |
+| INT_TX_PRI | 0x7F00 | mt792x_dma.c:mt792x_dma_enable() |
+| GLO_CFG_EXT1 | BIT(28) set | mt792x_dma.c (MT7927-specific) |
+| WFDMA_DUMMY_CR | MT_WFDMA_NEED_REINIT | mt792x_dma.c |
+| RST_DTX_PTR | ~0 (all rings) | mt792x_dma.c |
+| Descriptor init | DMA_DONE bit set | mt76_dma.c:mt76_dma_alloc_queue() |
+
 **Firmware Loading**: Uses polling mode (`fgCheckStatus=FALSE` in fw_dl.c) - NO mailbox response expected.
+
+**GLO_CFG Timing**: Zouyonghao sets CLK_GAT_DIS **AFTER** ring configuration in `mt792x_dma_enable()`.
 
 ## Next Steps
 
-1. **Update test_fw_load.c** with CB_INFRA initialization:
+1. **Fix GLO_CFG timing** - Reorder `test_fw_load.c` to match zouyonghao:
    ```c
-   // MANDATORY: Set PCIe remap BEFORE any WFDMA access
-   writel(0x74037001, bar0 + 0x1f6554);  // PCIE_REMAP_WF
-   writel(0x70007000, bar0 + 0x1f6558);  // PCIE_REMAP_WF_BT
-
-   // WF Subsystem reset via CB_INFRA_RGU (not WFSYS_SW_RST_B)
-   val = readl(bar0 + 0x1f8600);
-   val |= BIT(4);   // Assert
-   writel(val, bar0 + 0x1f8600);
-   mdelay(1);
-   val &= ~BIT(4);  // Deassert
-   writel(val, bar0 + 0x1f8600);
-
-   // Set crypto MCU ownership
-   writel(BIT(0), bar0 + 0x1f5034);
-
-   // Poll for MCU IDLE (0x1D1E)
-   // Then proceed with DMA setup at correct 0xd4000 base
+   // Phase 1: Clear GLO_CFG (or leave minimal)
+   // Phase 2: Configure rings 15/16 (BASE, CNT, CIDX=0, DIDX=0)
+   // Phase 3: Configure prefetch (EXT_CTRL)
+   // Phase 4: Set GLO_CFG with CLK_GAT_DIS + other bits (AFTER rings!)
+   // Phase 5: Enable TX/RX DMA
    ```
 
-2. **Verify WFDMA registers** are now accessible after CB_INFRA init
+2. **Test ring writes** after GLO_CFG timing fix
 
-3. **Implement polling-based firmware loading** (per ZOUYONGHAO_ANALYSIS.md)
+3. **If rings still fail**, investigate mt76 queue infrastructure:
+   - `mt76_init_mcu_queue()` may do hidden initialization
+   - `mt76_queue_reset()` may be needed
+   - Consider using mt76 framework instead of manual approach
+
+**Already Implemented in test_fw_load.c:**
+- ✅ CB_INFRA PCIe remap (0x74037001)
+- ✅ Correct WFDMA base (0xd4000)
+- ✅ DMA priority registers (INT_RX/TX_PRI)
+- ✅ GLO_CFG_EXT1 BIT(28)
+- ✅ WFDMA_DUMMY_CR NEED_REINIT
+- ✅ RST_DTX_PTR = ~0
+- ✅ Descriptor DMA_DONE init
+- ✅ MCU IDLE polling
 
 ---
 
@@ -256,12 +294,15 @@ sudo rmmod mt7927_minimal_scan
 ## How to Assist
 
 ### When User Asks About Status
-1. Driver binds, power/reset work via standard paths
-2. **ROOT CAUSES IDENTIFIED**:
-   - Mailbox protocol not supported by ROM (use polling)
-   - WFDMA registers were at wrong base (0x2000 → **0xd4000**)
-   - Missing CB_INFRA PCIe remap initialization
-3. **NEXT**: Implement CB_INFRA init + correct WFDMA addresses + polling FW load
+1. Driver binds, power/reset work, **MCU reaches IDLE (0x1D1E)** ✅
+2. **ROOT CAUSES ADDRESSED**:
+   - ✅ Mailbox protocol → Polling-based approach implemented
+   - ✅ WFDMA base → Correct address (0xd4000) used
+   - ✅ CB_INFRA → PCIe remap initialized (0x74037001)
+   - ✅ Phase 26 fixes → DMA priority, GLO_CFG_EXT1, descriptor init, etc.
+3. **CURRENT BLOCKER**: Ring config registers not accepting writes
+4. **LIKELY CAUSE**: GLO_CFG timing - we set CLK_GAT_DIS before ring config, zouyonghao sets it after
+5. **NEXT**: Fix GLO_CFG timing in test_fw_load.c (set CLK_GAT_DIS AFTER ring configuration)
 
 ### When User Wants to Debug
 1. Read `DEVELOPMENT_LOG.md` for full history and all attempts
@@ -339,23 +380,29 @@ drivers/net/wireless/mediatek/mt76/mt7925/
 
 **Goal**: Implement correct initialization sequence for MT7927 firmware loading.
 
-**What we now know**:
-1. WFDMA registers are at BAR0 + **0xd4000** (not 0x2000)
-2. CB_INFRA PCIe remap (0x74037001) must be set FIRST
-3. WF reset via CB_INFRA_RGU, not just WFSYS_SW_RST_B
-4. Crypto MCU ownership must be set before MCU reaches IDLE
-5. Firmware loading uses **polling** (no mailbox waits)
+**What's Working (Phase 26)**:
+1. ✅ WFDMA registers at BAR0 + **0xd4000** (correct)
+2. ✅ CB_INFRA PCIe remap (0x74037001) set correctly
+3. ✅ WF/BT subsystem reset via CB_INFRA_RGU
+4. ✅ Crypto MCU ownership granted
+5. ✅ **MCU reaches IDLE (0x1D1E)** - confirmed working!
+6. ✅ GLO_CFG setup with CLK_GATE_DIS
+7. ✅ WFDMA extensions configured
+
+**Current Blocker (Phase 26)**:
+- Ring configuration registers (BASE, EXT_CTRL) not accepting writes
+- Likely cause: GLO_CFG timing - CLK_GAT_DIS set BEFORE ring config (should be AFTER)
 
 **Implementation sequence**:
-1. Set CB_INFRA PCIe remap registers
-2. WF subsystem reset via CB_INFRA_RGU
-3. Set crypto MCU ownership
-4. Poll for MCU IDLE (0x1D1E)
-5. Configure WFDMA rings at correct 0xd4000 base
-6. Load firmware with polling (no mailbox waits)
-7. Set SW_INIT_DONE manually
+1. ✅ Set CB_INFRA PCIe remap registers
+2. ✅ WF/BT subsystem reset via CB_INFRA_RGU
+3. ✅ Set crypto MCU ownership
+4. ✅ Poll for MCU IDLE (0x1D1E)
+5. 🔧 Configure WFDMA rings (timing may need adjustment)
+6. ⏸️ Load firmware with polling (blocked on step 5)
+7. ⏸️ Set SW_INIT_DONE manually (blocked on step 6)
 
-The hardware works. The firmware is compatible. We now have the complete initialization sequence from MediaTek vendor code.
+The hardware works. The MCU reaches IDLE. We're very close - just need to fix ring configuration timing.
 
 ---
 

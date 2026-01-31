@@ -59,7 +59,7 @@ Complete documentation in `docs/` directory:
 - [docs/HARDWARE.md](docs/HARDWARE.md) - Hardware specifications
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) - Common issues
 - [docs/FAQ.md](docs/FAQ.md) - Frequently asked questions
-- [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md) - Complete history (17 phases)
+- [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md) - Complete history (26 phases)
 
 ## Build System
 

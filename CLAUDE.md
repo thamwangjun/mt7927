@@ -8,21 +8,42 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 
 **Official Product Name**: MT7927 802.11be 320MHz 2x2 PCIe Wireless Network Adapter [Filogic 380]
 
-**Current Status**: **ROOT CAUSES FOUND (Phase 21-23)** - Five critical issues identified:
-1. **Wrong WFDMA base address**: Driver wrote to BAR0+0x2000 (MCU DMA) instead of BAR0+0xd4000 (HOST DMA)
-2. **Mailbox protocol not supported**: MT7927 ROM doesn't respond to mailbox commands - must use polling
-3. **Missing GLO_CFG clock gating disable (Phase 22)**: `clk_gate_dis` (BIT 30) must be set BEFORE ring configuration
-4. **Missing CB_INFRA register definitions (Phase 23)**: Reset, remap, GPIO mode, and MCU ownership registers
-5. **Missing fixed_map entries (Phase 23)**: 0x7c010000, 0x7c030000, 0x70000000 mappings
+**Current Status**: **RING CONFIG INVESTIGATION (Phase 26)** - Implemented Phase 25 findings, investigating GLO_CFG timing:
+- ✅ **MCU reaches IDLE state (0x1D1E)** - First time confirmed!
+- ✅ **CB_INFRA and WFDMA global registers work correctly**
+- ❌ **Ring configuration registers not accepting writes** - Analysis found likely causes below
 
-**⚠️ SOLUTION**: Use correct WFDMA base (0xd4000) + full GLO_CFG setup (0x5030B870) + polling-based firmware loading. See docs/ZOUYONGHAO_ANALYSIS.md for implementation.
+Previous root causes (Phase 21-23) were addressed in test_fw_load.c:
+1. ✅ Fixed WFDMA base address: Now using BAR0+0xd4000 (HOST DMA)
+2. ✅ Polling-based firmware loading (no mailbox waits)
+3. ✅ GLO_CFG with clk_gate_dis (BIT 30) = 0x5030B870
+4. ✅ Complete CB_INFRA initialization (PCIe remap, MCU ownership, reset)
+5. ✅ WFDMA extension configuration (MSI, HIF_PERF, delay interrupts)
+
+**⚠️ LIKELY ROOT CAUSES (Phase 25-26 Findings)** - Comparison with zouyonghao revealed differences:
+
+**Fixed in test_fw_load.c (Phase 26)**:
+1. ✅ **DMA priority registers**: Added `INT_RX_PRI=0x0F00`, `INT_TX_PRI=0x7F00`
+2. ✅ **GLO_CFG_EXT1 BIT(28)**: Added MT7927-specific enable bit
+3. ✅ **WFDMA_DUMMY_CR flag**: Added `MT_WFDMA_NEED_REINIT`
+4. ✅ **Reset scope**: Changed to `~0` (all rings)
+5. ✅ **Descriptor init**: Set DMA_DONE bit on all descriptors (was memset to 0)
+6. ✅ **DIDX write**: Now write both CIDX and DIDX to 0
+
+**⚠️ REMAINING DIFFERENCE - GLO_CFG Timing**:
+- **Zouyonghao**: Sets CLK_GAT_DIS **AFTER** ring configuration (in `mt792x_dma_enable()`)
+- **Our code**: Sets CLK_GAT_DIS **BEFORE** ring configuration
+- Ring config happens with GLO_CFG in "cleared" state in zouyonghao, but with CLK_GAT_DIS set in our code
+- This timing difference may be significant - see `docs/ZOUYONGHAO_ANALYSIS.md` section "2a. Critical GLO_CFG Timing Difference"
+
+**Next Steps**: Consider reordering GLO_CFG setup to match zouyonghao (set CLK_GAT_DIS AFTER ring config).
 
 ## Critical Files to Review First
 
 1. **docs/ZOUYONGHAO_ANALYSIS.md** - 🎯 **ROOT CAUSE FOUND** - No mailbox protocol in MT7927 ROM!
 2. **docs/MT6639_ANALYSIS.md** - Proves MT7927 is MT6639 variant, validates rings 15/16
 3. **docs/REFERENCE_SOURCES.md** - Analysis of reference code origins and authoritative sources
-4. **DEVELOPMENT_LOG.md** - Complete chronological history (Phase 21 = final root cause)
+4. **DEVELOPMENT_LOG.md** - Complete chronological history (26 phases, Phase 26 = current)
 5. **AGENTS.md** - Session bootstrap with current blocker details, hardware context, and what's been tried
 6. **HARDWARE_ANALYSIS.md** - lspci analysis (L1 ASPM hypothesis now invalidated)
 7. **README.md** - Project overview, build instructions, expected outputs

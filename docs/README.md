@@ -28,10 +28,12 @@ If you're new to this project, start here:
    - See ring assignment validation (rings 15/16)
 
 3. **Review Development History** → [../DEVELOPMENT_LOG.md](../DEVELOPMENT_LOG.md)
-   - Understand the journey and key discoveries (18 phases)
+   - Understand the journey and key discoveries (26 phases)
    - Phase 16: MT6639 discovery
    - Phase 17: Root cause found (mailbox protocol)
-   - Phase 18: Zouyonghao code trace, **critical wiring gap found**
+   - Phase 21: WFDMA base address fix (0xd4000)
+   - Phase 24: MCU IDLE confirmed (0x1D1E)
+   - Phase 25-26: Ring config investigation, GLO_CFG timing discovery
 
 4. **Check the Roadmap** → [ROADMAP.md](ROADMAP.md)
    - See current status and implementation needs
@@ -107,10 +109,10 @@ Jump directly to:
 **Purpose:** Session bootstrap guide for resuming work
 
 **Contents:**
-- Current project status (root cause found!)
+- Current project status (Phase 26: ring config investigation)
 - Complete project structure
 - Hardware architecture details
-- Development history (18 phases)
+- Development history (26 phases)
 - Implementation path forward
 - Working commands and troubleshooting
 
@@ -451,21 +453,26 @@ The MediaTek MT7927 is a WiFi 7 (802.11be) chipset that supports 320MHz channel 
 
 ### Project Status
 
-**Current State:** ROOT CAUSE FOUND! 🎯 (2026-01-31)
+**Current State:** Phase 26 - Ring Configuration Investigation (2026-01-31)
 
-**Discovery:** MT7927 ROM bootloader does NOT support mailbox command protocol! Our driver waits for mailbox responses that the ROM will never send. DMA hardware works correctly - we're using the wrong communication protocol.
+**Progress:**
+- ✅ Root cause found (Phase 17): ROM doesn't support mailbox
+- ✅ WFDMA base fixed (Phase 21): 0xd4000
+- ✅ **MCU reaches IDLE (Phase 24): 0x1D1E confirmed!**
+- ✅ Phase 26 fixes implemented (DMA priority, GLO_CFG_EXT1, etc.)
+- 🔧 Ring config failing - GLO_CFG timing likely cause
 
 The driver successfully:
 - ✅ Binds to MT7927 hardware
 - ✅ Completes power management handshake
-- ✅ Configures DMA rings correctly
-- ✅ Loads firmware files
-- ✅ **Identified root cause** - Mailbox protocol not supported
+- ✅ Initializes CB_INFRA (PCIe remap 0x74037001)
+- ✅ **MCU reaches IDLE state (0x1D1E)**
+- ✅ GLO_CFG configured with CLK_GAT_DIS
 
 **Next Step:**
-- 🔧 Implement polling-based firmware loader (validated by zouyonghao working driver)
+- 🔧 Fix GLO_CFG timing (set CLK_GAT_DIS AFTER ring config, not before)
 
-See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) for complete root cause analysis and [DEVELOPMENT_LOG.md](../DEVELOPMENT_LOG.md) Phases 17-18 for detailed status.
+See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) section "2a. Critical GLO_CFG Timing Difference" and [DEVELOPMENT_LOG.md](../DEVELOPMENT_LOG.md) Phase 26 for details.
 
 ### Key Discoveries
 
@@ -481,7 +488,7 @@ See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) for complete root cause ana
 mt7927-linux-driver/
 ├── README.md                    # Minimal quick start guide
 ├── AGENTS.md                    # Session bootstrap guide
-├── DEVELOPMENT_LOG.md           # Complete development history (18 phases)
+├── DEVELOPMENT_LOG.md           # Complete development history (26 phases)
 ├── CLAUDE.md                    # AI agent project instructions
 │
 ├── docs/                        # Complete documentation
@@ -682,9 +689,9 @@ When adding new documentation:
 This documentation index provides:
 
 - ✅ **Quick start guide** for new developers
-- ✅ **Complete documentation listing** with descriptions
+- ✅ **Complete documentation listing** with descriptions (updated to Phase 26)
 - ✅ **Navigation** to all project documentation
 - ✅ **Development resources** and references
 - ✅ **Project overview** and status
 
-Start with the [Quick Start Guide](#quick-start-guide) above, then dive into the specific documentation you need. The [DEVELOPMENT_LOG.md](../DEVELOPMENT_LOG.md) provides the best overall context for understanding the project's journey and current state.
+Start with the [Quick Start Guide](#quick-start-guide) above, then dive into the specific documentation you need. The [DEVELOPMENT_LOG.md](../DEVELOPMENT_LOG.md) (26 phases) provides the best overall context for understanding the project's journey and current state.

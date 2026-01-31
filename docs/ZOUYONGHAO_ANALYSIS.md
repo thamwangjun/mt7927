@@ -811,3 +811,365 @@ The mt76-based branch should be used as the **primary reference** for MT7927 dri
 3. **Full register definitions** - CB_INFRA, CBTOP, WFDMA extensions
 4. **Working initialization sequence** - Pre-init, reset, MCU IDLE check
 5. **Production-quality code** - Clean integration with mt76 framework
+
+---
+
+## Hardware Test Results (Phase 24 - 2026-01-31)
+
+### Test Configuration
+
+Applied all zouyonghao findings to `tests/05_dma_impl/test_fw_load.c`:
+- Correct WFDMA base at 0xd4000 (not 0x2000)
+- Complete CB_INFRA initialization
+- Full WFDMA extension configuration
+- GLO_CFG with clk_gate_dis (BIT 30)
+- Polling-based firmware loading
+
+### What Worked ✅
+
+| Phase | Result | Evidence |
+|-------|--------|----------|
+| CB_INFRA PCIe Remap | ✅ | `PCIE_REMAP_WF = 0x74037001` |
+| Power Control | ✅ | LPCTL handshake completes |
+| WF/BT Subsystem Reset | ✅ | Reset sequence executes |
+| **MCU IDLE** | ✅ | **`0x00001d1e`** ← First time confirmed! |
+| CONN_INFRA Version | ✅ | `0x03010002` |
+| GLO_CFG Setup | ✅ | `0x5030b870` → `0x5030b875` with DMA_EN |
+| WFDMA Extensions | ✅ | All configured correctly |
+
+### What Failed ❌
+
+**Ring configuration registers not accepting writes:**
+
+```
+Ring 15 EXT_CTRL: 0x00000000 (expected 0x05000004)
+Ring 16 EXT_CTRL: 0x00000000 (expected 0x05400004)
+Ring 15: BASE=0x00000000 CNT=512 (expected DMA addr, CNT=128)
+Ring 16: BASE=0x00000000 CNT=512 (expected DMA addr, CNT=128)
+```
+
+Result: DMA never processes descriptors (DIDX stuck at 0).
+
+### Analysis
+
+The issue is specific to **ring CTRL registers** (CTRL0-3, EXT_CTRL). Global config registers (GLO_CFG, RST) work correctly.
+
+**RST Register Observation:**
+```
+RST before: 0x00000030  ← Reset bits set (power-on default)
+RST after clear: 0x00000000  ← We cleared them
+...ring writes immediately fail after this...
+```
+
+**Hypothesis**: Clearing the RST register may clear hardware state needed for ring registers. MediaTek's `asicConnac3xWfdmaControl()` does NOT explicitly manipulate RST.
+
+### Attempted Fix
+
+Modified test_fw_load.c to:
+1. **Leave RST at default value** (0x30) - don't clear reset bits
+2. **Change configuration order** - rings first, then EXT_CTRL
+3. **Fix CTRL1 write** - combine upper address and max count properly
+
+### Investigation Needed
+
+1. What enables ring register writes in MediaTek's driver?
+2. Is there a power domain or clock enable we're missing?
+3. Does MT7927 require a different sequence than MT6639?
+
+### Key Insight
+
+**Hardware initialization progresses much further than ever before!** MCU reaches IDLE (0x1D1E), all global registers work. Only ring-specific registers fail. We're very close to a working solution.
+
+---
+
+## Comprehensive Comparison: test_fw_load.c vs Zouyonghao Driver (Phase 25)
+
+**Date**: 2026-01-31
+**Purpose**: Detailed analysis of differences between our test module and the working zouyonghao reference
+
+### Executive Summary
+
+Our `test_fw_load.c` does **significantly MORE** initialization work than zouyonghao's driver. Several of these additions may actually be **counterproductive** given that zouyonghao's simpler approach is known to work on real MT7927 hardware.
+
+---
+
+### 1. Initialization Sequence Comparison
+
+| Phase | Our test_fw_load.c | Zouyonghao Driver | Verdict |
+|-------|-------------------|-------------------|---------|
+| **CB_INFRA PCIe Remap** | ✅ `init_cbinfra_remap()` | ✅ Done in `pci.c:538-555` | Same |
+| **Power Control** | ✅ `fw_pmctrl()` + `drv_pmctrl()` | ✅ Same functions | Same |
+| **WF/BT Subsystem Reset** | ✅ GPIO + BT + double WF reset | ✅ Simpler sequence | **We do more** |
+| **CONN_INFRA Wakeup** | ✅ Wakeup, version, crypto, IDLE | ✅ `mt7927e_mcu_pre_init()` | Same |
+| **PCIE2AP Remap** | ✅ Sets 0x18051803 | ✅ Same | Same |
+| **WFDMA MSI Config** | ✅ HOST_CONFIG, MSI_INT_CFG0-3 | ✅ Same | Same |
+| **WFDMA Extensions** | ✅ GLO_CFG_EXT1/2, HIF_PERF, etc. | ✅ Same | Same |
+| **GLO_CFG Setup** | ✅ Full setup with clk_gate_dis | ✅ Uses `mt792x_dma_enable()` | Same |
+
+---
+
+### 2. Critical DMA Setup Differences
+
+#### Our Approach (test_fw_load.c:1082-1186):
+```c
+// Step 1: Set GLO_CFG with all bits including clk_gate_dis, but NO TX/RX_DMA_EN
+val = MT_WFDMA0_GLO_CFG_SETUP;  // 0x5030B870
+mt_wr(dev, MT_WFDMA0_GLO_CFG, val);
+
+// Step 2: Disable DMASHDL
+// Step 3: Check RST but DON'T modify (leave at 0x30)
+// Step 4-5: Configure Ring 15 and Ring 16 (BASE, CNT, CIDX)
+// Step 6: Configure EXT_CTRL (prefetch) AFTER ring setup
+// Step 7: Reset ring pointers with RST_DTX_PTR
+// Final: Enable DMA by adding TX/RX_DMA_EN
+```
+
+#### Zouyonghao Approach (mt792x_dma.c:126-170):
+```c
+// mt792x_dma_enable() does this:
+// 1. Configure prefetch FIRST
+mt792x_dma_prefetch(dev);
+
+// 2. Reset DMA indices with ~0 (ALL rings at once!)
+mt76_wr(dev, MT_WFDMA0_RST_DTX_PTR, ~0);
+
+// 3. Set delay interrupt to 0
+mt76_wr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0, 0);
+
+// 4. Set GLO_CFG bits (using mt76_set, so OR'ing to existing)
+mt76_set(dev, MT_WFDMA0_GLO_CFG,
+         MT_WFDMA0_GLO_CFG_TX_WB_DDONE |
+         MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN |
+         MT_WFDMA0_GLO_CFG_CLK_GAT_DIS |     // Same as our clk_gate_dis!
+         MT_WFDMA0_GLO_CFG_OMIT_TX_INFO |
+         ... );
+
+// 5. Enable TX/RX DMA
+mt76_set(dev, MT_WFDMA0_GLO_CFG,
+         MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
+
+// 6. MT7927-specific additions
+mt76_rmw(dev, MT_UWFDMA0_GLO_CFG_EXT1, BIT(28), BIT(28));
+mt76_set(dev, MT_WFDMA0_INT_RX_PRI, 0x0F00);
+mt76_set(dev, MT_WFDMA0_INT_TX_PRI, 0x7F00);
+```
+
+### Key DMA Differences Table:
+
+| Aspect | Our test_fw_load.c | Zouyonghao | Impact |
+|--------|-------------------|------------|--------|
+| **RST_DTX_PTR reset** | `BIT(15) \| BIT(16)` | `~0` (all bits) | **We only reset rings 15/16** |
+| **Prefetch timing** | After ring config | **Before ring config** | **Different order!** |
+| **DMA priority setup** | ❌ **Missing** | `INT_RX_PRI=0x0F00, INT_TX_PRI=0x7F00` | **Critical!** |
+| **GLO_CFG_EXT1 BIT(28)** | ❌ **Missing** | Sets for MT7927 | **May be needed** |
+| **WFDMA_DUMMY_CR** | ❌ **Missing** | `MT_WFDMA_NEED_REINIT` flag | **May be needed** |
+| **Ring allocation** | Manual `dma_alloc_coherent` | Uses `mt76_init_mcu_queue()` | Different approach |
+
+---
+
+### 2a. Critical GLO_CFG Timing Difference (Phase 26 Finding)
+
+**Date**: 2026-01-31
+
+A detailed analysis of the initialization sequence reveals a **critical timing difference** in when GLO_CFG (including CLK_GAT_DIS) is set relative to ring configuration:
+
+#### Zouyonghao Complete Sequence:
+
+```
+mt7925_dma_init():
+  1. mt792x_dma_disable()
+     ├── Clear GLO_CFG (TX/RX_DMA_EN, OMIT_*, etc.)   ← GLO_CFG minimized
+     ├── Poll DMA not busy
+     ├── Disable DMASHDL
+     └── Toggle RST if force
+
+  2. mt76_init_mcu_queue() for rings 15, 16
+     └── Write BASE, CNT, CIDX=0, DIDX=0             ← Rings configured here
+                                                       (NO CLK_GAT_DIS yet!)
+
+  3. mt792x_dma_enable()                             ← ALL prefetch/enable here
+     ├── mt792x_dma_prefetch()                       ← PREFETCH FIRST!
+     │   └── EXT_CTRL for rings 0-3, 15, 16
+     ├── RST_DTX_PTR = ~0                            ← Reset all pointers
+     ├── PRI_DLY_INT_CFG0 = 0
+     ├── GLO_CFG += CLK_GAT_DIS + other bits         ← CLK_GAT_DIS set AFTER rings!
+     ├── GLO_CFG += TX_DMA_EN | RX_DMA_EN
+     ├── MT7927-specific (GLO_CFG_EXT1, INT_*_PRI)
+     └── WFDMA_DUMMY_CR += NEED_REINIT
+```
+
+#### Our Current Sequence (test_fw_load.c):
+
+```
+setup_dma_ring():
+  1. Allocate descriptors with DMA_DONE
+
+  2. GLO_CFG = SETUP_VALUE (with CLK_GAT_DIS)        ← CLK_GAT_DIS BEFORE rings!
+
+  3. Disable DMASHDL
+
+  4. Ring 15: BASE, CNT, CIDX=0, DIDX=0              ← Rings configured
+  5. Ring 16: BASE, CNT, CIDX=0, DIDX=0
+
+  6. Prefetch (EXT_CTRL) for rings 15, 16            ← After ring config
+
+  7. RST_DTX_PTR = ~0
+
+  8. GLO_CFG += TX_DMA_EN | RX_DMA_EN
+
+  9. MT7927-specific
+```
+
+#### Key Timing Differences:
+
+| Aspect | Zouyonghao | Our Code | Status |
+|--------|------------|----------|--------|
+| **Ring config state** | GLO_CFG cleared (minimal) | GLO_CFG has CLK_GAT_DIS set | **DIFFERENT** |
+| **CLK_GAT_DIS timing** | Set AFTER ring config | Set BEFORE ring config | **DIFFERENT** |
+| **Prefetch vs ring config** | Prefetch AFTER ring alloc, BEFORE DTX_PTR | Same | ✅ Same |
+
+**Key Insight**: Zouyonghao configures rings while GLO_CFG is in a "disabled" state, then sets CLK_GAT_DIS and other bits AFTER ring configuration is complete.
+
+Our assumption that CLK_GAT_DIS must be set BEFORE ring config may be **incorrect** based on zouyonghao's working code. This is a **potential fix to try**.
+
+---
+
+### 3. Firmware Loading Comparison
+
+Both implementations use the **same core patterns**:
+
+| Pattern | Our test_fw_load.c | Zouyonghao | Match? |
+|---------|-------------------|------------|--------|
+| No mailbox waits | ✅ `wait=false` implicit | ✅ `mt76_mcu_send_msg(..., false)` | ✅ Yes |
+| Cleanup before send | ✅ `tx_cleanup(..., true)` | ✅ `tx_cleanup(..., true)` | ✅ Yes |
+| Cleanup after send | ✅ Yes | ✅ Yes | ✅ Yes |
+| `cond_resched()` | ✅ Yes | ✅ Yes | ✅ Yes |
+| `msleep(5)` delay | ✅ Yes | ✅ Yes | ✅ Yes |
+| Skip FW_START | ✅ Yes | ✅ Yes | ✅ Yes |
+| Set SW_INIT_DONE | ✅ Yes | ✅ Yes | ✅ Yes |
+
+**Firmware loading approach is identical** - both use polling-based DMA.
+
+---
+
+### 4. What We Do EXTRA (Not in Zouyonghao)
+
+| Extra Step | Our Implementation | Analysis |
+|------------|-------------------|----------|
+| **BT subsystem reset** | Full BT reset before WF reset | **Possibly unnecessary** |
+| **Double WF reset (RMW style)** | Full MTK mt6639_mcu_reset sequence | **May be overkill** |
+| **CBTOP GPIO mode config** | Sets GPIO_MODE5=0x80000000, GPIO_MODE6=0x80 | **Not in zouyonghao** |
+| **Manual DMASHDL disable** | `GLO_CFG_EXT0 &= ~DMASHDL_ENABLE` | Present in both via `mt792x_dma_disable()` |
+| **Explicit RST register check** | Logs RST but doesn't modify (now) | **Good** - matches zouyonghao |
+
+---
+
+### 5. What We're MISSING (Present in Zouyonghao)
+
+| Missing Item | Zouyonghao Code | Impact Assessment |
+|--------------|-----------------|-------------------|
+| **DMA Priority Registers** | `INT_RX_PRI=0x0F00, INT_TX_PRI=0x7F00` | **POTENTIALLY CRITICAL** - affects DMA scheduling |
+| **GLO_CFG_EXT1 BIT(28)** | `mt76_rmw(dev, MT_UWFDMA0_GLO_CFG_EXT1, BIT(28), BIT(28))` | **Unknown** - MT7927-specific |
+| **WFDMA_DUMMY_CR** | `MT_WFDMA_NEED_REINIT` flag set | **May signal hw reinit needed** |
+| **Complete ring reset** | `RST_DTX_PTR = ~0` | **We only do BIT(15)\|BIT(16)** |
+| **Prefetch BEFORE rings** | `mt792x_dma_prefetch()` called first | **Order may matter** |
+| **mt76 queue infrastructure** | Uses `mt76_init_mcu_queue()` | **May include hidden init steps** |
+
+---
+
+### 6. Architecture Difference
+
+**Zouyonghao uses mt76 infrastructure**:
+```
+pci_probe() → mt7927_wfsys_reset() → mt7927e_mcu_pre_init() →
+mt7925_dma_init() → mt7927e_mcu_init() → mt792x_load_firmware() →
+mt7927_load_patch() + mt7927_load_ram()
+```
+
+**Our test module is standalone**:
+```
+test_probe() → init_cbinfra_remap() → power_control_handshake() →
+wfsys_reset() → init_conninfra() → claim_host_ownership() →
+configure_pcie_wfdma() → setup_dma_ring() → load_firmware()
+```
+
+The key difference: **zouyonghao relies on mt76 framework** which handles ring setup via `mt76_init_mcu_queue()`. This function does much more than just write ring addresses - it integrates with the mt76 DMA subsystem.
+
+---
+
+### 7. Register Address Verification
+
+| Register | Our Address | Zouyonghao Address | Match? |
+|----------|-------------|-------------------|--------|
+| WFDMA0_BASE | 0xd4000 | 0xd4000 (via fixed_map) | ✅ Yes |
+| GLO_CFG | 0xd4208 | Same | ✅ Yes |
+| Ring 15 EXT_CTRL | 0xd463c | Same | ✅ Yes |
+| Ring 16 EXT_CTRL | 0xd4640 | Same | ✅ Yes |
+| PCIE2AP_REMAP | 0x0d1034 | Same | ✅ Yes |
+| RST_DTX_PTR | 0xd420c | Same | ✅ Yes |
+
+**All register addresses match** - the difference is in the initialization sequence and values written.
+
+---
+
+### 8. Recommendations
+
+#### Items We Should ADD:
+
+1. **DMA Priority Registers** (HIGH priority):
+   ```c
+   mt_wr(dev, MT_WFDMA0_INT_RX_PRI, 0x0F00);
+   mt_wr(dev, MT_WFDMA0_INT_TX_PRI, 0x7F00);
+   ```
+
+2. **GLO_CFG_EXT1 BIT(28)** for MT7927:
+   ```c
+   mt_rmw(dev, MT_UWFDMA0_GLO_CFG_EXT1, BIT(28), BIT(28));
+   ```
+
+3. **WFDMA_DUMMY_CR Flag**:
+   ```c
+   mt_wr(dev, MT_WFDMA_DUMMY_CR, MT_WFDMA_NEED_REINIT);
+   ```
+
+4. **Complete Ring Reset** - use `~0` not just `BIT(15)|BIT(16)`:
+   ```c
+   mt_wr(dev, MT_WFDMA0_RST_DTX_PTR, ~0);
+   ```
+
+5. **Reorder: Prefetch BEFORE ring configuration**
+
+#### Items We Might REMOVE/SIMPLIFY:
+
+1. **BT subsystem reset** - zouyonghao only resets WF
+2. **Double WF reset sequence** - single reset may suffice
+3. **GPIO mode configuration** - not done explicitly in zouyonghao
+
+---
+
+### 9. Critical Observation
+
+The zouyonghao driver uses the **full mt76 DMA infrastructure** via:
+- `mt76_dma_attach()`
+- `mt76_init_mcu_queue()`
+- `mt76_queue_alloc()`
+- `mt792x_dma_enable()`
+
+These functions handle ring setup **internally** with proper initialization that our manual approach may be missing. The mt76 framework:
+
+1. Calls `mt76_queue_reset()` which properly initializes ring state
+2. Uses `mt76_dma_wed_setup()` for DMA engine attachment
+3. Manages descriptor memory via internal allocators
+4. Handles index pointers atomically
+
+Our manual `dma_alloc_coherent()` + direct register writes may be missing subtle initialization steps that the mt76 infrastructure provides automatically.
+
+---
+
+### 10. Next Steps Based on This Analysis
+
+1. **Test with DMA priority registers added** - may be the missing piece
+2. **Try prefetch configuration BEFORE ring setup** - matches zouyonghao order
+3. **Add GLO_CFG_EXT1 BIT(28)** - MT7927-specific flag
+4. **Use `RST_DTX_PTR = ~0`** to reset all rings
+5. **Consider using mt76 framework** instead of manual approach
