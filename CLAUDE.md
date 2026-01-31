@@ -8,11 +8,14 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 
 **Official Product Name**: MT7927 802.11be 320MHz 2x2 PCIe Wireless Network Adapter [Filogic 380]
 
-**Current Status**: **ROOT CAUSES FOUND (Phase 21)** - Two critical issues identified:
+**Current Status**: **ROOT CAUSES FOUND (Phase 21-23)** - Five critical issues identified:
 1. **Wrong WFDMA base address**: Driver wrote to BAR0+0x2000 (MCU DMA) instead of BAR0+0xd4000 (HOST DMA)
 2. **Mailbox protocol not supported**: MT7927 ROM doesn't respond to mailbox commands - must use polling
+3. **Missing GLO_CFG clock gating disable (Phase 22)**: `clk_gate_dis` (BIT 30) must be set BEFORE ring configuration
+4. **Missing CB_INFRA register definitions (Phase 23)**: Reset, remap, GPIO mode, and MCU ownership registers
+5. **Missing fixed_map entries (Phase 23)**: 0x7c010000, 0x7c030000, 0x70000000 mappings
 
-**⚠️ SOLUTION**: Use correct WFDMA base (0xd4000) + polling-based firmware loading. See docs/ZOUYONGHAO_ANALYSIS.md for implementation.
+**⚠️ SOLUTION**: Use correct WFDMA base (0xd4000) + full GLO_CFG setup (0x5030B870) + polling-based firmware loading. See docs/ZOUYONGHAO_ANALYSIS.md for implementation.
 
 ## Critical Files to Review First
 
@@ -186,7 +189,7 @@ CB_INFRA_WF_SUBSYS_RST     = 0x1f8600  // WF reset via CB_INFRA_RGU (bit 4)
 CB_INFRA_CRYPTO_MCU_OWN    = 0x1f5034  // Set BIT(0) for MCU ownership
 ```
 
-## Root Cause (FOUND 2026-01-31, REFINED 2026-01-31)
+## Root Cause (FOUND 2026-01-31, REFINED Phase 22-23)
 
 ### Issue 1: Mailbox Protocol Not Supported
 **MT7927 ROM bootloader does NOT support mailbox command protocol!**
@@ -214,14 +217,68 @@ writel(0x74037001, bar0 + 0x1f6554);  // PCIE_REMAP_WF
 writel(0x70007000, bar0 + 0x1f6558);  // PCIE_REMAP_WF_BT
 ```
 
+### Issue 4: Missing GLO_CFG Clock Gating Disable (Phase 22)
+**Ring register writes fail without `clk_gate_dis` (BIT 30) set in GLO_CFG!**
+
+Hardware testing showed ring BASE and EXT_CTRL reads back as 0x00000000, while CNT worked. Analysis of MediaTek's `asicConnac3xWfdmaControl()` revealed missing GLO_CFG bits:
+
+```c
+// CRITICAL: GLO_CFG must be set BEFORE ring configuration!
+// Expected value: 0x5030B870 (without TX/RX_DMA_EN)
+// Final value:    0x5030B875 (with TX/RX_DMA_EN)
+#define MT_WFDMA0_GLO_CFG_SETUP \
+    (PDMA_BT_SIZE(3) |         /* bits 4-5: burst size */ \
+     TX_WB_DDONE |             /* BIT(6) */ \
+     CSR_AXI_BUFRDY_BYP |      /* BIT(11) */ \
+     FIFO_LITTLE_ENDIAN |      /* BIT(12) */ \
+     CSR_RX_WB_DDONE |         /* BIT(13) */ \
+     CSR_DISP_BASE_PTR_CHAIN_EN | /* BIT(15) */ \
+     CSR_LBK_RX_Q_SEL_EN |     /* BIT(20) */ \
+     OMIT_RX_INFO_PFET2 |      /* BIT(21) */ \
+     OMIT_TX_INFO |            /* BIT(28) */ \
+     CLK_GATE_DIS)             /* BIT(30) - CRITICAL! */
+```
+
+### Issue 5: Missing Register Definitions & Fixed Map Entries (Phase 23)
+**Our `src/mt7927_regs.h` is missing critical definitions from the zouyonghao mt76-based driver!**
+
+**Missing CB_INFRA register definitions:**
+```c
+#define CB_INFRA_RGU_WF_SUBSYS_RST_ADDR         0x70028600  // WF reset register
+#define CB_INFRA_MISC0_CBTOP_PCIE_REMAP_WF_ADDR 0x70026554  // PCIe remap WF
+#define CB_INFRA_SLP_CTRL_CRYPTO_MCU_OWN_ADDR   0x70025380  // Crypto MCU ownership
+#define WF_TOP_CFG_ON_ROMCODE_INDEX_ADDR        0x81021604  // ROM state (expect 0x1D1E)
+#define CBTOP_GPIO_MODE5_MOD_ADDR               0x7000535c  // GPIO mode 5
+#define CBTOP_GPIO_MODE6_MOD_ADDR               0x7000536c  // GPIO mode 6
+```
+
+**Missing configuration values:**
+```c
+#define MT7927_WF_SUBSYS_RST_ASSERT             0x10351
+#define MT7927_WF_SUBSYS_RST_DEASSERT           0x10340
+#define MT7927_CBTOP_PCIE_REMAP_WF_VALUE        0x74037001
+#define MT7927_CBTOP_PCIE_REMAP_WF_BT_VALUE     0x70007000
+#define MT7927_GPIO_MODE5_VALUE                 0x80000000
+#define MT7927_GPIO_MODE6_VALUE                 0x80
+```
+
+**Missing fixed_map entries:**
+| Chip Address | BAR0 Offset | Purpose |
+|--------------|-------------|---------|
+| 0x7c010000 | 0x100000 | CONN_INFRA (CONN_CFG) |
+| 0x7c030000 | 0x1a0000 | CONN_INFRA_ON_CCIF |
+| 0x70000000 | 0x1e0000 | CBTOP low range |
+
 ### Complete Solution
 
 1. **Set CB_INFRA PCIe remap** (0x74037001)
 2. **WF subsystem reset** via CB_INFRA_RGU (BAR0+0x1f8600), not just WFSYS_SW_RST_B
 3. **Set crypto MCU ownership** (BAR0+0x1f5034 = BIT(0))
 4. **Wait for MCU IDLE** (0x1D1E at BAR0+0xc1604)
-5. **Configure WFDMA** at correct base **0xd4000**
-6. **Polling-based firmware loading** (no mailbox waits)
+5. **Set GLO_CFG = 0x5030B870** (includes clk_gate_dis, BEFORE ring config!)
+6. **Configure WFDMA rings** at correct base **0xd4000**
+7. **Set GLO_CFG = 0x5030B875** (add TX/RX_DMA_EN)
+8. **Polling-based firmware loading** (no mailbox waits)
 
 See **docs/ZOUYONGHAO_ANALYSIS.md** and **reference_mtk_modules/.../mt6639.c** for implementation details.
 
@@ -238,6 +295,31 @@ See **docs/ZOUYONGHAO_ANALYSIS.md** and **reference_mtk_modules/.../mt6639.c** f
 | GPIO_MODE6 | Placeholder | **0x80** | mt6639.c:2653 |
 | Ring 16 prefetch | Unknown | **0x4** | mt6639.c:1395 |
 | FW loading mode | Mailbox wait | **Polling** (fgCheckStatus=FALSE) | fw_dl.c |
+
+### Phase 23 Findings (January 2026)
+
+**Analysis of zouyonghao mt76-based driver** (alternative branch with complete mt76 fork):
+
+| Finding | Our Current State | Correct Value/Approach | Source |
+|---------|-------------------|------------------------|--------|
+| WFDMA base | 0x2000 (MCU DMA!) | **0xd4000** (HOST DMA) | mt7925/pci.c fixed_map |
+| CB_INFRA registers | Missing | Full CB_INFRA_RGU, MISC0, SLP_CTRL | mt7927_regs.h |
+| Pre-init sequence | None | CONN_INFRA wakeup → version poll → WF reset → MCU IDLE | pci_mcu.c:mt7927e_mcu_pre_init() |
+| Firmware loading | Mailbox waits | **wait=false**, aggressive TX cleanup | mt7927_fw_load.c |
+| FW_START command | Sent to MCU | **Skipped** - set SW_INIT_DONE manually | mt7927_fw_load.c:270-278 |
+| Fixed map entries | Missing 3 | Add 0x7c010000, 0x7c030000, 0x70000000 | pci.c:fixed_map_mt7927 |
+
+**Key zouyonghao implementation patterns:**
+```c
+/* 1. Send commands without waiting for mailbox response */
+return mt76_mcu_send_msg(dev, cmd, data, len, false);  // wait=false!
+
+/* 2. Aggressive cleanup before and after each chunk */
+dev->queue_ops->tx_cleanup(dev, dev->q_mcu[MT_MCUQ_FWDL], true);
+
+/* 3. Skip FW_START, manually set SW_INIT_DONE */
+__mt76_wr(dev, 0x7C000140, ap2wf | BIT(4));
+```
 
 ## Recent Fixes: test_fw_load.c (2026-01-30)
 

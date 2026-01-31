@@ -77,14 +77,37 @@
 #define PREFETCH_RING15                 0x05000004
 #define PREFETCH_RING16                 0x05400004
 
-/* GLO_CFG bits - need more than just TX/RX enable! */
+/* GLO_CFG bits - CRITICAL: All bits from MediaTek asicConnac3xWfdmaControl!
+ * Reference: reference_mtk_modules/connectivity/wlan/core/gen4m/chips/common/cmm_asic_connac3x.c
+ * WPDMA_GLO_CFG_STRUCT field_conn3x bit mapping from mt66xx_reg.h */
 #define MT_WFDMA0_GLO_CFG_TX_DMA_EN             BIT(0)
+#define MT_WFDMA0_GLO_CFG_TX_DMA_BUSY           BIT(1)
 #define MT_WFDMA0_GLO_CFG_RX_DMA_EN             BIT(2)
+#define MT_WFDMA0_GLO_CFG_RX_DMA_BUSY           BIT(3)
+#define MT_WFDMA0_GLO_CFG_PDMA_BT_SIZE          (3 << 4)  /* Burst size = 3 */
 #define MT_WFDMA0_GLO_CFG_TX_WB_DDONE           BIT(6)
+#define MT_WFDMA0_GLO_CFG_CSR_AXI_BUFRDY_BYP    BIT(11)   /* AXI buffer ready bypass */
 #define MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN    BIT(12)
+#define MT_WFDMA0_GLO_CFG_CSR_RX_WB_DDONE       BIT(13)   /* RX write back done */
 #define MT_WFDMA0_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN BIT(15)
-#define MT_WFDMA0_GLO_CFG_OMIT_TX_INFO          BIT(28)
+#define MT_WFDMA0_GLO_CFG_CSR_LBK_RX_Q_SEL_EN   BIT(20)   /* Loopback RX queue select enable */
 #define MT_WFDMA0_GLO_CFG_OMIT_RX_INFO_PFET2    BIT(21)
+#define MT_WFDMA0_GLO_CFG_OMIT_TX_INFO          BIT(28)
+#define MT_WFDMA0_GLO_CFG_CLK_GATE_DIS          BIT(30)   /* CRITICAL: Disable clock gating! */
+
+/* GLO_CFG setup value BEFORE enabling DMA (from asicConnac3xWfdmaControl enable=TRUE)
+ * This MUST be set before ring configuration for register writes to work! */
+#define MT_WFDMA0_GLO_CFG_SETUP \
+	(MT_WFDMA0_GLO_CFG_PDMA_BT_SIZE | \
+	 MT_WFDMA0_GLO_CFG_TX_WB_DDONE | \
+	 MT_WFDMA0_GLO_CFG_CSR_AXI_BUFRDY_BYP | \
+	 MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN | \
+	 MT_WFDMA0_GLO_CFG_CSR_RX_WB_DDONE | \
+	 MT_WFDMA0_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN | \
+	 MT_WFDMA0_GLO_CFG_CSR_LBK_RX_Q_SEL_EN | \
+	 MT_WFDMA0_GLO_CFG_OMIT_RX_INFO_PFET2 | \
+	 MT_WFDMA0_GLO_CFG_OMIT_TX_INFO | \
+	 MT_WFDMA0_GLO_CFG_CLK_GATE_DIS)
 
 /*
  * Key register addresses - DIRECT BAR0 OFFSETS from zouyonghao's fixed_map_mt7927[]
@@ -224,10 +247,20 @@
 #define CHIP_BT_SUBSYS_RST              CB_INFRA_BT_SUBSYS_RST
 #define CHIP_CRYPTO_MCU_OWN             CB_INFRA_CRYPTO_MCU_OWN_SET
 
-/* LPCTL bits */
-#define MT_LPCTL_HOST_OWN               BIT(0)
-#define MT_LPCTL_FW_OWN                 BIT(1)
-#define MT_LPCTL_OWN_SYNC               BIT(2)
+/* LPCTL bits - Power management handshake
+ * From zouyonghao mt792x_core.c:
+ *   SET_OWN (BIT 0) = Write to give ownership TO FIRMWARE
+ *   CLR_OWN (BIT 1) = Write to claim ownership FOR DRIVER
+ *   OWN_SYNC (BIT 2) = Status bit: 4 = FW owns, 0 = driver owns
+ */
+#define PCIE_LPCR_HOST_SET_OWN          BIT(0)  /* Give to firmware */
+#define PCIE_LPCR_HOST_CLR_OWN          BIT(1)  /* Claim for driver */
+#define PCIE_LPCR_HOST_OWN_SYNC         BIT(2)  /* Status: 4=FW, 0=driver */
+
+/* Backward compatibility aliases */
+#define MT_LPCTL_SET_OWN                PCIE_LPCR_HOST_SET_OWN
+#define MT_LPCTL_CLR_OWN                PCIE_LPCR_HOST_CLR_OWN
+#define MT_LPCTL_OWN_SYNC               PCIE_LPCR_HOST_OWN_SYNC
 
 /* WFSYS bits */
 #define MT_WFSYS_SW_RST_B_EN            BIT(0)
@@ -798,32 +831,102 @@ static int init_conninfra(struct test_dev *dev)
  * Phase 2: Power Management - Claim Host Ownership
  * ============================================================ */
 
-static int claim_host_ownership(struct test_dev *dev)
+/* ============================================================
+ * Power Management - Two-step handshake from zouyonghao
+ * Reference: mt792x_core.c lines 872-895 and 827-848
+ *
+ * CRITICAL: These must run BEFORE WFSYS reset!
+ * The full handshake is:
+ *   1. fw_pmctrl: Give ownership to firmware (SET_OWN, wait for OWN_SYNC=4)
+ *   2. drv_pmctrl: Claim ownership for driver (CLR_OWN, wait for OWN_SYNC=0)
+ * ============================================================ */
+
+/* Step 1: Give ownership to firmware (fw_pmctrl) */
+static int fw_pmctrl(struct test_dev *dev)
 {
 	u32 val;
 	int i;
 
-	dev_info(&dev->pdev->dev, "=== Phase 2: Claim Host Ownership ===\n");
+	dev_info(&dev->pdev->dev, "  fw_pmctrl: Giving ownership to firmware...\n");
 
 	val = mt_rr(dev, MT_CONN_ON_LPCTL);
-	dev_info(&dev->pdev->dev, "  LPCTL initial: 0x%08x\n", val);
+	dev_info(&dev->pdev->dev, "    LPCTL before SET_OWN: 0x%08x\n", val);
 
-	/* Write FW_OWN bit to claim host ownership */
-	mt_wr(dev, MT_CONN_ON_LPCTL, MT_LPCTL_FW_OWN);
-	msleep(5);
+	/* Write SET_OWN to give ownership to firmware */
+	mt_wr(dev, MT_CONN_ON_LPCTL, PCIE_LPCR_HOST_SET_OWN);
 
-	/* Poll until OWN_SYNC clears */
+	/* Poll until OWN_SYNC becomes 4 (BIT(2) set = FW owns) */
 	for (i = 0; i < 100; i++) {
 		val = mt_rr(dev, MT_CONN_ON_LPCTL);
-		if (!(val & MT_LPCTL_OWN_SYNC)) {
-			dev_info(&dev->pdev->dev, "  Host ownership claimed: 0x%08x\n", val);
+		if ((val & PCIE_LPCR_HOST_OWN_SYNC) == PCIE_LPCR_HOST_OWN_SYNC) {
+			dev_info(&dev->pdev->dev, "    Firmware owns device: LPCTL=0x%08x\n", val);
 			return 0;
 		}
-		msleep(10);
+		msleep(1);
 	}
 
-	dev_warn(&dev->pdev->dev, "  Ownership timeout (LPCTL=0x%08x), continuing...\n", val);
-	return 0; /* Continue anyway */
+	dev_warn(&dev->pdev->dev, "    fw_pmctrl timeout (LPCTL=0x%08x)\n", val);
+	return -ETIMEDOUT;
+}
+
+/* Step 2: Claim ownership for driver (drv_pmctrl) */
+static int drv_pmctrl(struct test_dev *dev)
+{
+	u32 val;
+	int i;
+
+	dev_info(&dev->pdev->dev, "  drv_pmctrl: Claiming ownership for driver...\n");
+
+	val = mt_rr(dev, MT_CONN_ON_LPCTL);
+	dev_info(&dev->pdev->dev, "    LPCTL before CLR_OWN: 0x%08x\n", val);
+
+	/* Write CLR_OWN to claim ownership for driver */
+	mt_wr(dev, MT_CONN_ON_LPCTL, PCIE_LPCR_HOST_CLR_OWN);
+
+	/* Per zouyonghao: 2-3ms delay if ASPM supported */
+	usleep_range(2000, 3000);
+
+	/* Poll until OWN_SYNC becomes 0 (BIT(2) clear = driver owns) */
+	for (i = 0; i < 100; i++) {
+		val = mt_rr(dev, MT_CONN_ON_LPCTL);
+		if (!(val & PCIE_LPCR_HOST_OWN_SYNC)) {
+			dev_info(&dev->pdev->dev, "    Driver owns device: LPCTL=0x%08x\n", val);
+			return 0;
+		}
+		msleep(1);
+	}
+
+	dev_warn(&dev->pdev->dev, "    drv_pmctrl timeout (LPCTL=0x%08x)\n", val);
+	return -ETIMEDOUT;
+}
+
+/* Combined power control sequence - MUST run BEFORE wfsys_reset! */
+static int power_control_handshake(struct test_dev *dev)
+{
+	int ret;
+
+	dev_info(&dev->pdev->dev, "=== Power Control Handshake ===\n");
+
+	/* Step 1: Give to firmware */
+	ret = fw_pmctrl(dev);
+	if (ret) {
+		dev_warn(&dev->pdev->dev, "  fw_pmctrl failed, continuing anyway...\n");
+	}
+
+	/* Step 2: Claim for driver */
+	ret = drv_pmctrl(dev);
+	if (ret) {
+		dev_warn(&dev->pdev->dev, "  drv_pmctrl failed, continuing anyway...\n");
+	}
+
+	return 0; /* Always continue - failures logged but not fatal */
+}
+
+/* Legacy function name for compatibility */
+static int claim_host_ownership(struct test_dev *dev)
+{
+	dev_info(&dev->pdev->dev, "=== Phase 2: Claim Host Ownership (drv_pmctrl only) ===\n");
+	return drv_pmctrl(dev);
 }
 
 /* ============================================================
@@ -919,18 +1022,28 @@ static int setup_dma_ring(struct test_dev *dev)
 	}
 
 	/* =====================================================================
-	 * CRITICAL: DMA Reset Sequence (from mt792x_dma_disable)
+	 * CRITICAL: DMA Reset Sequence (from mt792x_dma_disable + asicConnac3xWfdmaControl)
 	 * The WFDMA hardware ignores ring register writes until properly reset!
+	 *
+	 * Key insight from MediaTek code:
+	 * 1. asicConnac3xWfdmaControl(enable=FALSE) sets various GLO_CFG bits
+	 * 2. Ring configuration happens (BASE, CNT, CIDX)
+	 * 3. asicConnac3xWfdmaControl(enable=TRUE) enables TX/RX_DMA
+	 *
+	 * CRITICAL: clk_gate_dis MUST be set for register writes to work!
 	 * ===================================================================== */
-	dev_info(&dev->pdev->dev, "  Step 1: Disable WFDMA TX/RX...\n");
+	dev_info(&dev->pdev->dev, "  Step 1: Configure GLO_CFG (disable DMA, enable clk_gate_dis)...\n");
 	val = mt_rr(dev, MT_WFDMA0_GLO_CFG);
 	dev_info(&dev->pdev->dev, "    GLO_CFG before: 0x%08x\n", val);
-	val &= ~(MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
+
+	/* Set full GLO_CFG setup WITHOUT TX/RX_DMA_EN - matches MediaTek pdmaSetup(FALSE)
+	 * CRITICAL: clk_gate_dis (BIT 30) must be set for ring register writes to work! */
+	val = MT_WFDMA0_GLO_CFG_SETUP;
 	mt_wr(dev, MT_WFDMA0_GLO_CFG, val);
 	wmb();
 	usleep_range(1000, 2000);
-	dev_info(&dev->pdev->dev, "    GLO_CFG after disable: 0x%08x\n",
-		 mt_rr(dev, MT_WFDMA0_GLO_CFG));
+	dev_info(&dev->pdev->dev, "    GLO_CFG after setup (no DMA_EN): 0x%08x (expected 0x%08x)\n",
+		 mt_rr(dev, MT_WFDMA0_GLO_CFG), MT_WFDMA0_GLO_CFG_SETUP);
 
 	dev_info(&dev->pdev->dev, "  Step 2: Disable DMASHDL...\n");
 	val = mt_rr(dev, MT_WFDMA0_GLO_CFG_EXT0);
@@ -1005,26 +1118,21 @@ static int setup_dma_ring(struct test_dev *dev)
 		 mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX)),
 		 mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(FWDL_RING_IDX)));
 
-	/* Enable DMA with full configuration (from mt792x_dma_enable)
-	 * Key bits:
-	 * - TX_DMA_EN, RX_DMA_EN: Enable DMA engines
-	 * - TX_WB_DDONE: Write back done status
-	 * - FIFO_LITTLE_ENDIAN: Correct byte order
-	 * - CSR_DISP_BASE_PTR_CHAIN_EN: Enable base pointer chaining (critical!)
-	 * - OMIT_TX_INFO, OMIT_RX_INFO_PFET2: Optimize transfers
+	/* Enable DMA by adding TX_DMA_EN and RX_DMA_EN to the setup value
+	 * This matches MediaTek's pdmaSetup(TRUE) which adds DMA enables to existing config
+	 *
+	 * Full config = MT_WFDMA0_GLO_CFG_SETUP + TX_DMA_EN + RX_DMA_EN
+	 * Expected value: 0x5030B875 (from MediaTek analysis)
 	 */
-	val = MT_WFDMA0_GLO_CFG_TX_DMA_EN |
-	      MT_WFDMA0_GLO_CFG_RX_DMA_EN |
-	      MT_WFDMA0_GLO_CFG_TX_WB_DDONE |
-	      MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN |
-	      MT_WFDMA0_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN |
-	      MT_WFDMA0_GLO_CFG_OMIT_TX_INFO |
-	      MT_WFDMA0_GLO_CFG_OMIT_RX_INFO_PFET2;
+	val = MT_WFDMA0_GLO_CFG_SETUP |
+	      MT_WFDMA0_GLO_CFG_TX_DMA_EN |
+	      MT_WFDMA0_GLO_CFG_RX_DMA_EN;
 	mt_wr(dev, MT_WFDMA0_GLO_CFG, val);
 	wmb();
 
-	dev_info(&dev->pdev->dev, "  DMA enabled, GLO_CFG=0x%08x\n",
-		 mt_rr(dev, MT_WFDMA0_GLO_CFG));
+	dev_info(&dev->pdev->dev, "  DMA enabled, GLO_CFG=0x%08x (expected 0x%08x)\n",
+		 mt_rr(dev, MT_WFDMA0_GLO_CFG),
+		 MT_WFDMA0_GLO_CFG_SETUP | MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
 
 	return 0;
 }
@@ -1263,6 +1371,18 @@ static int load_ram(struct test_dev *dev)
 
 		offset += len;
 		dev_info(&dev->pdev->dev, "  Region %d sent (%zu bytes)\n", i, total_sent);
+
+		/* CRITICAL: Inter-region cleanup delay from zouyonghao (10ms × 10 = 100ms)
+		 * MT7927 ROM needs time to process each firmware region before the next.
+		 * This is a key timing difference for MT7927 vs other devices. */
+		if (i < trailer->n_region - 1) {  /* Not needed after last region */
+			int j;
+			dev_info(&dev->pdev->dev, "  Inter-region cleanup (100ms)...\n");
+			for (j = 0; j < 10; j++) {
+				tx_cleanup(dev, FWDL_RING_IDX, dev->fwdl_ring_head, false);
+				msleep(10);
+			}
+		}
 	}
 
 	return 0;
@@ -1417,8 +1537,17 @@ static int test_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		/* Continue anyway - may work without it */
 	}
 
-	/* Phase 0b: MT7927 WiFi/BT subsystem reset - CRITICAL, must run after remap!
-	 * This enables WFDMA ring register writes. */
+	/* Phase 0b: Power control handshake - CRITICAL, must run BEFORE reset!
+	 * Reference: zouyonghao pci.c:565-571
+	 * This two-step handshake (fw_pmctrl then drv_pmctrl) enables the
+	 * WiFi subsystem to be properly reset and WFDMA registers to be writable. */
+	ret = power_control_handshake(dev);
+	if (ret) {
+		dev_warn(&pdev->dev, "Power control handshake issue: %d\n", ret);
+	}
+
+	/* Phase 0c: MT7927 WiFi/BT subsystem reset - MUST run AFTER power control!
+	 * This resets the WiFi subsystem and enables WFDMA ring register writes. */
 	ret = wfsys_reset(dev);
 	if (ret) {
 		dev_err(&pdev->dev, "WFSYS reset failed: %d\n", ret);
@@ -1432,7 +1561,7 @@ static int test_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		/* Continue anyway - firmware loading might still work */
 	}
 
-	/* Phase 2: Claim host ownership */
+	/* Phase 2: Verify driver ownership (should already have it from Phase 0b) */
 	ret = claim_host_ownership(dev);
 	if (ret) {
 		dev_warn(&pdev->dev, "Host ownership claim issue: %d\n", ret);

@@ -2035,6 +2035,353 @@ This explains why:
 
 ---
 
+## Phase 22: GLO_CFG Clock Gating Discovery (2026-01-31)
+
+### What We Did
+
+After implementing correct WFDMA addresses (Phase 21), hardware testing revealed a new issue: ring BASE and EXT_CTRL register writes still failed (read back as 0x00000000), while CNT and CIDX worked correctly. Deep analysis of MediaTek's `asicConnac3xWfdmaControl()` function revealed missing GLO_CFG bits.
+
+### Hardware Test Results (Pre-Fix)
+
+```
+Ring 15 EXT_CTRL: 0x00000000 (expected 0x05000004)
+Ring 16 EXT_CTRL: 0x00000000 (expected 0x05400004)
+Ring 15: BASE=0x00000000 CNT=512 CIDX=0 DIDX=0
+Ring 16: BASE=0x00000000 CNT=512 CIDX=0 DIDX=0
+```
+
+The mystery: CNT writes succeeded (512 visible), but BASE and EXT_CTRL writes failed (always 0).
+
+### Root Cause: Missing GLO_CFG Bits
+
+Analysis of MediaTek's `asicConnac3xWfdmaControl()` in `cmm_asic_connac3x.c` (lines 603-637) revealed our GLO_CFG configuration was incomplete.
+
+**MediaTek sets these bits when `enable=TRUE`:**
+
+| Bit | Field | Value | Our Code |
+|-----|-------|-------|----------|
+| 4-5 | pdma_bt_size | 3 | ❌ Missing |
+| 6 | tx_wb_ddone | 1 | ✅ Had |
+| 11 | csr_axi_bufrdy_byp | 1 | ❌ Missing |
+| 12 | fifo_little_endian | 1 | ✅ Had |
+| 13 | csr_rx_wb_ddone | 1 | ❌ Missing |
+| 15 | csr_disp_base_ptr_chain_en | 1 | ✅ Had |
+| 20 | csr_lbk_rx_q_sel_en | 1 | ❌ Missing |
+| 21 | omit_rx_info_pfet2 | 1 | ✅ Had |
+| 28 | omit_tx_info | 1 | ✅ Had |
+| **30** | **clk_gate_dis** | **1** | **❌ CRITICAL - Missing!** |
+
+**Key Finding**: `clk_gate_dis` (BIT 30) disables clock gating for the WFDMA block. Without this bit set, some registers may not accept writes because the hardware clock is gated.
+
+### GLO_CFG Values
+
+| Config State | Value | Description |
+|--------------|-------|-------------|
+| Setup (no DMA_EN) | **0x5030B870** | All config bits WITHOUT TX/RX_DMA_EN |
+| Enabled | **0x5030B875** | Setup + TX_DMA_EN (BIT 0) + RX_DMA_EN (BIT 2) |
+| Our old code | 0x10209045 | Missing critical bits |
+
+### MediaTek Initialization Sequence
+
+From `halWpdmaInitRing()` in `hal_pdma.c` (lines 3451-3485):
+
+1. **`pdmaSetup(FALSE)`** - Set GLO_CFG with all config bits EXCEPT TX/RX_DMA_EN
+2. **`halWpdmaInitTxRing()`** - Configure ring BASE, CNT, CIDX
+3. **`wfdmaManualPrefetch()`** - Configure EXT_CTRL (prefetch)
+4. **`pdmaSetup(TRUE)`** - Enable TX/RX_DMA in GLO_CFG
+
+**Critical**: GLO_CFG (including `clk_gate_dis`) must be set BEFORE ring configuration!
+
+### Fix Applied to test_fw_load.c
+
+1. **Added missing GLO_CFG bit definitions** (lines 80-110):
+   ```c
+   #define MT_WFDMA0_GLO_CFG_PDMA_BT_SIZE          (3 << 4)
+   #define MT_WFDMA0_GLO_CFG_CSR_AXI_BUFRDY_BYP    BIT(11)
+   #define MT_WFDMA0_GLO_CFG_CSR_RX_WB_DDONE       BIT(13)
+   #define MT_WFDMA0_GLO_CFG_CSR_LBK_RX_Q_SEL_EN   BIT(20)
+   #define MT_WFDMA0_GLO_CFG_CLK_GATE_DIS          BIT(30)  /* CRITICAL */
+   ```
+
+2. **Created MT_WFDMA0_GLO_CFG_SETUP macro** combining all required bits:
+   ```c
+   #define MT_WFDMA0_GLO_CFG_SETUP \
+       (MT_WFDMA0_GLO_CFG_PDMA_BT_SIZE | \
+        MT_WFDMA0_GLO_CFG_TX_WB_DDONE | \
+        MT_WFDMA0_GLO_CFG_CSR_AXI_BUFRDY_BYP | \
+        MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN | \
+        MT_WFDMA0_GLO_CFG_CSR_RX_WB_DDONE | \
+        MT_WFDMA0_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN | \
+        MT_WFDMA0_GLO_CFG_CSR_LBK_RX_Q_SEL_EN | \
+        MT_WFDMA0_GLO_CFG_OMIT_RX_INFO_PFET2 | \
+        MT_WFDMA0_GLO_CFG_OMIT_TX_INFO | \
+        MT_WFDMA0_GLO_CFG_CLK_GATE_DIS)
+   ```
+
+3. **Fixed initialization sequence** - Set GLO_CFG BEFORE ring configuration:
+   ```c
+   /* Step 1: Configure GLO_CFG (disable DMA, enable clk_gate_dis) */
+   val = MT_WFDMA0_GLO_CFG_SETUP;  /* clk_gate_dis enabled here! */
+   mt_wr(dev, MT_WFDMA0_GLO_CFG, val);
+
+   /* ... reset, prefetch, ring configuration ... */
+
+   /* Final: Enable DMA */
+   val = MT_WFDMA0_GLO_CFG_SETUP | MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN;
+   mt_wr(dev, MT_WFDMA0_GLO_CFG, val);
+   ```
+
+### Expected Results After Fix
+
+```
+GLO_CFG after setup (no DMA_EN): 0x5030B870 (expected 0x5030B870)
+Ring 15: BASE=<actual_addr> CNT=512 CIDX=0 DIDX=0
+Ring 16: BASE=<actual_addr> CNT=512 CIDX=0 DIDX=0
+DMA enabled, GLO_CFG=0x5030B875
+```
+
+### Files Modified
+
+- `tests/05_dma_impl/test_fw_load.c` - Added missing GLO_CFG bits and fixed sequence
+
+### Reference Files Analyzed
+
+- `reference_mtk_modules/connectivity/wlan/core/gen4m/chips/common/cmm_asic_connac3x.c`
+  - `asicConnac3xWfdmaControl()` lines 603-654
+- `reference_mtk_modules/connectivity/wlan/core/gen4m/include/nic/mt66xx_reg.h`
+  - `WPDMA_GLO_CFG_STRUCT field_conn3x` lines 1383-1412
+- `reference_mtk_modules/connectivity/wlan/core/gen4m/os/linux/hif/common/hal_pdma.c`
+  - `halWpdmaInitRing()` lines 3451-3485
+
+### Summary
+
+| Issue | Root Cause | Fix |
+|-------|------------|-----|
+| Ring BASE writes fail | `clk_gate_dis` not set | Add BIT(30) to GLO_CFG |
+| EXT_CTRL writes fail | Missing multiple GLO_CFG bits | Add all bits from MediaTek |
+| CNT works but BASE doesn't | GLO_CFG set too late | Set GLO_CFG BEFORE ring config |
+
+### Lessons Learned
+
+1. **Clock gating matters**: WFDMA has internal clock gating that can prevent register writes
+2. **Order matters**: GLO_CFG configuration must precede ring register writes
+3. **Reference code is critical**: MediaTek's exact initialization sequence has subtle but important steps
+4. **Partial success can mislead**: CNT working while BASE failed suggested clock/power gating issue
+
+---
+
+## Phase 23: Zouyonghao MT76-Based Driver Analysis (2026-01-31)
+
+### Context
+
+Analyzed an alternative branch of the zouyonghao reference repository containing a complete **mt76-based out-of-tree driver** for MT7927. This revision represents a significantly more complete implementation than the previous gen4m-based revision.
+
+### Repository Structure
+
+```
+reference_zouyonghao_mt7927/
+├── build_and_load.sh         # Build script
+├── mt76-outoftree/           # Complete mt76 fork with MT7927 support
+│   ├── mt7927_fw_load.c      # KEY: Polling-based firmware loader
+│   ├── mt792x_core.c         # Core with is_mt7927() detection
+│   └── mt7925/
+│       ├── pci.c             # PCI probe with MT7927 bus2chip
+│       ├── pci_mcu.c         # MCU init with pre-init sequence
+│       └── mt7927_regs.h     # MT7927-specific register definitions
+└── unmtk.rb
+```
+
+### Critical Finding #1: WFDMA Base Address WRONG in Our Code
+
+**Our current code (`src/mt7927_regs.h:28`):**
+```c
+#define MT_WFDMA0_BASE                  0x2000  // WRONG!
+```
+
+**Problem**: 0x2000 maps to chip address 0x54000000 which is **MCU DMA0** (firmware-side), NOT **HOST DMA0** (driver-side)!
+
+**Correct mapping** (from zouyonghao):
+```c
+// Chip 0x7c024000 (HOST DMA0) → BAR0 0xd4000
+// Via fixed_map: { 0x7c020000, 0x0d0000, 0x0010000 }
+// So: 0x7c024000 - 0x7c020000 = 0x4000 → 0xd0000 + 0x4000 = 0xd4000
+#define WF_WFDMA_HOST_DMA0_BASE  (0x18024000 + 0x64000000)  // = 0x7c024000 → 0xd4000
+```
+
+**Impact**: ALL our ring register writes have been going to the wrong DMA controller! This is why BASE registers read back as 0 - we're writing to MCU DMA which host cannot access.
+
+### Critical Finding #2: Missing CB_INFRA Register Definitions
+
+**Zouyonghao has (we don't):**
+
+```c
+/* CB_INFRA_RGU - Reset Generation Unit */
+#define CB_INFRA_RGU_BASE                               0x70028000
+#define CB_INFRA_RGU_WF_SUBSYS_RST_ADDR                 (CB_INFRA_RGU_BASE + 0x600)
+
+/* CB_INFRA_MISC0 - PCIe Remap (CRITICAL) */
+#define CB_INFRA_MISC0_CBTOP_PCIE_REMAP_WF_ADDR         0x70026554
+#define CB_INFRA_MISC0_CBTOP_PCIE_REMAP_WF_BT_ADDR      0x70026558
+
+/* CB_INFRA_SLP_CTRL - Crypto MCU Ownership */
+#define CB_INFRA_SLP_CTRL_CB_INFRA_CRYPTO_TOP_MCU_OWN_SET_ADDR  0x70025380
+
+/* GPIO Mode Registers */
+#define CBTOP_GPIO_MODE5_MOD_ADDR                       0x7000535c
+#define CBTOP_GPIO_MODE6_MOD_ADDR                       0x7000536c
+
+/* ROM Code State */
+#define WF_TOP_CFG_ON_ROMCODE_INDEX_ADDR                0x81021604
+#define MCU_IDLE                                        0x1D1E
+
+/* CONN_INFRA_CFG Version */
+#define CONN_INFRA_CFG_VERSION_ADDR                     0x7C011000
+#define CONN_INFRA_CFG_CONN_HW_VER                      0x03010002
+```
+
+### Critical Finding #3: Missing Configuration Values
+
+**Zouyonghao has (we don't):**
+
+```c
+/* Reset sequence values */
+#define MT7927_WF_SUBSYS_RST_ASSERT                     0x10351
+#define MT7927_WF_SUBSYS_RST_DEASSERT                   0x10340
+
+/* PCIe remap values - MUST SET before WFDMA access! */
+#define MT7927_CBTOP_PCIE_REMAP_WF_VALUE                0x74037001
+#define MT7927_CBTOP_PCIE_REMAP_WF_BT_VALUE             0x70007000
+
+/* GPIO mode values */
+#define MT7927_GPIO_MODE5_VALUE                         0x80000000
+#define MT7927_GPIO_MODE6_VALUE                         0x80
+
+/* WFDMA extension configuration */
+#define MT7927_WPDMA_GLO_CFG_EXT1_VALUE                 0x8C800404
+#define MT7927_WPDMA_GLO_CFG_EXT2_VALUE                 0x44
+#define MT7927_WFDMA_HIF_PERF_MAVG_DIV_VALUE            0x36
+
+/* MSI interrupt routing */
+#define MT7927_MSI_INT_CFG0_VALUE                       0x00660077
+#define MT7927_MSI_INT_CFG1_VALUE                       0x00001100
+#define MT7927_MSI_INT_CFG2_VALUE                       0x0030004F
+#define MT7927_MSI_INT_CFG3_VALUE                       0x00542200
+
+/* PCIe MAC interrupt config */
+#define MT7927_PCIE_MAC_INT_CONFIG_VALUE                0x08021000
+```
+
+### Critical Finding #4: Missing Fixed Map Entries
+
+**Our fixed_map is missing:**
+
+| Chip Address | BAR0 Offset | Purpose |
+|--------------|-------------|---------|
+| 0x7c010000 | 0x100000 | CONN_INFRA (CONN_CFG) |
+| 0x7c030000 | 0x1a0000 | CONN_INFRA_ON_CCIF |
+| 0x70000000 | 0x1e0000 | CBTOP low range |
+
+### Critical Finding #5: Polling-Based Firmware Loading Pattern
+
+**From `mt7927_fw_load.c`:**
+
+```c
+/* 1. NO mailbox waiting - use wait=false */
+return mt76_mcu_send_msg(dev, cmd, data, len, false);  // ← CRITICAL!
+
+/* 2. NO semaphore acquisition - ROM doesn't support it */
+/* Skip PATCH_SEM_CONTROL entirely */
+
+/* 3. Aggressive TX cleanup between chunks */
+if (dev->queue_ops->tx_cleanup) {
+    dev->queue_ops->tx_cleanup(dev, dev->q_mcu[MT_MCUQ_FWDL], true);
+}
+
+/* 4. Brief delay for ROM processing */
+msleep(5);
+
+/* 5. Skip FW_START (mailbox command ROM doesn't understand) */
+dev_info(mdev->dev, "[MT7927] Skipping FW_START (mailbox not supported)\n");
+
+/* 6. Manual SW_INIT_DONE instead */
+__mt76_wr(dev, 0x7C000140, ap2wf | BIT(4));
+```
+
+### Zouyonghao MCU Pre-Init Sequence
+
+From `pci_mcu.c:mt7927e_mcu_pre_init()`:
+
+```c
+/* Step 1: Force conninfra wakeup */
+mt76_wr(dev, CONN_INFRA_CFG_ON_CONN_INFRA_CFG_PWRCTRL0_ADDR, 0x1);
+
+/* Step 2: Poll for conninfra version (0x03010002) */
+for (i = 0; i < 10; i++) {
+    val = mt76_rr(dev, CONN_INFRA_CFG_VERSION_ADDR);
+    if (val == CONN_INFRA_CFG_CONN_HW_VER) break;
+    msleep(1);
+}
+
+/* Step 3: WiFi subsystem reset */
+val = mt76_rr(dev, CB_INFRA_RGU_WF_SUBSYS_RST_ADDR);
+val |= BIT(0);   // Assert
+mt76_wr(dev, CB_INFRA_RGU_WF_SUBSYS_RST_ADDR, val);
+msleep(1);
+val &= ~BIT(0);  // Deassert
+mt76_wr(dev, CB_INFRA_RGU_WF_SUBSYS_RST_ADDR, val);
+
+/* Step 4: Set Crypto MCU ownership */
+mt76_wr(dev, CB_INFRA_SLP_CTRL_CB_INFRA_CRYPTO_TOP_MCU_OWN_SET_ADDR, BIT(0));
+
+/* Step 5: Wait for MCU IDLE (0x1D1E) */
+for (i = 0; i < 1000; i++) {
+    val = mt76_rr(dev, WF_TOP_CFG_ON_ROMCODE_INDEX_ADDR);
+    if (val == MCU_IDLE) return;  // Success!
+    msleep(1);
+}
+```
+
+### Comparison: Previous gen4m Revision vs Current mt76 Revision
+
+| Feature | gen4m revision | mt76 revision |
+|---------|----------------|---------------|
+| bus2chip 0x70020000 (CBTOP) | ❌ Missing | ✅ Present |
+| bus2chip 0x7c010000 | ❌ Missing | ✅ Present |
+| Polling-based FW load | ❌ Missing | ✅ Implemented |
+| Skip mailbox waits | ❌ Uses mailbox | ✅ wait=false |
+| CB_INFRA reset | ❌ Failed ("Not exist CR") | ✅ Works |
+| Complete register defs | ❌ Minimal | ✅ Full mt7927_regs.h |
+| MCU pre-init sequence | ❌ None | ✅ Complete |
+| Working firmware load | ❌ No | ✅ Yes (polling) |
+
+### Summary of Required Fixes for Our Driver
+
+| Issue | Current State | Required Fix |
+|-------|--------------|--------------|
+| WFDMA base | 0x2000 (MCU DMA) | Change to **0xd4000** (HOST DMA) |
+| CB_INFRA defs | Missing | Add all CB_INFRA register definitions |
+| Config values | Missing | Add reset, remap, GPIO, MSI values |
+| Fixed map | Incomplete | Add 0x7c010000, 0x7c030000, 0x70000000 |
+| FW loading | Uses mailbox | Use polling (wait=false), skip semaphore |
+| Pre-init | Missing | Add MCU pre-init sequence |
+
+### Files for Reference
+
+The zouyonghao mt76-based driver provides working reference implementations:
+- `mt7927_fw_load.c` - Polling-based firmware loader (295 lines)
+- `mt7925/mt7927_regs.h` - Complete register definitions (180 lines)
+- `mt7925/pci_mcu.c` - MCU init with pre-init (238 lines)
+- `mt7925/pci.c` - PCI probe with MT7927-specific handling
+
+### Lessons Learned
+
+1. **MCU DMA ≠ HOST DMA**: 0x2000 (MCU DMA) is NOT the same as 0xd4000 (HOST DMA)
+2. **Complete register definitions matter**: Missing CB_INFRA defs cause init failures
+3. **Pre-init sequence required**: Must check CONN_INFRA version and MCU IDLE before DMA
+4. **Polling is the answer**: ROM doesn't respond to mailbox, must poll DMA completion
+
+---
+
 ## Appendix A: Debunked Assumptions (Comprehensive List)
 
 This section documents all assumptions made during development that were later proven wrong, with citations to the evidence that debunked them.
@@ -2073,6 +2420,8 @@ This section documents all assumptions made during development that were later p
 |------------|--------|--------------------|-----------------------|
 | **Crypto MCU ownership at 0x70025380** | 17-19 | Early documentation | Phase 20: cb_infra_slp_ctrl.h shows SET register at 0x70025034 |
 | **CB_INFRA not required** | 1-18 | Not documented in mt7925 driver | Phase 19-20: MT6639 vendor code shows mandatory PCIE_REMAP_WF = 0x74037001 |
+| **Minimal GLO_CFG bits sufficient** | 1-21 | Only added known bits from MT7925 | Phase 22: MediaTek sets 10+ bits including `clk_gate_dis` (BIT 30) |
+| **GLO_CFG only needed at end** | 1-21 | Set after ring config | Phase 22: Must set BEFORE ring config or writes fail |
 
 ### A.5 Firmware Assumptions
 

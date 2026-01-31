@@ -693,3 +693,121 @@ Based on this analysis, a working MT7927 driver must:
 **The DMA system works fine.** We've been using the wrong communication protocol. MT7927 ROM bootloader is a simple firmware that processes DMA but doesn't implement mailbox responses. Switching to a polling-based approach (like zouyonghao's driver) should immediately resolve our "DMA blocker".
 
 **Important caveat**: The zouyonghao code has the correct firmware loading functions but they are **not wired into the initialization sequence**. Any implementation must ensure `mt792x_load_firmware()` is actually called during `mt7927e_mcu_init()`.
+
+---
+
+## Alternate Branch: Complete MT76-Based Driver (Phase 23)
+
+**Date Added**: 2026-01-31
+
+The zouyonghao repository has an alternate branch containing a **complete mt76-based out-of-tree driver** that addresses the wiring issue mentioned above. This revision represents a more complete and functional implementation.
+
+### Repository Structure (mt76 branch)
+
+```
+reference_zouyonghao_mt7927/
+├── build_and_load.sh           # Build and load script
+├── mt76-outoftree/             # Complete mt76 fork
+│   ├── mt7927_fw_load.c        # KEY: Polling-based firmware loader (295 lines)
+│   ├── mt792x_core.c           # Core with is_mt7927() detection
+│   └── mt7925/
+│       ├── pci.c               # PCI probe with MT7927-specific bus2chip
+│       ├── pci_mcu.c           # MCU init with pre-init sequence
+│       └── mt7927_regs.h       # MT7927-specific register definitions (180 lines)
+└── unmtk.rb
+```
+
+### Key Improvements Over gen4m Branch
+
+| Feature | gen4m branch | mt76 branch |
+|---------|--------------|-------------|
+| bus2chip mappings | ❌ Incomplete (missing CBTOP) | ✅ Complete |
+| Firmware loading | ❌ Never called | ✅ Properly wired via is_mt7927() |
+| Pre-init sequence | ❌ Missing | ✅ CONN_INFRA wakeup → MCU IDLE |
+| CB_INFRA registers | ❌ Access fails | ✅ Full definitions + values |
+| MSI configuration | ❌ Missing | ✅ Full MSI setup |
+| WFDMA extensions | ❌ Missing | ✅ GLO_CFG_EXT1/EXT2 setup |
+
+### Critical Additions in mt7927_regs.h
+
+```c
+/* CB_INFRA_RGU - Reset Generation Unit */
+#define CB_INFRA_RGU_BASE                               0x70028000
+#define CB_INFRA_RGU_WF_SUBSYS_RST_ADDR                 (CB_INFRA_RGU_BASE + 0x600)
+
+/* CB_INFRA_MISC0 - PCIe Remap */
+#define CB_INFRA_MISC0_CBTOP_PCIE_REMAP_WF_ADDR         0x70026554
+#define MT7927_CBTOP_PCIE_REMAP_WF_VALUE                0x74037001
+
+/* Reset sequence values */
+#define MT7927_WF_SUBSYS_RST_ASSERT                     0x10351
+#define MT7927_WF_SUBSYS_RST_DEASSERT                   0x10340
+
+/* WFDMA configuration */
+#define MT7927_WPDMA_GLO_CFG_EXT1_VALUE                 0x8C800404
+#define MT7927_MSI_INT_CFG0_VALUE                       0x00660077
+```
+
+### MCU Pre-Init Sequence (pci_mcu.c)
+
+```c
+void mt7927e_mcu_pre_init(struct mt792x_dev *dev)
+{
+    /* Step 1: Force conninfra wakeup */
+    mt76_wr(dev, CONN_INFRA_CFG_ON_CONN_INFRA_CFG_PWRCTRL0_ADDR, 0x1);
+
+    /* Step 2: Poll for conninfra version (0x03010002) */
+    for (i = 0; i < 10; i++) {
+        val = mt76_rr(dev, CONN_INFRA_CFG_VERSION_ADDR);
+        if (val == CONN_INFRA_CFG_CONN_HW_VER) break;
+        msleep(1);
+    }
+
+    /* Step 3: WiFi subsystem reset */
+    val = mt76_rr(dev, CB_INFRA_RGU_WF_SUBSYS_RST_ADDR);
+    val |= BIT(0);   // Assert
+    mt76_wr(dev, CB_INFRA_RGU_WF_SUBSYS_RST_ADDR, val);
+    msleep(1);
+    val &= ~BIT(0);  // Deassert
+    mt76_wr(dev, CB_INFRA_RGU_WF_SUBSYS_RST_ADDR, val);
+
+    /* Step 4: Set Crypto MCU ownership */
+    mt76_wr(dev, CB_INFRA_SLP_CTRL_CB_INFRA_CRYPTO_TOP_MCU_OWN_SET_ADDR, BIT(0));
+
+    /* Step 5: Wait for MCU IDLE (0x1D1E) */
+    for (i = 0; i < 1000; i++) {
+        val = mt76_rr(dev, WF_TOP_CFG_ON_ROMCODE_INDEX_ADDR);
+        if (val == MCU_IDLE) return;  // Success!
+        msleep(1);
+    }
+}
+```
+
+### Firmware Loading Integration (mt792x_core.c)
+
+```c
+/* MT7927 detection and custom loader dispatch */
+if (is_mt7927(&dev->mt76)) {
+    dev_info(dev->mt76.dev, "[MT7927] Using polling-based firmware loader\n");
+
+    ret = mt7927_load_patch(&dev->mt76, mt792x_patch_name(dev));
+    if (ret) return ret;
+
+    ret = mt7927_load_ram(&dev->mt76, mt792x_ram_name(dev));
+    if (ret) return ret;
+} else {
+    /* Standard mailbox-based loader for other chips */
+    ret = mt76_connac2_load_patch(&dev->mt76, mt792x_patch_name(dev));
+    ...
+}
+```
+
+### Recommendation
+
+The mt76-based branch should be used as the **primary reference** for MT7927 driver development due to:
+
+1. **Complete bus2chip mappings** - All required address translations present
+2. **Proper firmware loading wiring** - `is_mt7927()` detection and loader dispatch
+3. **Full register definitions** - CB_INFRA, CBTOP, WFDMA extensions
+4. **Working initialization sequence** - Pre-init, reset, MCU IDLE check
+5. **Production-quality code** - Clean integration with mt76 framework
