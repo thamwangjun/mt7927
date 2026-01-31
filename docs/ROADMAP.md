@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Status as of 2026-01-31**: **PHASE 27b - RX_DMA_EN FIX IMPLEMENTED**
+**Status as of 2026-01-31**: **PHASE 27e - HOST2MCU SOFTWARE INTERRUPT FIX**
 
 **Progress**:
 - ✅ Root cause found (Phase 17): ROM doesn't support mailbox protocol
@@ -11,23 +11,30 @@
 - ✅ Phase 26 fixes implemented: DMA priority, GLO_CFG_EXT1, descriptor init, etc.
 - ✅ **GLO_CFG timing fix (Phase 27)**: Ring registers NOW accept writes!
 - ✅ **TX ring fix (Phase 27)**: All 17 TX rings now have valid BASE addresses
-- ✅ **RX_DMA_EN identified (Phase 27b)**: RX rings have BASE=0, causing remaining page faults
-- 🔧 **Fix implemented (Phase 27b)**: Only enable TX_DMA_EN during firmware loading
+- ✅ **RX_DMA_EN fix (Phase 27b)**: Only enable TX_DMA_EN during firmware loading
+- ✅ **TXD control word FIX VERIFIED (Phase 27c)**: No more page faults!
+- ✅ **Phase 27d diagnostics**: Found WFDMA_OVERFLOW=1, PDA_TAR_ADDR=0
+- 🔧 **HOST2MCU doorbell IMPLEMENTED (Phase 27e)**: Awaiting test!
 
-**Root Cause Analysis (Phase 27b)**:
-1. ✅ TX ring fix worked - All TX rings 0-16 have valid BASE
-2. ❌ **RX rings still have BASE=0** - RX_DMA_EN enabled but RX not configured
-3. ❌ **DIDX stuck at 0** - Page fault halts DMA engine
+**Phase 27e Fix** - HOST2MCU Software Interrupt Doorbell:
 
-**Two Approaches for RX_DMA_EN Timing**:
-1. **Approach 1 (Current)**: Only enable TX_DMA_EN during FWDL, enable RX later
-2. **Approach 2**: Initialize all RX rings upfront, enable both TX and RX together
+Phase 27d diagnostics revealed MCU receives DMA data (`WFDMA_OVERFLOW=1`) but isn't consuming it
+(`PDA_TAR_ADDR=0`). The MCU ROM is IDLE (0x1D1E) but not polling DMA rings - it needs a software
+interrupt to wake up!
 
-**Fix Applied (Approach 1)**: Only enable `TX_DMA_EN` during firmware loading. `RX_DMA_EN` should be enabled after RX rings are properly configured.
+**Implementation** in `tests/05_dma_impl/test_fw_load.c`:
+```c
+/* After writing CIDX for Ring 15 or 16 */
+mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(ring), head);
+wmb();
+mt_wr(dev, MT_HOST2MCU_SW_INT_SET, BIT(0));  /* Doorbell at 0xd4108 */
+wmb();
+```
 
-**Next Step**: Test the fix to verify page faults eliminated and DIDX starts incrementing.
+> **⚠️ Bug Fixed**: Initial implementation incorrectly used MCU_DMA0 space (0x2108).
+> The correct register is in HOST_DMA0 space at **0xd4108**.
 
-See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** sections "2b", "2c", and "2d" for complete analysis.
+See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** section "2g" for complete analysis.
 
 ## Phase 1: Get It Working 🎯 CURRENT PHASE
 
@@ -57,16 +64,27 @@ See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** sections "2b", "2c", an
   - ✅ Root cause: 15 unused TX rings (0-14) had BASE=0
   - ✅ Fix implemented: Initialize all TX rings to valid DMA address
 
-- [x] ~~**Fix DMA page fault (RX rings)**~~ - ROOT CAUSE FOUND (Phase 27b)
+- [x] ~~**Fix DMA page fault (RX rings)**~~ - DONE (Phase 27b)
   - ✅ Root cause: RX rings have BASE=0 but RX_DMA_EN was enabled
   - ✅ Fix implemented: Only enable TX_DMA_EN during firmware loading
-  - 🔧 Pending test to verify fix eliminates page faults
 
-- [ ] **Verify DMA descriptor processing** ← Current task
-  - Test the RX_DMA_EN fix
-  - Verify DIDX increments (hardware consuming descriptors)
-  - Verify no more IOMMU page faults
-  - See ZOUYONGHAO_ANALYSIS.md sections "2b", "2c", and "2d"
+- [x] ~~**Fix TXD control word bit layout**~~ - VERIFIED (Phase 27c)
+  - ✅ Root cause: SDLen0 was in bits 0-13 (should be 16-29), LastSec0 in bit 14 (should be bit 30)
+  - ✅ Hardware interpreted SDLen1=76 at SDPtr1=0x0 → DMA accessed address 0
+  - ✅ Fix implemented and **verified working**: `ctrl=0x404c0000` (correct format)
+  - ✅ **No more AMD-Vi IO_PAGE_FAULT errors!**
+
+- [x] ~~**Investigate global DMA path issue**~~ - ROOT CAUSE FOUND (Phase 27d)
+  - **Finding**: WFDMA_OVERFLOW=1 proves data IS reaching MCU's WFDMA
+  - **Finding**: PDA_TAR_ADDR=0 proves MCU didn't process INIT_DOWNLOAD commands
+  - **Root Cause**: MCU ROM is IDLE but not actively polling DMA rings
+  - See ZOUYONGHAO_ANALYSIS.md section "2f" for diagnostics
+
+- [ ] **Test HOST2MCU software interrupt fix** ← Current task (Phase 27e)
+  - ✅ Added `HOST2MCU_SW_INT_SET` doorbell writes after CIDX updates
+  - ✅ Bug fixed: Use HOST_DMA0 offset (0xd4108), not MCU_DMA0 (0x2108)
+  - 🔧 Awaiting test to verify DIDX increments
+  - See ZOUYONGHAO_ANALYSIS.md section "2g" for implementation
 
 ### Blocked (Pending Implementation) ⏸️
 
@@ -238,10 +256,17 @@ See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) section "2a. Critical GLO_C
 
 ### What's Not Working ❌
 
-- **Ring register writes** - BASE, EXT_CTRL not accepting writes (likely GLO_CFG timing)
-- **DMA descriptor processing** - DIDX stuck at 0 (blocked on ring config)
-- Firmware transfer (blocked on ring config)
+- **DMA descriptor processing** - DIDX stuck at 0 (Phase 27e doorbell fix pending test)
+- Firmware transfer (blocked on DMA processing verification)
 - Network interface creation (requires successful initialization)
+
+### Fixed in Phase 27/27b/27c/27d/27e ✅
+
+- ~~Ring register writes~~ - GLO_CFG timing fixed (Phase 27)
+- ~~Unused TX rings causing page faults~~ - All rings initialized (Phase 27)
+- ~~RX_DMA_EN causing page faults~~ - Only TX_DMA_EN during FWDL (Phase 27b)
+- ~~TXD control word bit layout~~ - Correct bit positions applied (Phase 27c)
+- ~~MCU not consuming DMA data~~ - HOST2MCU doorbell implemented (Phase 27e)
 
 ### Root Cause Analysis
 
@@ -249,14 +274,24 @@ See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) section "2a. Critical GLO_C
 - ✅ ROM doesn't support mailbox → Polling-based approach implemented
 - ✅ Wrong WFDMA base (0x2000 vs 0xd4000) → Fixed to use 0xd4000
 
-**Phase 24-26 (CURRENT)**: Ring configuration registers
-- ❌ Ring registers (BASE, EXT_CTRL) not accepting writes
-- Likely cause: **GLO_CFG timing difference**
-  - Zouyonghao: Sets CLK_GAT_DIS **AFTER** ring configuration
-  - Our code: Sets CLK_GAT_DIS **BEFORE** ring configuration
-  - Hardware may require ring config while GLO_CFG is in "disabled" state
+**Phase 24-26 (RESOLVED)**: Ring configuration registers
+- ✅ GLO_CFG timing fixed → Set CLK_GAT_DIS AFTER ring configuration (Phase 27)
 
-**Current Blocker**: GLO_CFG timing (Phase 26 finding)
+**Phase 27 (RESOLVED)**: DMA page faults at address 0x0
+- ✅ Unused TX rings (0-14) had BASE=0 → All rings initialized to valid DMA address
+- ✅ RX rings had BASE=0 but RX_DMA_EN enabled → Only enable TX_DMA_EN during FWDL
+
+**Phase 27c (RESOLVED)**: TXD control word bit layout
+- ✅ Root cause FOUND: SDLen0 in bits 0-13 (should be 16-29), LastSec0 in bit 14 (should be 30)
+- ✅ Fix IMPLEMENTED: Corrected bit positions to match MediaTek TXD_STRUCT
+- ✅ **VERIFIED**: No more AMD-Vi IO_PAGE_FAULT errors!
+
+**Phase 27d/27e (CURRENT)**: MCU not consuming DMA data
+- ✅ Diagnostics showed WFDMA_OVERFLOW=1 (data arrives) but PDA_TAR_ADDR=0 (not processed)
+- ✅ Root cause: MCU ROM is IDLE but not polling DMA rings - needs doorbell interrupt
+- ✅ Fix IMPLEMENTED: Added HOST2MCU_SW_INT_SET writes after CIDX updates
+- ⚠️ Bug FIXED: Use HOST_DMA0 offset (0xd4108), NOT MCU_DMA0 (0x2108)
+- 🔧 Pending TEST: Verify DIDX increments and firmware loads
 
 ## Testing and Validation
 

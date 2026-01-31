@@ -8,41 +8,44 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 
 **Official Product Name**: MT7927 802.11be 320MHz 2x2 PCIe Wireless Network Adapter [Filogic 380]
 
-**Current Status**: **PHASE 27b - RX_DMA_EN FIX** - Pending test:
+**Current Status**: **PHASE 27e - HOST2MCU SOFTWARE INTERRUPT FIX IMPLEMENTED**:
 - ✅ **MCU reaches IDLE state (0x1D1E)** - Confirmed!
 - ✅ **CB_INFRA and WFDMA global registers work correctly**
 - ✅ **Ring configuration registers accept writes** - Phase 27 GLO_CFG timing fix worked!
 - ✅ **TX rings 0-16 all have valid BASE addresses** - Phase 27 unused ring fix worked!
-- ✅ **RX_DMA_EN identified as remaining page fault source** - Phase 27b finding
-- 🔧 **Fix implemented**: Only enable TX_DMA_EN during firmware loading (RX rings not configured)
+- ✅ **TXD control word FIX VERIFIED** - Phase 27c fix works! No more page faults!
+- ✅ **MCU_DMA0 RX_DMA_EN = 1** - MCU DMA receive is enabled
+- 🔧 **HOST2MCU_SW_INT doorbell IMPLEMENTED** - Awaiting test!
 
-**Phase 27b Analysis**:
-1. ✅ TX ring fix worked - All 17 TX rings now have valid BASE addresses
-2. ❌ **3 remaining page faults** - RX rings still have BASE=0
-3. ❌ **DIDX stuck at 0** - Page fault halts DMA engine
-4. ✅ **Root cause**: `RX_DMA_EN` enabled but RX rings not initialized
+**Phase 27e FIX** - HOST2MCU Software Interrupt Doorbell:
 
-**Phase 27b Fix Applied** (test_fw_load.c Step 7c):
+ROOT CAUSE: MCU ROM is in IDLE (0x1D1E) but **not polling DMA rings**. The WFDMA_OVERFLOW=1 flag showed data was arriving but MCU wasn't consuming it. MCU needs a software interrupt to wake up and process rings!
+
+**Fix Applied** in `tests/05_dma_impl/test_fw_load.c`:
 ```c
-/* Enable TX DMA ONLY - RX rings not configured!
- * Phase 27b fix: RX rings have BASE=0, enabling RX_DMA causes
- * DMA engine to scan RX rings → access 0x0 → IOMMU page fault → DMA halts */
-val = MT_WFDMA0_GLO_CFG_SETUP |
-      MT_WFDMA0_GLO_CFG_TX_DMA_EN;
-/* NOTE: RX_DMA_EN intentionally NOT set */
+/* After kicking Ring 15 or Ring 16 with CIDX */
+mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(ring_idx), ring_head);  /* Kick ring */
+wmb();
+mt_wr(dev, MT_HOST2MCU_SW_INT_SET, BIT(0));  /* Doorbell to wake MCU */
+wmb();
 ```
 
-**Next Step**: Test the fix to verify page faults eliminated and DIDX starts incrementing.
+| Register | BAR0 Offset | Purpose |
+|----------|-------------|---------|
+| HOST2MCU_SW_INT_SET | **0xd4108** | Write BIT(0) to generate MCU interrupt |
 
-See **docs/ZOUYONGHAO_ANALYSIS.md** sections "2b", "2c", and "2d" for complete analysis.
+See **docs/ZOUYONGHAO_ANALYSIS.md** section "2g" for discovery details.
 
 ## Critical Files to Review First
 
-1. **docs/ZOUYONGHAO_ANALYSIS.md** - 🎯 **ROOT CAUSE FOUND** - No mailbox protocol in MT7927 ROM!
+1. **docs/ZOUYONGHAO_ANALYSIS.md** - 🎯 Complete DMA fix history
    - Section "2a": GLO_CFG timing difference (Phase 26)
    - Section "2b": Phase 27 findings - DMA page fault analysis
    - Section "2c": Phase 27 fix - Unused TX rings initialization
-   - Section "2d": **Phase 27b fix** - RX_DMA_EN timing (current)
+   - Section "2d": Phase 27b fix - RX_DMA_EN timing
+   - Section "2e": Phase 27c fix - TXD control word bit positions (verified!)
+   - Section "2f": Phase 27d - Global DMA path investigation
+   - Section "2g": **Phase 27e** - HOST2MCU software interrupt discovery (current)
 2. **docs/ROADMAP.md** - Current status, blockers, and next steps
 3. **docs/MT6639_ANALYSIS.md** - Proves MT7927 is MT6639 variant, validates rings 15/16
 4. **docs/REFERENCE_SOURCES.md** - Analysis of reference code origins and authoritative sources

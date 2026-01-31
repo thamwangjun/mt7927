@@ -60,6 +60,63 @@
 #define MT_WFDMA0_RST_LOGIC_RST         BIT(4)
 #define MT_WFDMA0_RST_DMASHDL_ALL_RST   BIT(5)
 
+/* PHASE 27d DIAGNOSTIC REGISTERS - Error status investigation */
+/* MCU_INT_STA - MCU interrupt status (memory errors, DMA errors)
+ * At WFDMA0 + 0x110 = BAR0 0xd4110 */
+#define MT_WFDMA0_MCU_INT_STA       (MT_WFDMA0_BASE + 0x110)
+#define MT_WFDMA0_MCU_INT_MEM_RANGE_ERR  BIT(0)  /* Memory range error */
+#define MT_WFDMA0_MCU_INT_DMA_ERR        BIT(1)  /* DMA error */
+
+/* WPDMA2HOST_ERR_INT_STA - WPDMA to host error interrupt status
+ * At WFDMA0 + 0x1E8 = BAR0 0xd41E8 */
+#define MT_WFDMA0_WPDMA2HOST_ERR_INT_STA (MT_WFDMA0_BASE + 0x1E8)
+#define MT_WFDMA0_ERR_TX_TIMEOUT_INT     BIT(0)  /* TX timeout */
+#define MT_WFDMA0_ERR_RX_TIMEOUT_INT     BIT(1)  /* RX timeout */
+#define MT_WFDMA0_ERR_TX_DMA_ERR_INT     BIT(2)  /* TX DMA error */
+#define MT_WFDMA0_ERR_RX_DMA_ERR_INT     BIT(3)  /* RX DMA error */
+
+/* MCU DMA0 base - chip address 0x54000000 maps to BAR0 0x2000
+ * This is SEPARATE from HOST DMA0 at 0xd4000 */
+#define MT_MCU_DMA0_BASE            0x2000
+
+/* PDA (Patch Download Agent) registers at MCU_DMA0
+ * These registers control firmware download on the MCU side */
+#define MT_PDA_TAR_ADDR             (MT_MCU_DMA0_BASE + 0x800)  /* Target address for FW download */
+#define MT_PDA_TAR_LEN              (MT_MCU_DMA0_BASE + 0x804)  /* Target length for FW download */
+#define MT_PDA_DWLD_STATE           (MT_MCU_DMA0_BASE + 0x808)  /* Download state register */
+#define MT_PDA_CONFG                (MT_MCU_DMA0_BASE + 0x80C)  /* Configuration register */
+
+/* PDA_CONFG bits */
+#define MT_PDA_FWDL_EN              BIT(31)  /* Firmware download enable (default on) */
+#define MT_PDA_FWDL_LS_QSEL_EN      BIT(30)  /* Ring selection: 1=ring 0, 0=max ring */
+
+/* PDA_DWLD_STATE bits */
+#define MT_PDA_FWDL_FINISH          BIT(0)   /* PDA finished processing */
+#define MT_PDA_FWDL_BUSY            BIT(1)   /* PDA busy */
+#define MT_WFDMA_FWDL_FINISH        BIT(2)   /* WFDMA received all data */
+#define MT_WFDMA_FWDL_BUSY          BIT(3)   /* WFDMA busy */
+#define MT_WFDMA_FWDL_OVERFLOW      BIT(4)   /* Received more than target length */
+#define MT_PDA_FWDL_OVERFLOW        BIT(6)   /* PDA overflow */
+
+/* MCU_DMA0 GLO_CFG - RX DMA enable for MCU side */
+#define MT_MCU_DMA0_GLO_CFG         (MT_MCU_DMA0_BASE + 0x208)
+#define MT_MCU_DMA0_GLO_CFG_RX_DMA_EN  BIT(2)
+
+/* HOST2MCU_SW_INT_SET - Doorbell to wake MCU from sleep
+ * Phase 27e: MCU ROM sits in IDLE (0x1D1E) and doesn't actively poll DMA rings.
+ * Writing BIT(0) here generates an interrupt to wake MCU and process rings.
+ * CRITICAL: This is in HOST_DMA0 space (0xd4000), NOT MCU_DMA0 (0x2000)!
+ * From: reference_mtk_modules/include/chips/coda/mt6639/wf_wfdma_host_dma0.h
+ * Chip address 0x7c024108 → BAR0 0xd4108 */
+#define MT_HOST2MCU_SW_INT_SET      (MT_WFDMA0_BASE + 0x108)
+
+/* TX_RING_CTRL0 for Ring 16 (FWDL) - check BASE address
+ * At WFDMA0 + 0x400 = BAR0 0xd4400 */
+#define MT_WFDMA0_TX_RING16_CTRL0   (MT_WFDMA0_BASE + 0x400)
+#define MT_WFDMA0_TX_RING16_CTRL1   (MT_WFDMA0_BASE + 0x404)
+#define MT_WFDMA0_TX_RING16_CTRL2   (MT_WFDMA0_BASE + 0x408)
+#define MT_WFDMA0_TX_RING16_CTRL3   (MT_WFDMA0_BASE + 0x40c)
+
 /* GLO_CFG extension for DMASHDL */
 #define MT_WFDMA0_GLO_CFG_EXT0      (MT_WFDMA0_BASE + 0x2b0)
 #define MT_WFDMA0_GLO_CFG_EXT1      (MT_WFDMA0_BASE + 0x2b4)  /* MT7927-specific enable */
@@ -314,11 +371,26 @@ struct mt7927_desc {
 	__le32 info;
 } __packed;
 
-/* Descriptor control bits */
-#define MT_DMA_CTL_SD_LEN0      GENMASK(13, 0)
-#define MT_DMA_CTL_LAST_SEC0    BIT(14)
-#define MT_DMA_CTL_BURST        BIT(15)
-#define MT_DMA_CTL_DMA_DONE     BIT(31)
+/* Descriptor control bits - from MediaTek TXD_STRUCT in hif_pdma.h
+ *
+ * Word 1 layout (little-endian bitfield):
+ *   bits 0-13:  SDLen1   - Length for scatter pointer 1
+ *   bit 14:     LastSec1 - Last section for pointer 1
+ *   bit 15:     Burst    - Burst flag
+ *   bits 16-29: SDLen0   - Length for scatter pointer 0 (OUR DATA!)
+ *   bit 30:     LastSec0 - Last section for pointer 0 (SET THIS!)
+ *   bit 31:     DMADONE  - DMA done flag
+ *
+ * CRITICAL: SDLen0 and LastSec0 are in bits 16-30, NOT bits 0-14!
+ * Previous bug: We put length in bits 0-13 (SDLen1) which made hardware
+ * think buffer 1 (SDPtr1=0x0) had the data, causing page fault at addr 0!
+ */
+#define MT_DMA_CTL_SD_LEN1      GENMASK(13, 0)   /* bits 0-13: buffer 1 length */
+#define MT_DMA_CTL_LAST_SEC1    BIT(14)          /* bit 14: buffer 1 last section */
+#define MT_DMA_CTL_BURST        BIT(15)          /* bit 15: burst mode */
+#define MT_DMA_CTL_SD_LEN0      GENMASK(29, 16)  /* bits 16-29: buffer 0 length */
+#define MT_DMA_CTL_LAST_SEC0    BIT(30)          /* bit 30: buffer 0 last section */
+#define MT_DMA_CTL_DMA_DONE     BIT(31)          /* bit 31: DMA done */
 
 /* MCU command codes */
 #define MCU_CMD_TARGET_ADDRESS_LEN_REQ  0x01
@@ -617,26 +689,34 @@ static int send_mcu_cmd(struct test_dev *dev, u8 cmd, const void *data, size_t l
 	idx = dev->mcu_ring_head;
 	desc = &dev->mcu_ring[idx];
 
+	/* TXD descriptor format (from MediaTek hif_pdma.h TXD_STRUCT):
+	 * Word 0 (buf0): SDPtr0 - lower 32 bits of buffer 0 address
+	 * Word 1 (ctrl): Control word with SDLen0 in bits 16-29, LastSec0 in bit 30
+	 * Word 2 (buf1): SDPtr1 - lower 32 bits of buffer 1 (0 if not using scatter)
+	 * Word 3 (info): SDPtr0Ext:SDPtr1Ext - upper 16 bits of each pointer packed
+	 */
 	desc->buf0 = cpu_to_le32(lower_32_bits(dev->dma_buf_phys));
-	desc->buf1 = cpu_to_le32(upper_32_bits(dev->dma_buf_phys));
+	desc->buf1 = cpu_to_le32(0);  /* SDPtr1 - not using second buffer */
 	ctrl = FIELD_PREP(MT_DMA_CTL_SD_LEN0, total_len) | MT_DMA_CTL_LAST_SEC0;
 	desc->ctrl = cpu_to_le32(ctrl);
-	desc->info = 0;
+	/* SDPtr0Ext in lower 16 bits, SDPtr1Ext in upper 16 bits */
+	desc->info = cpu_to_le32(upper_32_bits(dev->dma_buf_phys) & 0xFFFF);
 	wmb();
 
 	/* DIAGNOSTIC: Dump descriptor before DMA kick (first MCU cmd only) */
 	{
 		static int mcu_dump_count;
 		if (mcu_dump_count < 2) {
+			u32 c = le32_to_cpu(desc->ctrl);
 			dev_info(&dev->pdev->dev, "  [DIAG] Ring 15 desc[%d] before kick:\n", idx);
 			dev_info(&dev->pdev->dev, "    buf0=0x%08x (SDPtr0 lower32)\n", le32_to_cpu(desc->buf0));
-			dev_info(&dev->pdev->dev, "    ctrl=0x%08x (len=%d, LAST_SEC0=%d, DONE=%d)\n",
-				 le32_to_cpu(desc->ctrl),
-				 le32_to_cpu(desc->ctrl) & 0x3FFF,
-				 (le32_to_cpu(desc->ctrl) >> 14) & 1,
-				 (le32_to_cpu(desc->ctrl) >> 31) & 1);
-			dev_info(&dev->pdev->dev, "    buf1=0x%08x (SDPtr1 - should be 0 or upper32?)\n", le32_to_cpu(desc->buf1));
-			dev_info(&dev->pdev->dev, "    info=0x%08x (SDPtr0Ext:SDPtr1Ext - should have upper bits!)\n", le32_to_cpu(desc->info));
+			dev_info(&dev->pdev->dev, "    ctrl=0x%08x (SDLen0=%d[bits16-29], LS0=%d[bit30], DONE=%d[bit31])\n",
+				 c, (c >> 16) & 0x3FFF, (c >> 30) & 1, (c >> 31) & 1);
+			dev_info(&dev->pdev->dev, "    buf1=0x%08x (SDPtr1 - should be 0 for single buffer)\n", le32_to_cpu(desc->buf1));
+			dev_info(&dev->pdev->dev, "    info=0x%08x (SDPtr0Ext=%d, SDPtr1Ext=%d)\n",
+				 le32_to_cpu(desc->info),
+				 le32_to_cpu(desc->info) & 0xFFFF,
+				 (le32_to_cpu(desc->info) >> 16) & 0xFFFF);
 			dev_info(&dev->pdev->dev, "    dma_buf_phys=0x%llx\n", (unsigned long long)dev->dma_buf_phys);
 			mcu_dump_count++;
 		}
@@ -645,6 +725,12 @@ static int send_mcu_cmd(struct test_dev *dev, u8 cmd, const void *data, size_t l
 	/* Kick DMA on Ring 15 */
 	dev->mcu_ring_head = (idx + 1) % RING_SIZE;
 	mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(MCU_WM_RING_IDX), dev->mcu_ring_head);
+	wmb();
+
+	/* Phase 27e: Trigger MCU interrupt - MCU ROM is in IDLE (0x1D1E) and
+	 * doesn't actively poll DMA rings. We must ring the doorbell to wake it.
+	 * BIT(0) = SW_INT_0, generates interrupt on MCU side. */
+	mt_wr(dev, MT_HOST2MCU_SW_INT_SET, BIT(0));
 	wmb();
 
 	/* Poll for completion - but don't wait for mailbox response */
@@ -1454,29 +1540,31 @@ static int send_fw_chunk(struct test_dev *dev, const void *data, size_t len)
 	memcpy(dev->dma_buf, data, len);
 	wmb();
 
-	/* Setup descriptor on Ring 16 (FWDL) */
+	/* Setup descriptor on Ring 16 (FWDL) - same format as Ring 15 */
 	idx = dev->fwdl_ring_head;
 	desc = &dev->fwdl_ring[idx];
 
 	desc->buf0 = cpu_to_le32(lower_32_bits(dev->dma_buf_phys));
-	desc->buf1 = cpu_to_le32(upper_32_bits(dev->dma_buf_phys));
+	desc->buf1 = cpu_to_le32(0);  /* SDPtr1 - not using second buffer */
 	ctrl = FIELD_PREP(MT_DMA_CTL_SD_LEN0, len) | MT_DMA_CTL_LAST_SEC0;
 	desc->ctrl = cpu_to_le32(ctrl);
-	desc->info = 0;
+	/* SDPtr0Ext in lower 16 bits, SDPtr1Ext in upper 16 bits */
+	desc->info = cpu_to_le32(upper_32_bits(dev->dma_buf_phys) & 0xFFFF);
 
 	/* DIAGNOSTIC: Dump descriptor before DMA kick (first FWDL chunk only) */
 	{
 		static int fwdl_dump_count;
 		if (fwdl_dump_count < 2) {
+			u32 c = le32_to_cpu(desc->ctrl);
 			dev_info(&dev->pdev->dev, "  [DIAG] Ring 16 desc[%d] before kick:\n", idx);
 			dev_info(&dev->pdev->dev, "    buf0=0x%08x (SDPtr0 lower32)\n", le32_to_cpu(desc->buf0));
-			dev_info(&dev->pdev->dev, "    ctrl=0x%08x (len=%d, LAST_SEC0=%d, DONE=%d)\n",
-				 le32_to_cpu(desc->ctrl),
-				 le32_to_cpu(desc->ctrl) & 0x3FFF,
-				 (le32_to_cpu(desc->ctrl) >> 14) & 1,
-				 (le32_to_cpu(desc->ctrl) >> 31) & 1);
-			dev_info(&dev->pdev->dev, "    buf1=0x%08x (SDPtr1 - should be 0 or upper32?)\n", le32_to_cpu(desc->buf1));
-			dev_info(&dev->pdev->dev, "    info=0x%08x (SDPtr0Ext:SDPtr1Ext - should have upper bits!)\n", le32_to_cpu(desc->info));
+			dev_info(&dev->pdev->dev, "    ctrl=0x%08x (SDLen0=%d[bits16-29], LS0=%d[bit30], DONE=%d[bit31])\n",
+				 c, (c >> 16) & 0x3FFF, (c >> 30) & 1, (c >> 31) & 1);
+			dev_info(&dev->pdev->dev, "    buf1=0x%08x (SDPtr1 - should be 0 for single buffer)\n", le32_to_cpu(desc->buf1));
+			dev_info(&dev->pdev->dev, "    info=0x%08x (SDPtr0Ext=%d, SDPtr1Ext=%d)\n",
+				 le32_to_cpu(desc->info),
+				 le32_to_cpu(desc->info) & 0xFFFF,
+				 (le32_to_cpu(desc->info) >> 16) & 0xFFFF);
 			dev_info(&dev->pdev->dev, "    dma_buf_phys=0x%llx\n", (unsigned long long)dev->dma_buf_phys);
 			fwdl_dump_count++;
 		}
@@ -1486,6 +1574,12 @@ static int send_fw_chunk(struct test_dev *dev, const void *data, size_t len)
 	/* Advance ring head and kick DMA on Ring 16 */
 	dev->fwdl_ring_head = (idx + 1) % RING_SIZE;
 	mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX), dev->fwdl_ring_head);
+	wmb();
+
+	/* Phase 27e: Trigger MCU interrupt - MCU ROM is in IDLE (0x1D1E) and
+	 * doesn't actively poll DMA rings. We must ring the doorbell to wake it.
+	 * BIT(0) = SW_INT_0, generates interrupt on MCU side. */
+	mt_wr(dev, MT_HOST2MCU_SW_INT_SET, BIT(0));
 	wmb();
 
 	/* Poll for DMA completion (DIDX should advance) */
@@ -1498,8 +1592,34 @@ static int send_fw_chunk(struct test_dev *dev, const void *data, size_t len)
 	}
 
 	if (timeout <= 0) {
+		/* Phase 27d: Add diagnostic register reads on timeout */
+		static int diag_count;
+		u32 err_sta, mcu_int, pda_cfg, ring16_base;
+
 		dev_warn(&dev->pdev->dev, "  Ring 16 DMA timeout (CIDX=%d, DIDX=%d)\n",
 			 dev->fwdl_ring_head, didx);
+
+		/* Only dump diagnostics for first 3 timeouts to avoid log spam */
+		if (diag_count < 3) {
+			err_sta = mt_rr(dev, MT_WFDMA0_WPDMA2HOST_ERR_INT_STA);
+			mcu_int = mt_rr(dev, MT_WFDMA0_MCU_INT_STA);
+			pda_cfg = mt_rr(dev, MT_PDA_CONFG);
+			ring16_base = mt_rr(dev, MT_WFDMA0_TX_RING16_CTRL0);
+
+			dev_info(&dev->pdev->dev, "  [DIAG] Phase 27d Error Investigation:\n");
+			dev_info(&dev->pdev->dev, "    WPDMA2HOST_ERR_INT_STA(0xd41E8)=0x%08x (TX_TO=%d RX_TO=%d)\n",
+				 err_sta,
+				 !!(err_sta & MT_WFDMA0_ERR_TX_TIMEOUT_INT),
+				 !!(err_sta & MT_WFDMA0_ERR_RX_TIMEOUT_INT));
+			dev_info(&dev->pdev->dev, "    MCU_INT_STA(0xd4110)=0x%08x (MEM_ERR=%d DMA_ERR=%d)\n",
+				 mcu_int,
+				 !!(mcu_int & MT_WFDMA0_MCU_INT_MEM_RANGE_ERR),
+				 !!(mcu_int & MT_WFDMA0_MCU_INT_DMA_ERR));
+			dev_info(&dev->pdev->dev, "    PDA_CONFG(0x280C)=0x%08x (FWDL_EN=%d)\n",
+				 pda_cfg, !!(pda_cfg & MT_PDA_FWDL_EN));
+			dev_info(&dev->pdev->dev, "    Ring16 BASE(0xd4400)=0x%08x\n", ring16_base);
+			diag_count++;
+		}
 		/* Per zouyonghao: Continue anyway, ROM may have processed it */
 	}
 
@@ -1889,14 +2009,91 @@ static int test_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	dev_info(&pdev->dev, "+----------------------------------------------------------+\n");
 	dev_info(&pdev->dev, "|                    Test Complete                         |\n");
 	dev_info(&pdev->dev, "+----------------------------------------------------------+\n");
-	dev_info(&pdev->dev, "  WFDMA GLO_CFG: 0x%08x\n", mt_rr(dev, MT_WFDMA0_GLO_CFG));
-	dev_info(&pdev->dev, "  WFDMA INT_STA: 0x%08x\n", mt_rr(dev, MT_WFDMA0_HOST_INT_STA));
-	dev_info(&pdev->dev, "  Ring %d (MCU_WM) CIDX/DIDX: %d/%d\n", MCU_WM_RING_IDX,
-		 mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(MCU_WM_RING_IDX)),
-		 mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(MCU_WM_RING_IDX)));
-	dev_info(&pdev->dev, "  Ring %d (FWDL) CIDX/DIDX: %d/%d\n", FWDL_RING_IDX,
-		 mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX)),
-		 mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(FWDL_RING_IDX)));
+	{
+		u32 glo_cfg, int_sta, err_sta, mcu_int, pda_cfg;
+		u32 ring15_base, ring16_base, ring16_cnt, ring16_ext;
+
+		glo_cfg = mt_rr(dev, MT_WFDMA0_GLO_CFG);
+		int_sta = mt_rr(dev, MT_WFDMA0_HOST_INT_STA);
+		err_sta = mt_rr(dev, MT_WFDMA0_WPDMA2HOST_ERR_INT_STA);
+		mcu_int = mt_rr(dev, MT_WFDMA0_MCU_INT_STA);
+		pda_cfg = mt_rr(dev, MT_PDA_CONFG);
+		ring15_base = mt_rr(dev, MT_WFDMA0_TX_RING_BASE(MCU_WM_RING_IDX));
+		ring16_base = mt_rr(dev, MT_WFDMA0_TX_RING16_CTRL0);
+		ring16_cnt = mt_rr(dev, MT_WFDMA0_TX_RING_CNT(FWDL_RING_IDX));
+		ring16_ext = mt_rr(dev, MT_WFDMA0_TX_RING16_EXT_CTRL);
+
+		dev_info(&pdev->dev, "  WFDMA GLO_CFG: 0x%08x\n", glo_cfg);
+		dev_info(&pdev->dev, "  WFDMA INT_STA: 0x%08x (tx15=%d tx16=%d)\n",
+			 int_sta,
+			 !!(int_sta & BIT(25)),  /* tx_done_int_sts_15 */
+			 !!(int_sta & BIT(26))); /* tx_done_int_sts_16 */
+		dev_info(&pdev->dev, "  Ring %d (MCU_WM) CIDX/DIDX: %d/%d, BASE=0x%08x\n",
+			 MCU_WM_RING_IDX,
+			 mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(MCU_WM_RING_IDX)),
+			 mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(MCU_WM_RING_IDX)),
+			 ring15_base);
+		dev_info(&pdev->dev, "  Ring %d (FWDL) CIDX/DIDX: %d/%d, BASE=0x%08x\n",
+			 FWDL_RING_IDX,
+			 mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX)),
+			 mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(FWDL_RING_IDX)),
+			 ring16_base);
+
+		/* Phase 27d: Diagnostic registers */
+		dev_info(&pdev->dev, "\n");
+		dev_info(&pdev->dev, "  [Phase 27d Diagnostics]\n");
+		dev_info(&pdev->dev, "    WPDMA2HOST_ERR_INT_STA(0xd41E8): 0x%08x\n", err_sta);
+		dev_info(&pdev->dev, "      TX_TIMEOUT=%d RX_TIMEOUT=%d TX_DMA_ERR=%d RX_DMA_ERR=%d\n",
+			 !!(err_sta & MT_WFDMA0_ERR_TX_TIMEOUT_INT),
+			 !!(err_sta & MT_WFDMA0_ERR_RX_TIMEOUT_INT),
+			 !!(err_sta & MT_WFDMA0_ERR_TX_DMA_ERR_INT),
+			 !!(err_sta & MT_WFDMA0_ERR_RX_DMA_ERR_INT));
+		dev_info(&pdev->dev, "    MCU_INT_STA(0xd4110): 0x%08x (MEM_ERR=%d DMA_ERR=%d)\n",
+			 mcu_int,
+			 !!(mcu_int & MT_WFDMA0_MCU_INT_MEM_RANGE_ERR),
+			 !!(mcu_int & MT_WFDMA0_MCU_INT_DMA_ERR));
+		dev_info(&pdev->dev, "    PDA_CONFG(0x280C): 0x%08x (FWDL_EN=%d LS_QSEL=%d)\n",
+			 pda_cfg, !!(pda_cfg & MT_PDA_FWDL_EN),
+			 !!(pda_cfg & MT_PDA_FWDL_LS_QSEL_EN));
+
+		/* Enhanced PDA diagnostics - why isn't the MCU receiving data? */
+		{
+			u32 pda_tar_addr, pda_tar_len, pda_dwld_state, mcu_glo_cfg;
+			pda_tar_addr = mt_rr(dev, MT_PDA_TAR_ADDR);
+			pda_tar_len = mt_rr(dev, MT_PDA_TAR_LEN);
+			pda_dwld_state = mt_rr(dev, MT_PDA_DWLD_STATE);
+			mcu_glo_cfg = mt_rr(dev, MT_MCU_DMA0_GLO_CFG);
+			dev_info(&pdev->dev, "    PDA_TAR_ADDR(0x2800): 0x%08x\n", pda_tar_addr);
+			dev_info(&pdev->dev, "    PDA_TAR_LEN(0x2804): 0x%08x\n", pda_tar_len);
+			dev_info(&pdev->dev, "    PDA_DWLD_STATE(0x2808): 0x%08x\n", pda_dwld_state);
+			dev_info(&pdev->dev, "      PDA_FINISH=%d PDA_BUSY=%d WFDMA_FINISH=%d WFDMA_BUSY=%d\n",
+				 !!(pda_dwld_state & MT_PDA_FWDL_FINISH),
+				 !!(pda_dwld_state & MT_PDA_FWDL_BUSY),
+				 !!(pda_dwld_state & MT_WFDMA_FWDL_FINISH),
+				 !!(pda_dwld_state & MT_WFDMA_FWDL_BUSY));
+			dev_info(&pdev->dev, "      WFDMA_OVERFLOW=%d PDA_OVERFLOW=%d\n",
+				 !!(pda_dwld_state & MT_WFDMA_FWDL_OVERFLOW),
+				 !!(pda_dwld_state & MT_PDA_FWDL_OVERFLOW));
+			dev_info(&pdev->dev, "    MCU_DMA0_GLO_CFG(0x2208): 0x%08x (RX_DMA_EN=%d)\n",
+				 mcu_glo_cfg, !!(mcu_glo_cfg & MT_MCU_DMA0_GLO_CFG_RX_DMA_EN));
+		}
+
+		/* Ring comparison - BOTH rings have DIDX=0, this is a global DMA path issue */
+		{
+			u32 ring15_cnt, ring15_ext, ring15_cidx, ring15_didx;
+			ring15_cnt = mt_rr(dev, MT_WFDMA0_TX_RING_CNT(MCU_WM_RING_IDX));
+			ring15_ext = mt_rr(dev, MT_WFDMA0_TX_RING15_EXT_CTRL);
+			ring15_cidx = mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(MCU_WM_RING_IDX));
+			ring15_didx = mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(MCU_WM_RING_IDX));
+			dev_info(&pdev->dev, "    Ring 15 (MCU_WM): CNT=%d, CIDX=%d, DIDX=%d, EXT_CTRL=0x%08x\n",
+				 ring15_cnt, ring15_cidx, ring15_didx, ring15_ext);
+			dev_info(&pdev->dev, "    Ring 16 (FWDL):   CNT=%d, CIDX=%d, DIDX=%d, EXT_CTRL=0x%08x\n",
+				 ring16_cnt,
+				 mt_rr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX)),
+				 mt_rr(dev, MT_WFDMA0_TX_RING_DIDX(FWDL_RING_IDX)),
+				 ring16_ext);
+		}
+	}
 	dev_info(&pdev->dev, "\n");
 	dev_info(&pdev->dev, "Unload with: sudo rmmod test_fw_load\n");
 

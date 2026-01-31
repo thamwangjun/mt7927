@@ -52,10 +52,27 @@
     - **Fix implemented**: Only enable `TX_DMA_EN` during firmware loading
     - RX_DMA_EN should be enabled later after RX rings are properly configured
 
+13. **✅ TXD CONTROL WORD FIX VERIFIED (Phase 27c)**: TRUE root cause of page faults FIXED:
+    - **TXD descriptor control word bit layout was WRONG!**
+    - SDLen0 was in bits 0-13 (should be **bits 16-29**)
+    - LastSec0 was in bit 14 (should be **bit 30**)
+    - With ctrl=0x404C, hardware read SDLen1=76 bytes at SDPtr1=0x0 → DMA tried to fetch from address 0!
+    - **Fix verified**: Control word now shows `ctrl=0x404c0000` (correct format)
+    - **No more AMD-Vi IO_PAGE_FAULT errors!**
+
+14. **⚠️ GLOBAL DMA PATH ISSUE (Phase 27d)**: Critical finding from diagnostic run:
+    - **BOTH Ring 15 AND Ring 16 have DIDX stuck at 0** - NOT a Ring 16-specific issue!
+    - Ring 15 (MCU_WM): CIDX=7, DIDX=0 - commands not processed
+    - Ring 16 (FWDL): CIDX=50, DIDX=0 - data not processed
+    - `TX_TIMEOUT=1` error at end - DMA tried to send but MCU didn't acknowledge
+    - `tx_done_int_sts_15=1` but DIDX=0 - interrupt may be stale or spurious
+    - **Root cause**: MCU/target side not accepting DMA data
+    - Hypothesis: MCU_DMA0 RX not enabled, or PDA not configured
+
 ## Current Status
 
-**Status**: 🔧 PHASE 27b - RX_DMA_EN FIX IMPLEMENTED - Pending test
-**Last Updated**: January 2026
+**Status**: 🔧 PHASE 27d - RING 16 DIDX INVESTIGATION
+**Last Updated**: January 2026 (Phase 27c fix verified)
 
 ### What's Working ✅
 - Driver successfully binds to MT7927 hardware (PCI ID: 14c3:7927)
@@ -67,38 +84,74 @@
 - GLO_CFG setup with CLK_GATE_DIS works
 - WFDMA extensions configured correctly
 - **Ring configuration registers NOW work** (Phase 27 GLO_CFG timing fix)
-  - Ring 15 BASE=0xffff8000, EXT_CTRL=0x05000004 ✅
-  - Ring 16 BASE=0xffff9000, EXT_CTRL=0x05400004 ✅
+  - Ring 15 BASE=0xffffb000, EXT_CTRL=0x05000004 ✅
+  - Ring 16 BASE=0xffffc000, EXT_CTRL=0x05400004 ✅
 - **All TX rings 0-16 have valid BASE addresses** (Phase 27 unused ring fix)
+- **TXD control word format CORRECT** (Phase 27c fix verified)
+  - `ctrl=0x404c0000` (SDLen0 in bits 16-29, LastSec0 in bit 30)
+  - **No more AMD-Vi IO_PAGE_FAULT errors!**
+- Ring 15 (MCU_WM) shows DMA activity - tx_done_int_sts_15 set
 - Correct WFDMA base address (0xd4000)
 - L0S and L1 ASPM disabled
 - Firmware files load into kernel memory (1.4MB RAM code + patch)
 
-### What Was Fixed (Phase 27b) 🔧
-- **Remaining page fault root cause found**: RX rings have BASE=0 but RX_DMA_EN was enabled
-- IOMMU page fault halts DMA engine → DIDX never increments
-- **Fix implemented**: Only enable TX_DMA_EN during firmware loading
-- **Two approaches documented**:
-  1. TX-only during FWDL (current) - enable RX_DMA_EN after RX rings configured
-  2. Initialize all rings upfront - enable both TX and RX together
+### What Was Fixed (Phase 27c) ✅ VERIFIED
+- **TXD control word fix WORKING**: No more page faults!
+- SDLen0 now correctly in **bits 16-29** (was bits 0-13)
+- LastSec0 now correctly in **bit 30** (was bit 14)
+- Control word shows `ctrl=0x404c0000` (correct format)
+- buf1 (SDPtr1) correctly set to 0 for single-buffer mode
+- **No more AMD-Vi IO_PAGE_FAULT errors!**
 
-### Next Step 🔧
+### Current Issue (Phase 27d) ⚠️
 
-**Test the RX_DMA_EN fix:**
+**CRITICAL: BOTH Rings Have DIDX Stuck at 0**
 
+Diagnostic run revealed this is a **global DMA path issue**, not Ring 16-specific:
+
+| Ring | Purpose | CIDX | DIDX | Error |
+|------|---------|------|------|-------|
+| Ring 15 | MCU_WM | 7 | **0** | Commands not processed |
+| Ring 16 | FWDL | 50 | **0** | Data not processed |
+
+**Key findings from diagnostic**:
+- `TX_TIMEOUT=1` at end - DMA tried to send, target didn't acknowledge
+- `tx_done_int_sts_15=1` but DIDX=0 - interrupt may be stale
+- `PDA_CONFG=0xc0000002` - FWDL_EN=1, LS_QSEL_EN=1 (correct)
+
+**Root cause hypothesis**: MCU receiving side not accepting DMA data:
+- MCU_DMA0 RX may not be enabled
+- PDA_TAR_ADDR/PDA_TAR_LEN may not be configured
+- ROM bootloader may need explicit download mode activation
+
+### Next Step 🔧 - ENHANCED DIAGNOSTICS ADDED
+
+**Additional PDA registers now checked in test_fw_load.c:**
+
+✅ Implemented diagnostics:
+1. `0xd41E8` - WPDMA2HOST_ERR_INT_STA (TX/RX timeout errors)
+2. `0xd4110` - MCU_INT_STA (memory range errors, DMA errors)
+3. `0x280C` - PDA_CONFG (PDA_FWDL_EN, LS_QSEL_EN)
+4. `0x2800` - **PDA_TAR_ADDR** (target address - should be non-zero if MCU processed commands)
+5. `0x2804` - **PDA_TAR_LEN** (target length)
+6. `0x2808` - **PDA_DWLD_STATE** (BUSY/FINISH/OVERFLOW flags)
+7. `0x2208` - **MCU_DMA0_GLO_CFG** (RX_DMA_EN status)
+8. Ring 15 vs Ring 16 comparison (CNT, CIDX, DIDX, EXT_CTRL)
+
+**To run the enhanced diagnostic test:**
 ```bash
+make clean && make tests
 sudo rmmod test_fw_load 2>/dev/null
 sudo insmod tests/05_dma_impl/test_fw_load.ko
 sudo dmesg | tail -100
 ```
 
-**Expected results**:
-1. No more `AMD-Vi: Event logged [IO_PAGE_FAULT]` errors
-2. GLO_CFG = `0x5030b871` (TX_DMA_EN only, not 0x5030b875)
-3. DIDX should start incrementing (DMA consuming descriptors)
-4. Fewer or no "Ring 16 DMA timeout" messages
+**Investigation paths**:
+1. If PDA_TAR_ADDR/LEN = 0 → MCU commands not being processed, need direct PDA init
+2. If MCU_DMA0_GLO_CFG has RX_DMA_EN = 0 → MCU RX DMA needs explicit enable
+3. If PDA_DWLD_STATE shows no activity → ROM not in download mode
 
-See **docs/ZOUYONGHAO_ANALYSIS.md** sections "2b", "2c", and "2d" for complete analysis.
+See **docs/ZOUYONGHAO_ANALYSIS.md** section "2f" for complete analysis.
 
 ---
 
@@ -242,21 +295,24 @@ Ring 16:    FWDL            // **Firmware download** ← Use this
 
 ## Next Steps
 
-1. **Fix GLO_CFG timing** - Reorder `test_fw_load.c` to match zouyonghao:
-   ```c
-   // Phase 1: Clear GLO_CFG (or leave minimal)
-   // Phase 2: Configure rings 15/16 (BASE, CNT, CIDX=0, DIDX=0)
-   // Phase 3: Configure prefetch (EXT_CTRL)
-   // Phase 4: Set GLO_CFG with CLK_GAT_DIS + other bits (AFTER rings!)
-   // Phase 5: Enable TX/RX DMA
+1. ✅ **Phase 27c VERIFIED** - TXD control word fix works:
+   - Control word: `ctrl=0x404c0000` (correct format)
+   - No more `AMD-Vi: Event logged [IO_PAGE_FAULT]` errors
+   - Ring 15 (MCU_WM) shows DMA activity
+
+2. **Phase 27d - Run diagnostic test**:
+   ```bash
+   make clean && make tests
+   sudo rmmod test_fw_load 2>/dev/null
+   sudo insmod tests/05_dma_impl/test_fw_load.ko
+   sudo dmesg | tail -80
    ```
 
-2. **Test ring writes** after GLO_CFG timing fix
-
-3. **If rings still fail**, investigate mt76 queue infrastructure:
-   - `mt76_init_mcu_queue()` may do hidden initialization
-   - `mt76_queue_reset()` may be needed
-   - Consider using mt76 framework instead of manual approach
+3. **Analyze Phase 27d diagnostic output**:
+   - Check `WPDMA2HOST_ERR_INT_STA (0xd41E8)` for TX/RX errors
+   - Check `MCU_INT_STA (0xd4110)` for memory/DMA errors
+   - Check `PDA_CONFG (0x280C)` for FWDL enable status
+   - Compare Ring 15 vs Ring 16 configuration
 
 **Already Implemented in test_fw_load.c:**
 - ✅ CB_INFRA PCIe remap (0x74037001)
@@ -267,6 +323,8 @@ Ring 16:    FWDL            // **Firmware download** ← Use this
 - ✅ RST_DTX_PTR = ~0
 - ✅ Descriptor DMA_DONE init
 - ✅ MCU IDLE polling
+- ✅ TXD control word format (SDLen0 bits 16-29, LastSec0 bit 30) - Phase 27c
+- ✅ Phase 27d diagnostic registers (WPDMA2HOST_ERR_INT_STA, MCU_INT_STA, PDA_CONFG)
 
 ---
 
@@ -311,9 +369,13 @@ sudo rmmod mt7927_minimal_scan
    - ✅ WFDMA base → Correct address (0xd4000) used
    - ✅ CB_INFRA → PCIe remap initialized (0x74037001)
    - ✅ Phase 26 fixes → DMA priority, GLO_CFG_EXT1, descriptor init, etc.
-3. **CURRENT BLOCKER**: Ring config registers not accepting writes
-4. **LIKELY CAUSE**: GLO_CFG timing - we set CLK_GAT_DIS before ring config, zouyonghao sets it after
-5. **NEXT**: Fix GLO_CFG timing in test_fw_load.c (set CLK_GAT_DIS AFTER ring configuration)
+   - ✅ Phase 27 → GLO_CFG timing fixed, ring registers accept writes
+   - ✅ Phase 27 → All TX rings 0-16 initialized to valid DMA addresses
+   - ✅ Phase 27b → RX_DMA_EN disabled during firmware loading
+   - ✅ Phase 27c → TXD control word bit positions corrected
+3. **CURRENT BLOCKER**: Need to test Phase 27c fix
+4. **FIX APPLIED**: TXD control word - SDLen0 now in bits 16-29, LastSec0 in bit 30
+5. **NEXT**: Test the fix to verify no page faults and DIDX increments
 
 ### When User Wants to Debug
 1. Read `DEVELOPMENT_LOG.md` for full history and all attempts
@@ -391,7 +453,7 @@ drivers/net/wireless/mediatek/mt76/mt7925/
 
 **Goal**: Implement correct initialization sequence for MT7927 firmware loading.
 
-**What's Working (Phase 26)**:
+**What's Working (Phase 27c)**:
 1. ✅ WFDMA registers at BAR0 + **0xd4000** (correct)
 2. ✅ CB_INFRA PCIe remap (0x74037001) set correctly
 3. ✅ WF/BT subsystem reset via CB_INFRA_RGU
@@ -399,21 +461,26 @@ drivers/net/wireless/mediatek/mt76/mt7925/
 5. ✅ **MCU reaches IDLE (0x1D1E)** - confirmed working!
 6. ✅ GLO_CFG setup with CLK_GATE_DIS
 7. ✅ WFDMA extensions configured
+8. ✅ Ring configuration registers accept writes (Phase 27 GLO_CFG timing fix)
+9. ✅ All TX rings 0-16 have valid BASE addresses (Phase 27 unused ring fix)
+10. ✅ RX_DMA_EN disabled during firmware loading (Phase 27b fix)
+11. ✅ TXD control word bit positions corrected (Phase 27c fix)
 
-**Current Blocker (Phase 26)**:
-- Ring configuration registers (BASE, EXT_CTRL) not accepting writes
-- Likely cause: GLO_CFG timing - CLK_GAT_DIS set BEFORE ring config (should be AFTER)
+**Current Status (Phase 27c)**: TXD control word fix implemented, pending test
+- Root cause: SDLen0 was in wrong bit position (0-13 instead of 16-29)
+- Hardware read SDLen1=76 at SDPtr1=0x0 → DMA accessed address 0 → page fault
+- Fix: Corrected bit positions to match MediaTek TXD_STRUCT
 
 **Implementation sequence**:
 1. ✅ Set CB_INFRA PCIe remap registers
 2. ✅ WF/BT subsystem reset via CB_INFRA_RGU
 3. ✅ Set crypto MCU ownership
 4. ✅ Poll for MCU IDLE (0x1D1E)
-5. 🔧 Configure WFDMA rings (timing may need adjustment)
-6. ⏸️ Load firmware with polling (blocked on step 5)
+5. ✅ Configure WFDMA rings (GLO_CFG timing fixed)
+6. 🔧 Load firmware with polling (pending Phase 27c test)
 7. ⏸️ Set SW_INIT_DONE manually (blocked on step 6)
 
-The hardware works. The MCU reaches IDLE. We're very close - just need to fix ring configuration timing.
+The hardware works. All initialization steps complete. TXD control word fix applied. Need to test to verify DMA processing works.
 
 ---
 

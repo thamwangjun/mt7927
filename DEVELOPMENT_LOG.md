@@ -9,7 +9,7 @@ This document chronicles the development effort to create a Linux driver for the
 2. MT7927 ROM bootloader does **NOT support mailbox protocol** - this was the root cause of all DMA "blocker" issues
 3. Reference zouyonghao driver has correct polling-based FW loader functions, but **wiring is broken** (firmware never called)
 
-**Current Status (Phase 27b)**: **RX_DMA_EN FIX IMPLEMENTED** - After Phase 27 fixed TX rings (GLO_CFG timing + unused ring initialization), Phase 27b identified remaining page faults were caused by RX_DMA_EN being enabled while RX rings have BASE=0. Fix: Only enable TX_DMA_EN during firmware loading. Pending test.
+**Current Status (Phase 27d)**: **GLOBAL DMA PATH INVESTIGATION** - CRITICAL FINDING: **BOTH Ring 15 AND Ring 16 have DIDX stuck at 0**. This is NOT a Ring 16-specific issue - the entire TX DMA path is failing. Diagnostic run shows `TX_TIMEOUT=1` error, meaning DMA engine tried to send but MCU/target didn't acknowledge. Root cause hypothesis: MCU_DMA0 RX not enabled, or PDA target registers not configured. Enhanced diagnostics added to read PDA_TAR_ADDR, PDA_TAR_LEN, PDA_DWLD_STATE, and MCU_DMA0_GLO_CFG to investigate MCU receiving side.
 
 ---
 
@@ -2972,6 +2972,281 @@ After this fix:
 
 Test the RX_DMA_EN fix:
 ```bash
+sudo rmmod test_fw_load 2>/dev/null
+sudo insmod tests/05_dma_impl/test_fw_load.ko
+sudo dmesg | tail -100
+```
+
+---
+
+## Phase 27c: TXD Control Word Fix (2026-01-31)
+
+### Status: ✅ VERIFIED WORKING
+
+### Test Results After Phase 27b RX_DMA_EN Fix
+
+Test showed no more AMD-Vi page faults from RX rings, but still seeing page faults:
+
+```
+AMD-Vi: IO_PAGE_FAULT address=0x0
+```
+
+### Root Cause Found: TXD Control Word Bit Layout Wrong
+
+Analysis of the descriptor dump revealed the issue:
+
+```
+[DIAG] Ring 15 desc[0] before kick:
+  ctrl=0x0000404c ← WRONG! Should be 0x404c0000
+```
+
+The TXD control word bit layout was incorrect:
+
+| Field | OLD (Wrong) | NEW (Correct) |
+|-------|-------------|---------------|
+| SDLen0 | bits 0-13 | **bits 16-29** |
+| LastSec0 | bit 14 | **bit 30** |
+| DMA_DONE | bit 15 | **bit 31** |
+
+With the wrong layout (`ctrl=0x0000404c`):
+- SDLen0 in bits 0-13 = 0x404c = 16460 bytes (way too long!)
+- But worse: hardware interprets SDLen1 from bits 16-29 = 0x0000 = 0
+- And SDPtr1 is 0x0, so DMA tries to fetch 0 bytes from address 0x0
+
+### Fix Applied
+
+Updated `tx_queue_entry()` in test_fw_load.c:
+
+```c
+/* TXD DW1 layout (CONNAC3X style):
+ * Bits 16-29: SDLen0 (14 bits, max 16383 bytes)
+ * Bit 30: LastSec0 (last segment indicator)
+ * Bit 31: DMA_DONE (set by hardware when complete)
+ */
+desc->ctrl = cpu_to_le32((len << 16) | BIT(30));  /* SDLen0=len, LS0=1 */
+```
+
+### Verified Results
+
+After fix, descriptor shows correct format:
+```
+[DIAG] Ring 15 desc[0] before kick:
+  ctrl=0x404c0000 (SDLen0=76[bits16-29], LS0=1[bit30], DONE=0[bit31])
+```
+
+**✅ No more AMD-Vi IO_PAGE_FAULT errors!**
+
+---
+
+## Phase 27d: Global DMA Path Investigation (2026-01-31)
+
+### Status: 🔧 INVESTIGATING - CRITICAL FINDING
+
+### Test Results After Phase 27c TXD Fix
+
+TXD fix eliminated page faults, but revealed a deeper issue:
+
+```
+Ring 15 (MCU_WM) CIDX/DIDX: 7/0   ← DIDX never incremented!
+Ring 16 (FWDL) CIDX/DIDX: 50/0   ← DIDX never incremented!
+```
+
+**BOTH rings have DIDX stuck at 0** - this is NOT a Ring 16-specific issue!
+
+### Diagnostic Results
+
+| Register | Value | Meaning |
+|----------|-------|---------|
+| WPDMA2HOST_ERR_INT_STA | 0x00000001 | **TX_TIMEOUT=1** at end |
+| MCU_INT_STA | 0x00010000 | Bit 16 set |
+| PDA_CONFG | 0xc0000002 | FWDL_EN=1, LS_QSEL_EN=1 |
+| INT_STA | 0x02000000 | tx_done_int_sts_15=1 (but DIDX=0!) |
+
+### TX_TIMEOUT Interpretation
+
+`TX_TIMEOUT=1` means:
+- ✅ DMA engine is running
+- ✅ Descriptors were read
+- ❌ **Target side (MCU) didn't acknowledge**
+
+The HOST_DMA0 tried to send data, but MCU_DMA0 never received/acknowledged it.
+
+### Root Cause Hypothesis
+
+The MCU receiving side is not accepting DMA data. Possible causes:
+
+1. **MCU_DMA0 RX not enabled** - Need to check MCU_DMA0_GLO_CFG RX_DMA_EN bit
+2. **PDA not configured** - PDA_TAR_ADDR/PDA_TAR_LEN may not be set
+3. **Internal bus issue** - Something between HOST_DMA0 and MCU_DMA0
+4. **ROM not in download mode** - MCU IDLE (0x1D1E) doesn't mean "ready for FWDL"
+
+**Chicken-and-egg problem**: Ring 15 commands should configure PDA_TAR_ADDR/LEN, but Ring 15 is also stuck at DIDX=0, meaning commands aren't being processed either!
+
+### Enhanced Diagnostics Added
+
+New registers checked in test_fw_load.c:
+
+| Register | BAR0 Offset | Purpose |
+|----------|-------------|---------|
+| PDA_TAR_ADDR | 0x2800 | Target address (should be non-zero) |
+| PDA_TAR_LEN | 0x2804 | Target length |
+| PDA_DWLD_STATE | 0x2808 | Download state (BUSY/FINISH/OVERFLOW) |
+| MCU_DMA0_GLO_CFG | 0x2208 | MCU DMA config (RX_DMA_EN bit) |
+
+### Investigation Paths
+
+1. **If PDA_TAR_ADDR/LEN = 0** → MCU commands not being processed
+   - Need to configure PDA directly from host, bypassing Ring 15 commands
+
+2. **If MCU_DMA0_GLO_CFG has RX_DMA_EN = 0** → MCU RX DMA disabled
+   - Need to enable MCU_DMA0 RX before sending data
+
+3. **If PDA_DWLD_STATE shows no activity** → ROM not in download mode
+   - May need explicit activation sequence for ROM bootloader
+
+### Next Steps
+
+Run enhanced diagnostic test:
+```bash
+make clean && make tests
+sudo rmmod test_fw_load 2>/dev/null
+sudo insmod tests/05_dma_impl/test_fw_load.ko
+sudo dmesg | tail -100
+```
+
+Check the new PDA register values to determine which investigation path to follow.
+
+---
+
+## Phase 27e: HOST2MCU Software Interrupt Discovery (2026-01-31)
+
+### Status: 🎯 POTENTIAL ROOT CAUSE IDENTIFIED
+
+### Enhanced Diagnostic Results
+
+After running the enhanced diagnostics from Phase 27d:
+
+```
+PDA_TAR_ADDR(0x2800): 0x00000000      ← Commands NOT processed!
+PDA_TAR_LEN(0x2804): 0x000fffff       ← Default max value
+PDA_DWLD_STATE(0x2808): 0x0fffe01a
+  PDA_BUSY=1 WFDMA_BUSY=1 WFDMA_OVERFLOW=1
+MCU_DMA0_GLO_CFG(0x2208): 0x1070387d (RX_DMA_EN=1)
+```
+
+**CRITICAL**: `WFDMA_OVERFLOW=1` - Data is arriving at MCU but not being consumed!
+
+### Key Insights
+
+1. **PDA_TAR_ADDR = 0** proves MCU never processed INIT_DOWNLOAD commands from Ring 15
+2. **WFDMA_OVERFLOW = 1** proves data IS reaching MCU's receiving WFDMA
+3. **RX_DMA_EN = 1** proves MCU DMA receive is enabled
+4. **BUT** the MCU software/ROM isn't consuming the data
+
+### Discovery: HOST2MCU Software Interrupt Mechanism
+
+Searching MediaTek reference code revealed a **doorbell mechanism** we're not using:
+
+```c
+/* MT6639 MCU DMA register */
+#define WF_WFDMA_MCU_DMA0_HOST2MCU_SW_INT_SET_ADDR  (WF_WFDMA_MCU_DMA0_BASE + 0x108)
+
+/* Usage in cmm_asic_connac3x.c:1280-1282 */
+kalDevRegWrite(prGlueInfo,
+    CONNAC3X_WPDMA_HOST2MCU_SW_INT_SET(u4McuWpdamBase),
+    intrBitMask);
+```
+
+Documentation states: "Driver set this bit to generate MCU interrupt"
+
+### Register Locations
+
+| Register | Chip Address | BAR0 Offset | Purpose |
+|----------|--------------|-------------|---------|
+| HOST_DMA0 HOST2MCU_SW_INT_SET | 0x7c024108 | **0xd4108** | Host-side doorbell |
+| MCU_DMA0 HOST2MCU_SW_INT_SET | 0x54000108 | **0x2108** | MCU-side |
+
+### Root Cause Hypothesis
+
+The MCU ROM is in IDLE state (0x1D1E) but **sleeping/not polling DMA rings**. It expects a software interrupt to wake up and process commands.
+
+Our test_fw_load.c:
+- ✅ Writes descriptors correctly
+- ✅ Kicks ring via CIDX
+- ❌ **Never triggers HOST2MCU software interrupt**
+
+The mt76 framework's `mt76_mcu_send_msg()` may include hidden doorbell steps that we bypass when doing raw DMA.
+
+### Proposed Fix
+
+After writing CIDX, trigger the MCU interrupt:
+
+```c
+/* After kicking Ring 15 (MCU commands) */
+writel(CIDX, dev->regs + MT_WFDMA0_TX_RING15_CTRL2);
+writel(0x01, dev->regs + 0xd4108);  /* HOST2MCU_SW_INT_SET bit 0 */
+```
+
+### Implementation (2026-01-31)
+
+**Fix applied to `tests/05_dma_impl/test_fw_load.c`:**
+
+1. Added register definition:
+```c
+/* HOST2MCU_SW_INT_SET - Doorbell to wake MCU from sleep
+ * CRITICAL: In HOST_DMA0 space, NOT MCU_DMA0!
+ * Chip address 0x7c024108 → BAR0 0xd4108 */
+#define MT_HOST2MCU_SW_INT_SET      (MT_WFDMA0_BASE + 0x108)  /* = 0xd4108 */
+```
+
+2. Added doorbell writes after CIDX updates for both rings:
+```c
+/* After kicking Ring 15 (MCU commands) */
+mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(MCU_WM_RING_IDX), dev->mcu_ring_head);
+wmb();
+mt_wr(dev, MT_HOST2MCU_SW_INT_SET, BIT(0));  /* Doorbell to wake MCU */
+wmb();
+
+/* After kicking Ring 16 (FWDL data) */
+mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(FWDL_RING_IDX), dev->fwdl_ring_head);
+wmb();
+mt_wr(dev, MT_HOST2MCU_SW_INT_SET, BIT(0));  /* Doorbell to wake MCU */
+wmb();
+```
+
+### Bug Fix: Wrong Register Space (2026-01-31)
+
+**Initial bug**: The doorbell was incorrectly defined using MCU_DMA0 space:
+```c
+/* WRONG - MCU_DMA0 space */
+#define MT_HOST2MCU_SW_INT_SET  (MT_MCU_DMA0_BASE + 0x108)  /* = 0x2108 */
+```
+
+**Corrected**: Must use HOST_DMA0 space where the register actually exists:
+```c
+/* CORRECT - HOST_DMA0 space */
+#define MT_HOST2MCU_SW_INT_SET  (MT_WFDMA0_BASE + 0x108)  /* = 0xd4108 */
+```
+
+The HOST2MCU_SW_INT_SET register is defined in `wf_wfdma_host_dma0.h` (not `wf_wfdma_mcu_dma0.h`).
+MediaTek's `connac_reg.h` confirms: `#define HOST2MCU_SW_INT_SET (PCIE_HIF_BASE + 0x0108)`
+
+### Status: ✅ IMPLEMENTED - Awaiting Test
+
+Run test to verify:
+```bash
+sudo rmmod test_fw_load 2>/dev/null
+sudo insmod tests/05_dma_impl/test_fw_load.ko
+sudo dmesg | tail -60
+```
+
+Expected improvement: DIDX should start incrementing when MCU wakes up and processes DMA rings.
+4. Verify PDA_TAR_ADDR gets populated
+
+### Test Command
+
+```bash
+make clean && make tests
 sudo rmmod test_fw_load 2>/dev/null
 sudo insmod tests/05_dma_impl/test_fw_load.ko
 sudo dmesg | tail -100
