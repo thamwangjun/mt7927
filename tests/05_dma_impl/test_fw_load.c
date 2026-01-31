@@ -395,10 +395,10 @@ struct mt7927_desc {
 #define MT_DMA_CTL_SD_LEN1      GENMASK(13, 0)   /* bits 0-13: buffer 1 length */
 #define MT_DMA_CTL_LAST_SEC1    BIT(14)          /* bit 14: buffer 1 last section */
 #define MT_DMA_CTL_BURST        BIT(15)          /* bit 15: burst mode */
-/* TEMPORARILY REVERTED TO OLD (BUGGY) FORMAT FOR PAGE FAULT TEST!
- * This should cause page faults at address 0 if DMA is working. */
-#define MT_DMA_CTL_SD_LEN0      GENMASK(13, 0)   /* OLD: bits 0-13 (WRONG - causes page fault!) */
-#define MT_DMA_CTL_LAST_SEC0    BIT(14)          /* OLD: bit 14 (WRONG - causes page fault!) */
+/* CORRECT format - validated by page fault test (Phase 28d):
+ * Old format (bits 0-13) caused page faults at addr 0x0, proving hardware expects bits 16-29 */
+#define MT_DMA_CTL_SD_LEN0      GENMASK(29, 16)  /* bits 16-29: buffer 0 length (CORRECT) */
+#define MT_DMA_CTL_LAST_SEC0    BIT(30)          /* bit 30: buffer 0 last section (CORRECT) */
 #define MT_DMA_CTL_DMA_DONE     BIT(31)          /* bit 31: DMA done */
 
 /* MCU command codes */
@@ -704,12 +704,15 @@ static int send_mcu_cmd(struct test_dev *dev, u8 cmd, const void *data, size_t l
 	 * Word 2 (buf1): SDPtr1 - lower 32 bits of buffer 1 (0 if not using scatter)
 	 * Word 3 (info): SDPtr0Ext:SDPtr1Ext - upper 16 bits of each pointer packed
 	 */
-	/* OLD FORMAT FOR PAGE FAULT TEST - buf1 gets upper bits, info=0 */
+	/* CORRECT FORMAT (validated by Phase 28d page fault test):
+	 * - buf0: lower 32 bits of buffer address
+	 * - buf1: 0 (single buffer, no scatter/gather)
+	 * - info: upper 16 bits of buf0 address in lower 16 bits (SDPtr0Ext) */
 	desc->buf0 = cpu_to_le32(lower_32_bits(dev->dma_buf_phys));
-	desc->buf1 = cpu_to_le32(upper_32_bits(dev->dma_buf_phys));  /* OLD: upper bits here */
+	desc->buf1 = cpu_to_le32(0);  /* Not using scatter/gather */
 	ctrl = FIELD_PREP(MT_DMA_CTL_SD_LEN0, total_len) | MT_DMA_CTL_LAST_SEC0;
 	desc->ctrl = cpu_to_le32(ctrl);
-	desc->info = cpu_to_le32(0);  /* OLD: info was 0 */
+	desc->info = cpu_to_le32(upper_32_bits(dev->dma_buf_phys) & 0xFFFF);  /* SDPtr0Ext */
 	wmb();
 
 	/* DIAGNOSTIC: Dump descriptor before DMA kick (first MCU cmd only) */
@@ -1608,12 +1611,12 @@ static int send_fw_chunk(struct test_dev *dev, const void *data, size_t len)
 	idx = dev->fwdl_ring_head;
 	desc = &dev->fwdl_ring[idx];
 
-	/* OLD FORMAT FOR PAGE FAULT TEST */
+	/* CORRECT FORMAT (validated by Phase 28d page fault test) */
 	desc->buf0 = cpu_to_le32(lower_32_bits(dev->dma_buf_phys));
-	desc->buf1 = cpu_to_le32(upper_32_bits(dev->dma_buf_phys));  /* OLD: upper bits here */
+	desc->buf1 = cpu_to_le32(0);  /* Not using scatter/gather */
 	ctrl = FIELD_PREP(MT_DMA_CTL_SD_LEN0, len) | MT_DMA_CTL_LAST_SEC0;
 	desc->ctrl = cpu_to_le32(ctrl);
-	desc->info = cpu_to_le32(0);  /* OLD: info was 0 */
+	desc->info = cpu_to_le32(upper_32_bits(dev->dma_buf_phys) & 0xFFFF);  /* SDPtr0Ext */
 
 	/* DIAGNOSTIC: Dump descriptor before DMA kick (first FWDL chunk only) */
 	{
