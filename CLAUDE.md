@@ -8,21 +8,22 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 
 **Official Product Name**: MT7927 802.11be 320MHz 2x2 PCIe Wireless Network Adapter [Filogic 380]
 
-**Current Status**: **PHASE 28 - DMA MEMORY ACCESS FAILURE**:
+**Current Status**: **PHASE 28b - DMA MEMORY ACCESS FAILURE (PERSISTS)**:
 - ✅ **All initialization phases complete** - MCU IDLE, rings configured, DMA enabled
 - ✅ **Firmware loading protocol correct** - Polling mode, no mailbox waits
-- ❌ **DMA transfers failing** - DIDX never advances (stays at 0)
+- ✅ **Zouyonghao config additions applied** - PCIe MAC int routing, PCIE2AP timing fix
+- ❌ **DMA transfers STILL failing** - DIDX never advances (stays at 0)
 - ❌ **MEM_ERR=1** - Memory access error on first DMA attempt
 - ❌ **WFDMA_OVERFLOW=1** - Ring overflowed, nothing consumed
 
-**Phase 28 BLOCKER** (2026-01-31):
+**Phase 28b BLOCKER** (2026-01-31):
 
-The WFDMA engine **cannot access host memory** to fetch descriptors. Evidence:
-- `MCU_INT_STA(0xd4110) = 0x00000001` (MEM_ERR=1) from first DMA attempt
-- `DIDX stays at 0` while CIDX increments to 60+
-- `PDA_DWLD_STATE = 0x0fffe01a` (WFDMA_BUSY=1, WFDMA_FINISH=0, WFDMA_OVERFLOW=1)
+The WFDMA engine **cannot access host memory** to fetch descriptors. Applied zouyonghao config additions but issue persists:
+- `PCIE_MAC_INT_CONFIG (0x010074) = 0x08021000` ✅ Applied
+- `PCIE2AP_REMAP (after DMA init) = 0x18051803` ✅ Applied
+- `MCU_INT_STA(0xd4110) = 0x00000001` (MEM_ERR=1) ❌ Still failing
 
-**Likely cause**: Missing WFDMA-to-PCIe bridge configuration or address translation for DMA.
+**Evidence**: These configs address interrupt routing and MCU communication paths, NOT WFDMA→host memory access path.
 
 **What's working**:
 - ✅ MCU reaches IDLE state (0x1D1E)
@@ -30,10 +31,19 @@ The WFDMA engine **cannot access host memory** to fetch descriptors. Evidence:
 - ✅ Ring configuration accepted (BASE, CNT, EXT_CTRL all correct)
 - ✅ GLO_CFG = 0x5030b871 (TX_DMA_EN set)
 - ✅ Descriptors correctly formatted
+- ✅ All 40+ register addresses verified against reference
+- ✅ PCIe MAC interrupt routing configured
+- ✅ PCIE2AP remap timing corrected
 
-**Next**: Investigate WFDMA AXI/bus configuration, PCIe address translation for DMA, IOMMU interaction.
+**Likely cause**: IOMMU blocking DMA, or missing WFDMA AXI/bus configuration for PCIe memory access.
 
-See **docs/ZOUYONGHAO_ANALYSIS.md** section "2l" for complete Phase 28 analysis.
+**Next Steps**:
+1. Check IOMMU status: `dmesg | grep -i iommu`
+2. Verify PCIe bus master enabled: `lspci -vvs 01:00.0 | grep Bus`
+3. Search for AP2PCIE/WFDMA AXI configuration in reference sources
+4. Try booting with `intel_iommu=off` or `amd_iommu=off`
+
+See **docs/ZOUYONGHAO_ANALYSIS.md** section "2m" for complete Phase 28b analysis.
 
 ## Critical Files to Review First
 
@@ -49,12 +59,13 @@ See **docs/ZOUYONGHAO_ANALYSIS.md** section "2l" for complete Phase 28 analysis.
    - Section "2i": Phase 27f - Structure fixes and register verification
    - Section "2j": Phase 27g - Comprehensive memory reference verification
    - Section "2k": Phase 27g - test_fw_load.c alignment with zouyonghao
-   - Section "2l": **Phase 28** - DMA memory access failure analysis (current)
+   - Section "2l": Phase 28 - DMA memory access failure analysis
+   - Section "2m": **Phase 28b** - Zouyonghao config additions test (current)
 2. **docs/ROADMAP.md** - Current status, blockers, and next steps
 3. **docs/MT6639_ANALYSIS.md** - Proves MT7927 is MT6639 variant, validates rings 15/16
 4. **docs/MT7996_COMPARISON.md** - Comparison analysis: why MT7927 is NOT an MT7996 variant
 5. **docs/REFERENCE_SOURCES.md** - Analysis of reference code origins and authoritative sources
-6. **DEVELOPMENT_LOG.md** - Complete chronological history (27 phases, Phase 27 = current)
+6. **DEVELOPMENT_LOG.md** - Complete chronological history (28+ phases, Phase 28b = current)
 7. **AGENTS.md** - Session bootstrap with current blocker details, hardware context, and what's been tried
 8. **README.md** - Project overview, build instructions, expected outputs
 

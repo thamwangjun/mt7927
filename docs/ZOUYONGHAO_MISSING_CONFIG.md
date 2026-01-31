@@ -2,6 +2,8 @@
 
 This document analyzes the zouyonghao MT7927 driver and identifies configuration steps that may be missing from our test_fw_load.c. These steps could explain why DMA transfers fail with MEM_ERR=1 and DIDX never advances.
 
+> **UPDATE (2026-01-31 - Phase 28b)**: All HIGH priority configurations have been implemented and tested. **The DMA memory access failure persists.** These configurations address interrupt routing and MCU communication paths, but NOT the fundamental issue: WFDMA cannot access host memory. See `ZOUYONGHAO_ANALYSIS.md` section "2m" for complete test results and analysis.
+
 ## Executive Summary
 
 Our test_fw_load.c has most of the core initialization but is **missing several MT7927-specific configuration steps** that zouyonghao performs:

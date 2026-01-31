@@ -2527,3 +2527,204 @@ The blocker is at a **lower level**: the WFDMA engine cannot access host memory 
 1. WFDMA bus/AXI configuration registers
 2. PCIe address translation for DMA
 3. IOMMU interaction with MediaTek WiFi DMA
+
+---
+
+### 2m. Phase 28b - Zouyonghao Config Additions Test (2026-01-31)
+
+**Date**: 2026-01-31
+**Status**: **ZOUYONGHAO CONFIG ADDITIONS APPLIED - DMA STILL FAILS**
+
+#### Configuration Additions Applied
+
+Based on `docs/ZOUYONGHAO_MISSING_CONFIG.md` analysis, two HIGH priority missing configuration steps from zouyonghao were added to `test_fw_load.c`:
+
+| Configuration | Register | Value | Status |
+|---------------|----------|-------|--------|
+| **PCIe MAC Interrupt Routing** | `0x010074` | `0x08021000` | ✅ Applied (Phase 2a) |
+| **PCIE2AP Remap Timing Fix** | `0x0d1034` | `0x18051803` | ✅ Moved to after DMA init (Phase 3.5) |
+
+Additional MEDIUM priority configurations already in test_fw_load.c:
+- MSI Interrupt Configuration (MSI_INT_CFG0-3)
+- GLO_CFG_EXT1 full value (0x8C800404)
+- GLO_CFG_EXT2 (0x44)
+
+#### Test Results After Additions
+
+**All new configurations verified:**
+```
+=== Phase 2a: PCIe MAC Interrupt Routing ===
+  PCIE_MAC_INT_CONFIG = 0x08021000 (expected 0x08021000) OK
+
+=== Phase 3.5: PCIE2AP Remap (AFTER DMA init!) ===
+  PCIE2AP_REMAP_WF_1_BA = 0x18051803 (expected 0x18051803) OK
+```
+
+**Result: DMA STILL FAILS**
+
+The same MEM_ERR=1 and DIDX=0 pattern persists:
+```
+MCU_INT_STA(0xd4110)=0x00000001 (MEM_ERR=1 DMA_ERR=0)
+Ring 16 DMA timeout (CIDX=1, DIDX=0)
+Ring 16 DMA timeout (CIDX=2, DIDX=0)
+...
+```
+
+#### Complete Initialization Sequence (Current)
+
+```
+Phase 0a: CB_INFRA PCIe Remap
+  ├── PCIE_REMAP_WF = 0x74037001 ✓
+  └── PCIE_REMAP_WF_BT = 0x70007000 ✓
+
+Phase 0b: Power Control Handshake
+  ├── fw_pmctrl → drv_pmctrl
+  └── Initial drv_pmctrl timeout (normal before reset)
+
+Phase 0c: WiFi/BT Subsystem Reset
+  ├── GPIO mode registers set
+  ├── BT subsystem reset
+  └── WF subsystem reset (double pass)
+
+Phase 1: CONN_INFRA Initialization
+  ├── CONN_INFRA wakeup
+  ├── Version poll: 0x03010002 ✓
+  ├── Crypto MCU ownership set
+  └── MCU IDLE reached: 0x00001d1e ✓
+
+Phase 2: Host Ownership Claim
+  └── LPCTL = 0x00000000 ✓
+
+Phase 2a: PCIe MAC Interrupt Routing (NEW!)
+  └── PCIE_MAC_INT_CONFIG = 0x08021000 ✓
+
+Phase 2.5: WFDMA Extension Configuration
+  ├── MSI_INT_CFG0-3 set
+  ├── GLO_CFG_EXT1 = 0x8c800404
+  ├── GLO_CFG_EXT2 = 0x00000044
+  ├── HIF_PERF_MAVG_DIV set
+  ├── RX thresholds set
+  └── Delay interrupts configured
+
+Phase 3: DMA Ring Setup
+  ├── GLO_CFG cleared
+  ├── Unused rings 0-14 initialized
+  ├── Ring 15 (MCU_WM): BASE=0xffff0000, CNT=128 ✓
+  ├── Ring 16 (FWDL): BASE=0xfffef000, CNT=128 ✓
+  ├── EXT_CTRL prefetch configured
+  ├── GLO_CFG = 0x5030b870 (CLK_GAT_DIS, no DMA_EN)
+  ├── GLO_CFG = 0x5030b871 (TX_DMA_EN added)
+  └── MT7927-specific: INT_RX_PRI, INT_TX_PRI, WFDMA_DUMMY_CR
+
+Phase 3.5: PCIE2AP Remap (TIMING FIX - now after DMA init!)
+  └── PCIE2AP_REMAP_WF_1_BA = 0x18051803 ✓
+
+Phase 5: Firmware Loading (Polling Mode)
+  └── MEM_ERR=1 on first DMA attempt ✗
+```
+
+#### Final Diagnostic State
+
+```
+WFDMA GLO_CFG: 0x5030b873
+WFDMA INT_STA: 0x02000000 (tx15=1 tx16=0)
+Ring 15 (MCU_WM) CIDX/DIDX: 7/0, BASE=0xffff0000
+Ring 16 (FWDL) CIDX/DIDX: 60/0, BASE=0xfffef000
+
+[Phase 27d Diagnostics]
+  WPDMA2HOST_ERR_INT_STA(0xd41E8): 0x00000001
+    TX_TIMEOUT=1 RX_TIMEOUT=0 TX_DMA_ERR=0 RX_DMA_ERR=0
+  MCU_INT_STA(0xd4110): 0x00010001 (MEM_ERR=1 DMA_ERR=0)
+  PDA_CONFG(0x280C): 0xc0000002 (FWDL_EN=1 LS_QSEL=1)
+  PDA_TAR_ADDR(0x2800): 0x00000000    ← Commands NOT processed
+  PDA_TAR_LEN(0x2804): 0x000fffff     ← Default value
+  PDA_DWLD_STATE(0x2808): 0x0fffe01a
+    PDA_FINISH=0 PDA_BUSY=1 WFDMA_FINISH=0 WFDMA_BUSY=1
+    WFDMA_OVERFLOW=1 PDA_OVERFLOW=0
+  MCU_DMA0_GLO_CFG(0x2208): 0x1070387d (RX_DMA_EN=1)
+```
+
+#### Analysis: Why Zouyonghao Configs Didn't Help
+
+The zouyonghao configurations address **interrupt routing** and **MCU communication paths**:
+
+1. **PCIe MAC Interrupt Routing (0x08021000)** - Configures how DMA completion interrupts route through PCIe MAC. This matters for **interrupt delivery**, not for DMA memory access.
+
+2. **PCIE2AP Remap Timing** - Controls address translation for **MCU-to-host** communication. The DMA is **host-initiated** (WFDMA fetches from host memory), so this is in the opposite direction.
+
+**Neither configuration addresses the fundamental issue**: WFDMA cannot access host memory at all. The MEM_ERR occurs when WFDMA tries to read the first descriptor from address 0xfffef000.
+
+#### Root Cause Refined
+
+The issue is specifically **WFDMA→Host memory access path**, NOT:
+- ✗ Interrupt routing (would affect completion signaling, not memory access)
+- ✗ PCIE2AP remap (affects MCU→Host direction)
+- ✗ Ring configuration (registers accept writes correctly)
+- ✗ Descriptor format (verified correct in Phase 27c)
+- ✗ DMA enable bits (GLO_CFG shows TX_DMA_EN set)
+
+**The WFDMA engine cannot resolve host memory addresses via PCIe.**
+
+#### Possible Remaining Causes
+
+1. **IOMMU Translation Failure**
+   - System may have IOMMU (Intel VT-d/AMD-Vi) enabled
+   - Device may not be properly assigned to IOMMU domain
+   - DMA addresses (0xfffef000) may not translate to valid physical memory
+
+   **Check**: `dmesg | grep -i iommu` and `find /sys/kernel/iommu_groups -name "0000:01:00.0"`
+
+2. **PCIe Bus Master Not Enabled**
+   - PCI core should enable this, but may need explicit configuration
+   - Device can't initiate memory transactions without bus master bit
+
+3. **AP2PCIE (Host→Device) Address Window Configuration**
+   - Zouyonghao sets PCIE2AP for device→host
+   - May need separate configuration for host→device (WFDMA reading host memory)
+
+4. **WFDMA AXI Bus Configuration**
+   - WFDMA uses AXI internally to reach PCIe
+   - May need specific AXI master configuration for PCIe memory reads
+
+5. **Platform-Specific PCIe Configuration**
+   - Some platforms require explicit memory aperture setup
+   - MediaTek vendor code may have platform hooks we're missing
+
+#### Recommended Investigation
+
+1. **Check IOMMU status**:
+   ```bash
+   dmesg | grep -i iommu
+   cat /proc/cmdline | grep iommu
+   find /sys/kernel/iommu_groups -name "0000:01:00.0" 2>/dev/null
+   ```
+
+2. **Verify PCIe bus master**:
+   ```bash
+   lspci -vvs 01:00.0 | grep "Bus"
+   # Should show "BusMaster+"
+   ```
+
+3. **Search for AP2PCIE/WFDMA address config** in reference sources:
+   - Look for registers that configure WFDMA memory access path
+   - Check if there's an address window/aperture setup
+
+4. **Try disabling IOMMU** (if enabled):
+   - Boot with `intel_iommu=off` or `amd_iommu=off`
+   - Test if DMA works without IOMMU translation
+
+5. **Compare with working MT7925 DMA init**:
+   - MT7925 has similar architecture and works on Linux
+   - Check for any additional DMA setup steps
+
+---
+
+### Conclusion (Phase 28b)
+
+**All zouyonghao configuration steps have been implemented**, including the HIGH priority items from the missing config analysis. The initialization sequence matches zouyonghao's approach.
+
+**The DMA memory access failure persists.** This is a fundamental issue with WFDMA accessing host memory, not a configuration ordering or missing register problem. The next investigation should focus on:
+
+1. **IOMMU/DMA address translation**
+2. **PCIe bus master and memory aperture configuration**
+3. **WFDMA AXI bus configuration for PCIe memory access**

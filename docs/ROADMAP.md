@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Status as of 2026-01-31**: **PHASE 27g - ALL MEMORY REFERENCES VERIFIED**
+**Status as of 2026-01-31**: **PHASE 28b - DMA MEMORY ACCESS FAILURE**
 
 **Progress**:
 - ✅ Root cause found (Phase 17): ROM doesn't support mailbox protocol
@@ -18,21 +18,34 @@
 - ✅ **FIRMWARE STRUCTURES FIXED (Phase 27f)**: All structures match reference!
 - ✅ **ALL REGISTER VALUES VERIFIED (Phase 27f)**: Checked against mt6639.c, mt7927_regs.h
 - ✅ **ALL MEMORY REFERENCES VERIFIED (Phase 27g)**: 40+ addresses verified against sources
+- ✅ **Phase 28 - DMA blocker identified**: MEM_ERR=1, DIDX never advances
+- ✅ **Phase 28b - Zouyonghao config additions**: PCIe MAC int routing + PCIE2AP timing fix applied
+- ❌ **DMA STILL FAILS** - WFDMA cannot access host memory
 
-**Phase 27g Verification Complete** (2026-01-31):
+**Phase 28b BLOCKER** (2026-01-31):
 
-All 40+ memory references in `tests/05_dma_impl/test_fw_load.c` verified:
-- WFDMA0 registers (20 addresses) ✅
-- CB_INFRA registers (5 addresses) ✅
-- CONN_INFRA registers (8 addresses) ✅
-- WFDMA extension registers (12 addresses) ✅
-- L1 remap registers (5 addresses) ✅
-- MCU DMA0/PDA registers (6 addresses) ✅
-- GPIO registers (2 addresses) ✅
+Despite implementing ALL zouyonghao configuration steps, DMA transfers fail with:
+- `MEM_ERR=1` from first DMA attempt
+- `DIDX=0` (never advances, device consumes nothing)
+- `WFDMA_OVERFLOW=1` (ring overflowed because nothing processed)
 
-**Next Step**: Load test module and verify patch section parsing shows valid addr/len/offs values.
+**Verified configurations**:
+- PCIe MAC Interrupt Routing: `0x010074` = `0x08021000` ✅
+- PCIE2AP Remap (after DMA init): `0x0d1034` = `0x18051803` ✅
+- All 40+ register addresses verified ✅
+- All firmware structures corrected ✅
+- Descriptor format verified (Phase 27c) ✅
 
-See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** sections "2i" and "2j" for complete verification tables.
+**Root cause**: WFDMA engine cannot access host memory addresses via PCIe. Not an interrupt routing or configuration ordering issue.
+
+**Next Steps**:
+1. Check IOMMU status (`dmesg | grep -i iommu`)
+2. Verify PCIe bus master enabled
+3. Search for AP2PCIE/WFDMA AXI configuration in reference sources
+4. Try booting with `intel_iommu=off` or `amd_iommu=off`
+5. Compare with working MT7925 DMA initialization
+
+See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** section "2m" for complete Phase 28b analysis.
 
 ## Phase 1: Get It Working 🎯 CURRENT PHASE
 
@@ -54,7 +67,6 @@ See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** sections "2i" and "2j" 
 ### In Progress 🔧
 
 - [x] ~~**Fix ring configuration**~~ - DONE (Phase 27)
-  - ~~Ring registers (BASE, EXT_CTRL) not accepting writes~~
   - ✅ GLO_CFG timing fix applied: Clear GLO_CFG → configure rings → set CLK_GAT_DIS
   - ✅ Ring BASE and EXT_CTRL now show correct DMA addresses
 
@@ -67,22 +79,31 @@ See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** sections "2i" and "2j" 
   - ✅ Fix implemented: Only enable TX_DMA_EN during firmware loading
 
 - [x] ~~**Fix TXD control word bit layout**~~ - VERIFIED (Phase 27c)
-  - ✅ Root cause: SDLen0 was in bits 0-13 (should be 16-29), LastSec0 in bit 14 (should be bit 30)
-  - ✅ Hardware interpreted SDLen1=76 at SDPtr1=0x0 → DMA accessed address 0
   - ✅ Fix implemented and **verified working**: `ctrl=0x404c0000` (correct format)
   - ✅ **No more AMD-Vi IO_PAGE_FAULT errors!**
 
 - [x] ~~**Investigate global DMA path issue**~~ - ROOT CAUSE FOUND (Phase 27d)
   - **Finding**: WFDMA_OVERFLOW=1 proves data IS reaching MCU's WFDMA
   - **Finding**: PDA_TAR_ADDR=0 proves MCU didn't process INIT_DOWNLOAD commands
-  - **Root Cause**: MCU ROM is IDLE but not actively polling DMA rings
   - See ZOUYONGHAO_ANALYSIS.md section "2f" for diagnostics
 
-- [ ] **Test HOST2MCU software interrupt fix** ← Current task (Phase 27e)
+- [x] ~~**HOST2MCU software interrupt fix**~~ - IMPLEMENTED (Phase 27e)
   - ✅ Added `HOST2MCU_SW_INT_SET` doorbell writes after CIDX updates
   - ✅ Bug fixed: Use HOST_DMA0 offset (0xd4108), not MCU_DMA0 (0x2108)
-  - 🔧 Awaiting test to verify DIDX increments
-  - See ZOUYONGHAO_ANALYSIS.md section "2g" for implementation
+
+- [x] ~~**Firmware structure fixes**~~ - DONE (Phase 27f)
+  - ✅ All structures match reference implementations
+
+- [x] ~~**Zouyonghao config additions**~~ - DONE (Phase 28b)
+  - ✅ PCIe MAC Interrupt Routing (0x010074 = 0x08021000)
+  - ✅ PCIE2AP Remap timing fix (moved after DMA init)
+  - ❌ DMA still fails - these don't address memory access path
+
+- [ ] **Fix WFDMA memory access** ← Current blocker (Phase 28b)
+  - ❌ WFDMA cannot access host memory (MEM_ERR=1)
+  - ❌ DIDX never advances (device consumes nothing)
+  - 🔧 Investigate: IOMMU, PCIe bus master, AXI config
+  - See ZOUYONGHAO_ANALYSIS.md section "2m" for analysis
 
 ### Blocked (Pending Implementation) ⏸️
 
@@ -254,17 +275,21 @@ See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) section "2a. Critical GLO_C
 
 ### What's Not Working ❌
 
-- **DMA descriptor processing** - DIDX stuck at 0 (Phase 27e doorbell fix pending test)
-- Firmware transfer (blocked on DMA processing verification)
+- **DMA memory access** - WFDMA cannot access host memory (MEM_ERR=1)
+- **DMA descriptor processing** - DIDX stuck at 0 (device consumes nothing)
+- Firmware transfer (blocked on DMA memory access)
 - Network interface creation (requires successful initialization)
 
-### Fixed in Phase 27/27b/27c/27d/27e ✅
+### Fixed in Phase 27/27b/27c/27d/27e/27f/28b ✅
 
 - ~~Ring register writes~~ - GLO_CFG timing fixed (Phase 27)
 - ~~Unused TX rings causing page faults~~ - All rings initialized (Phase 27)
 - ~~RX_DMA_EN causing page faults~~ - Only TX_DMA_EN during FWDL (Phase 27b)
 - ~~TXD control word bit layout~~ - Correct bit positions applied (Phase 27c)
-- ~~MCU not consuming DMA data~~ - HOST2MCU doorbell implemented (Phase 27e)
+- ~~HOST2MCU doorbell~~ - Implemented with correct offset (Phase 27e)
+- ~~Firmware structures~~ - All structures match reference (Phase 27f)
+- ~~Register values~~ - All 40+ addresses verified (Phase 27g)
+- ~~Zouyonghao config additions~~ - PCIe MAC int routing, PCIE2AP timing (Phase 28b)
 
 ### Root Cause Analysis
 
@@ -284,12 +309,19 @@ See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) section "2a. Critical GLO_C
 - ✅ Fix IMPLEMENTED: Corrected bit positions to match MediaTek TXD_STRUCT
 - ✅ **VERIFIED**: No more AMD-Vi IO_PAGE_FAULT errors!
 
-**Phase 27d/27e (CURRENT)**: MCU not consuming DMA data
+**Phase 27d/27e (RESOLVED)**: HOST2MCU doorbell
 - ✅ Diagnostics showed WFDMA_OVERFLOW=1 (data arrives) but PDA_TAR_ADDR=0 (not processed)
-- ✅ Root cause: MCU ROM is IDLE but not polling DMA rings - needs doorbell interrupt
-- ✅ Fix IMPLEMENTED: Added HOST2MCU_SW_INT_SET writes after CIDX updates
-- ⚠️ Bug FIXED: Use HOST_DMA0 offset (0xd4108), NOT MCU_DMA0 (0x2108)
-- 🔧 Pending TEST: Verify DIDX increments and firmware loads
+- ✅ ROOT CAUSE: MCU ROM is IDLE but not polling DMA rings - needs doorbell interrupt
+- ✅ FIX IMPLEMENTED: Added HOST2MCU_SW_INT_SET writes after CIDX updates
+- ✅ Bug FIXED: Use HOST_DMA0 offset (0xd4108), NOT MCU_DMA0 (0x2108)
+
+**Phase 28/28b (CURRENT)**: DMA memory access failure
+- ❌ MEM_ERR=1 from first DMA attempt - WFDMA cannot read host memory
+- ❌ DIDX stays at 0 - device never processes any descriptors
+- ❌ WFDMA_OVERFLOW=1 - ring overflows because nothing consumed
+- ✅ Zouyonghao config additions applied - didn't fix the issue
+- 🔧 ROOT CAUSE: WFDMA-to-host memory access path not working
+- 🔧 HYPOTHESIS: IOMMU, PCIe bus master, or AXI bus configuration issue
 
 ## Testing and Validation
 
