@@ -8,42 +8,38 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 
 **Official Product Name**: MT7927 802.11be 320MHz 2x2 PCIe Wireless Network Adapter [Filogic 380]
 
-**Current Status**: **PHASE 28b - DMA MEMORY ACCESS FAILURE (PERSISTS)**:
+**Current Status**: **PHASE 28d - DMA PATH INVESTIGATION**:
 - ✅ **All initialization phases complete** - MCU IDLE, rings configured, DMA enabled
 - ✅ **Firmware loading protocol correct** - Polling mode, no mailbox waits
-- ✅ **Zouyonghao config additions applied** - PCIe MAC int routing, PCIE2AP timing fix
 - ❌ **DMA transfers STILL failing** - DIDX never advances (stays at 0)
-- ❌ **MEM_ERR=1** - Memory access error on first DMA attempt
-- ❌ **WFDMA_OVERFLOW=1** - Ring overflowed, nothing consumed
+- ❌ **MEM_ERR=1** - Memory access error persists
+- ❌ **NO PAGE FAULTS** - Even with old (buggy) descriptor format, no IOMMU faults
+- 🔬 **Investigation ongoing** - Something prevents DMA from even being attempted
 
-**Phase 28b BLOCKER** (2026-01-31):
+**Phase 28d Critical Finding** (2026-01-31):
 
-The WFDMA engine **cannot access host memory** to fetch descriptors. Applied zouyonghao config additions but issue persists:
-- `PCIE_MAC_INT_CONFIG (0x010074) = 0x08021000` ✅ Applied
-- `PCIE2AP_REMAP (after DMA init) = 0x18051803` ✅ Applied
-- `MCU_INT_STA(0xd4110) = 0x00000001` (MEM_ERR=1) ❌ Still failing
+**The Phase 27 page faults were a BUG, not proof of working DMA!**
 
-**Evidence**: These configs address interrupt routing and MCU communication paths, NOT WFDMA→host memory access path.
+The old descriptor format put length in bits 0-13 (SDLen1) instead of bits 16-29 (SDLen0). This made hardware read from `buf1` (address 0x0) instead of `buf0` (valid address). The page faults were IOMMU catching this incorrect access.
 
-**What's working**:
-- ✅ MCU reaches IDLE state (0x1D1E)
-- ✅ CB_INFRA and WFDMA global registers work correctly
-- ✅ Ring configuration accepted (BASE, CNT, EXT_CTRL all correct)
-- ✅ GLO_CFG = 0x5030b871 (TX_DMA_EN set)
-- ✅ Descriptors correctly formatted
-- ✅ All 40+ register addresses verified against reference
-- ✅ PCIe MAC interrupt routing configured
-- ✅ PCIE2AP remap timing corrected
+**Key test results:**
 
-**Likely cause**: IOMMU blocking DMA, or missing WFDMA AXI/bus configuration for PCIe memory access.
+| Test | Descriptor Format | Full Init | Page Faults |
+|------|-------------------|-----------|-------------|
+| test_dma_path.ko | New (correct) | No | ❌ None |
+| test_dma_path.ko | Old (buggy) | No | ❌ None |
+| test_fw_load.ko | Old (buggy) | Yes | **Pending** |
+
+**The mystery**: If the old format caused page faults in Phase 27, reverting to it should cause page faults now. But it doesn't. This suggests WFDMA isn't even attempting to read from memory, regardless of descriptor format.
+
+**Bus Master discovery**: Test modules disable Bus Master on exit (due to `-ENODEV` return triggering managed cleanup). But the test runs WITH Bus Master enabled during probe, so this isn't the cause.
 
 **Next Steps**:
-1. Check IOMMU status: `dmesg | grep -i iommu`
-2. Verify PCIe bus master enabled: `lspci -vvs 01:00.0 | grep Bus`
-3. Search for AP2PCIE/WFDMA AXI configuration in reference sources
-4. Try booting with `intel_iommu=off` or `amd_iommu=off`
+1. **Run test_fw_load.ko with old format** - test if full init + old format causes page faults
+2. If no page faults: bisect changes since Phase 27 to find what broke DMA initiation
+3. Check if MCU is in IDLE state before DMA tests
 
-See **docs/ZOUYONGHAO_ANALYSIS.md** section "2m" for complete Phase 28b analysis.
+See **docs/ZOUYONGHAO_ANALYSIS.md** sections "2n" and "2o" for complete investigation.
 
 ## Critical Files to Review First
 
@@ -60,7 +56,9 @@ See **docs/ZOUYONGHAO_ANALYSIS.md** section "2m" for complete Phase 28b analysis
    - Section "2j": Phase 27g - Comprehensive memory reference verification
    - Section "2k": Phase 27g - test_fw_load.c alignment with zouyonghao
    - Section "2l": Phase 28 - DMA memory access failure analysis
-   - Section "2m": **Phase 28b** - Zouyonghao config additions test (current)
+   - Section "2m": Phase 28b - Zouyonghao config additions test
+   - Section "2n": Phase 28c - DMA path verification insight
+   - Section "2o": **Phase 28d** - DMA path investigation results (current)
 2. **docs/ROADMAP.md** - Current status, blockers, and next steps
 3. **docs/MT6639_ANALYSIS.md** - Proves MT7927 is MT6639 variant, validates rings 15/16
 4. **docs/MT7996_COMPARISON.md** - Comparison analysis: why MT7927 is NOT an MT7996 variant

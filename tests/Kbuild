@@ -47,3 +47,4 @@ obj-m += 05_dma_impl/test_power_ctrl.o
 obj-m += 05_dma_impl/test_wfsys_reset.o
 obj-m += 05_dma_impl/test_dma_queues.o
 obj-m += 05_dma_impl/test_fw_load.o
+obj-m += 05_dma_impl/test_dma_path.o

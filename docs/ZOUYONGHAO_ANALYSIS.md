@@ -2728,3 +2728,196 @@ The issue is specifically **WFDMA→Host memory access path**, NOT:
 1. **IOMMU/DMA address translation**
 2. **PCIe bus master and memory aperture configuration**
 3. **WFDMA AXI bus configuration for PCIe memory access**
+
+---
+
+## 2n. Phase 28c - DMA Path Verification Insight (2026-01-31)
+
+### Critical Insight: Page Faults Proved DMA Was Working
+
+**Key observation**: In Phase 27, we had AMD-Vi `IO_PAGE_FAULT` errors when DMA tried to access address 0x0 (from uninitialized rings/descriptors). These page faults were actually **proof that DMA was functional**:
+
+1. WFDMA successfully initiated DMA reads
+2. DMA requests traversed PCIe to the host
+3. Host IOMMU received the requests
+4. IOMMU rejected them because address 0x0 wasn't mapped
+
+**After Phase 27c fixes** (correct descriptor format, initialized rings):
+- No more AMD-Vi page faults
+- But also no DMA progress (DIDX=0)
+- MEM_ERR=1 from device's internal MCU_INT_STA register
+
+**The question**: Did our fixes break the DMA path itself, or is DMA now going to valid addresses but blocked elsewhere?
+
+| Phase | IOMMU Page Faults | MEM_ERR | Interpretation |
+|-------|-------------------|---------|----------------|
+| 27 (before fixes) | Yes (AMD-Vi at addr 0x0) | Unknown | DMA reaching host, bad addresses |
+| 28b (after fixes) | None visible | 1 | Either valid addresses OR DMA not reaching host |
+
+### Diagnostic Test: test_dma_path.ko
+
+Created a diagnostic test module to verify if DMA requests still reach the host IOMMU:
+
+**Location**: `tests/05_dma_impl/test_dma_path.c`
+
+**Purpose**: Intentionally set a ring's BASE to 0 and kick DMA. If DMA path works, we'll get an IOMMU page fault. If no fault appears, DMA isn't reaching the host.
+
+**How to run**:
+```bash
+# Unload any existing modules
+sudo rmmod test_fw_load 2>/dev/null
+sudo rmmod mt7927 2>/dev/null
+
+# Load the DMA path test
+sudo insmod tests/05_dma_impl/test_dma_path.ko
+
+# Check for IOMMU page faults
+sudo dmesg | grep -i 'page.fault\|amd-vi\|dmar' | tail -20
+
+# Check module output
+sudo dmesg | tail -60
+```
+
+**Expected results**:
+
+| Result | Meaning | Next Step |
+|--------|---------|-----------|
+| `AMD-Vi: Event logged [IO_PAGE_FAULT]` at address 0x0 | DMA path WORKS | Problem is MCU-side processing, not DMA path |
+| No page fault appears | DMA path BROKEN | Our fixes broke something, or initialization missing |
+
+### Why This Matters
+
+If the test shows page faults:
+- DMA requests ARE reaching the host IOMMU
+- The `MEM_ERR=1` is from a different issue (MCU internal, not PCIe DMA)
+- Focus should shift to MCU-side processing, PDA configuration, or ROM bootloader state
+
+If the test shows NO page faults:
+- Something in our Phase 27 fixes broke the DMA initiation
+- Need to bisect the changes to find what broke
+- Possible causes: GLO_CFG timing, ring initialization order, etc.
+
+### Test Status
+
+- [x] Test module created (`test_dma_path.c`)
+- [x] Added to build system (Kbuild)
+- [x] Module builds successfully
+- [x] Test execution completed - **NO PAGE FAULTS**
+
+---
+
+## 2o. Phase 28d - DMA Path Investigation Results (2026-01-31)
+
+### Test Results: No Page Faults With Either Descriptor Format
+
+**Critical finding**: We ran `test_dma_path.ko` and also reverted to the OLD (buggy) descriptor format, but **no page faults occurred in either case**.
+
+| Test | Descriptor Format | Ring | Page Faults | MEM_ERR |
+|------|-------------------|------|-------------|---------|
+| test_dma_path.ko | New (correct) | Ring 0 | ❌ None | 1 |
+| test_dma_path.ko | New (correct) | Ring 16 | ❌ None | 1 |
+| test_dma_path.ko | Old (buggy) | Ring 16 | ❌ None | 1 |
+| test_fw_load.ko | Old (buggy) | Ring 15/16 | **Testing** | - |
+
+### Key Discovery: Bus Master Disabled After Module Load
+
+During investigation, we discovered that **Bus Master gets disabled** after our test modules load:
+
+```
+Before insmod: BusMaster+
+After insmod:  BusMaster-
+```
+
+**Root cause**: Test modules return `-ENODEV` from probe() to avoid binding. This triggers managed resource cleanup (`pcim_*` functions), which undoes `pci_set_master()`.
+
+**Important**: The test DOES run with Bus Master enabled during probe(). The disable happens AFTER the test completes. So Bus Master is NOT the cause of missing page faults.
+
+### Revised Hypothesis: Page Faults Were a Bug, Not Proof of Working DMA
+
+Looking at the git diff from Phase 26 to current, the Phase 27c fix changed:
+
+**OLD (buggy) format - caused page faults in Phase 27:**
+```c
+#define MT_DMA_CTL_SD_LEN0      GENMASK(13, 0)   // bits 0-13 (WRONG!)
+#define MT_DMA_CTL_LAST_SEC0    BIT(14)          // bit 14 (WRONG!)
+
+desc->buf1 = cpu_to_le32(upper_32_bits(dev->dma_buf_phys));
+desc->info = cpu_to_le32(0);
+```
+
+**NEW (corrected) format - no page faults:**
+```c
+#define MT_DMA_CTL_SD_LEN0      GENMASK(29, 16)  // bits 16-29 (CORRECT)
+#define MT_DMA_CTL_LAST_SEC0    BIT(30)          // bit 30 (CORRECT)
+
+desc->buf1 = cpu_to_le32(0);
+desc->info = cpu_to_le32(upper_32_bits(dev->dma_buf_phys) & 0xFFFF);
+```
+
+**The comment in test_fw_load.c explains it:**
+> Previous bug: We put length in bits 0-13 (SDLen1) which made hardware think buffer 1 (SDPtr1=0x0) had the data, causing page fault at addr 0!
+
+So the Phase 27 page faults were a **SYMPTOM OF A BUG**, not proof that DMA was working correctly:
+1. Old format put length in wrong bits (SDLen1 instead of SDLen0)
+2. Hardware interpreted buf1 (which was 0 or upper bits) as data pointer
+3. DMA tried to read from address 0x0 → IOMMU page fault
+
+### But Why No Page Faults Now Even With Old Format?
+
+**This is the mystery.** If the old format caused page faults in Phase 27, it should cause page faults now when we revert to it. But it doesn't.
+
+**Possible explanations:**
+
+1. **Missing initialization**: Our `test_dma_path.ko` has minimal initialization. Phase 27 tests used `test_fw_load.ko` with full init (LPCTL, WFSYS reset, MCU IDLE wait).
+
+2. **Device state**: The chip may be in a different state now due to previous test runs. The MCU might not be in IDLE state.
+
+3. **Something else changed**: Besides descriptor format, other changes may have affected DMA initiation.
+
+4. **WFDMA not processing rings at all**: The WFDMA engine might not even be attempting to read from the ring BASE address, regardless of format.
+
+### MCU State Check
+
+Added MCU state check to `test_dma_path.ko`. Output shows:
+```
+MCU state: 0x???????? (IDLE=0x1D1E)
+```
+
+If MCU is NOT in IDLE state, DMA may not work regardless of descriptor format.
+
+### Current Test: test_fw_load.ko with Old Format
+
+We've modified `test_fw_load.c` to use the OLD (buggy) descriptor format:
+- SD_LEN0 at bits 0-13 (wrong)
+- LAST_SEC0 at bit 14 (wrong)
+- buf1 = upper bits, info = 0 (old format)
+
+**This test will determine:**
+- If full init + old format = page faults → confirms Phase 27 behavior was from buggy format
+- If full init + old format = no page faults → something else changed that prevents DMA entirely
+
+### Files Modified for Testing
+
+| File | Change | Purpose |
+|------|--------|---------|
+| `tests/05_dma_impl/test_dma_path.c` | Added MCU state check | Diagnose MCU initialization |
+| `tests/05_dma_impl/test_dma_path.c` | Reverted to old descriptor format | Test if old format causes faults |
+| `tests/05_dma_impl/test_fw_load.c` | Reverted to old descriptor format | Test full init + old format |
+
+### Next Steps
+
+1. **Run test_fw_load.ko with old format** - see if page faults return with full initialization
+2. **If no page faults**: bisect changes since Phase 27 to find what broke DMA initiation
+3. **If page faults**: confirms the descriptor format was the only issue, need to investigate why new format doesn't work
+4. **Check IOMMU configuration**: verify device is properly associated with IOMMU domain
+
+### Investigation Timeline
+
+| Time | Action | Result |
+|------|--------|--------|
+| Start | Created test_dma_path.ko | Minimal DMA path test |
+| +1 | Tested with Ring 0 | No page faults |
+| +2 | Changed to Ring 16 | No page faults |
+| +3 | Discovered Bus Master disable issue | Not the root cause |
+| +4 | Reverted test_dma_path.ko to old format | No page faults |
+| +5 | Reverted test_fw_load.c to old format | **Pending test** |

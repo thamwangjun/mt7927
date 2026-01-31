@@ -124,34 +124,42 @@ Diagnostic run revealed this is a **global DMA path issue**, not Ring 16-specifi
 - PDA_TAR_ADDR/PDA_TAR_LEN may not be configured
 - ROM bootloader may need explicit download mode activation
 
-### Next Step 🔧 - ENHANCED DIAGNOSTICS ADDED
+### Next Step 🔧 - PHASE 28d: INVESTIGATE WHY DMA ISN'T BEING ATTEMPTED
 
-**Additional PDA registers now checked in test_fw_load.c:**
+**Critical Finding (Phase 28d)**: The Phase 27 page faults were a **BUG**, not proof of working DMA!
 
-✅ Implemented diagnostics:
-1. `0xd41E8` - WPDMA2HOST_ERR_INT_STA (TX/RX timeout errors)
-2. `0xd4110` - MCU_INT_STA (memory range errors, DMA errors)
-3. `0x280C` - PDA_CONFG (PDA_FWDL_EN, LS_QSEL_EN)
-4. `0x2800` - **PDA_TAR_ADDR** (target address - should be non-zero if MCU processed commands)
-5. `0x2804` - **PDA_TAR_LEN** (target length)
-6. `0x2808` - **PDA_DWLD_STATE** (BUSY/FINISH/OVERFLOW flags)
-7. `0x2208` - **MCU_DMA0_GLO_CFG** (RX_DMA_EN status)
-8. Ring 15 vs Ring 16 comparison (CNT, CIDX, DIDX, EXT_CTRL)
+The old descriptor format put length in wrong bits (SDLen1 vs SDLen0), causing hardware to read from `buf1` (address 0x0) instead of `buf0`. The page faults were IOMMU catching this incorrect access.
 
-**To run the enhanced diagnostic test:**
+**Test Results (2026-01-31):**
+| Test | Descriptor Format | Full Init | Page Faults |
+|------|-------------------|-----------|-------------|
+| test_dma_path.ko | New (correct) | No | ❌ None |
+| test_dma_path.ko | Old (buggy) | No | ❌ None |
+| test_fw_load.ko | Old (buggy) | Yes | **Pending** |
+
+**The mystery**: Reverting to old format should cause page faults, but doesn't. WFDMA isn't even attempting memory access.
+
+**Bus Master**: Test modules disable on exit (managed cleanup), but tests run WITH Bus Master enabled.
+
+**Current test**: `test_fw_load.ko` modified with old descriptor format:
 ```bash
-make clean && make tests
-sudo rmmod test_fw_load 2>/dev/null
+# Reset device first
+DEVICE=$(lspci -nn | grep 14c3:7927 | cut -d' ' -f1)
+echo 1 | sudo tee /sys/bus/pci/devices/0000:$DEVICE/remove
+sleep 2
+echo 1 | sudo tee /sys/bus/pci/rescan
+sleep 1
+
+# Run test with old (buggy) format
 sudo insmod tests/05_dma_impl/test_fw_load.ko
-sudo dmesg | tail -100
+sudo dmesg | tail -80
+dmesg | grep -i 'page.fault\|amd-vi\|dmar' | tail -10
 ```
 
-**Investigation paths**:
-1. If PDA_TAR_ADDR/LEN = 0 → MCU commands not being processed, need direct PDA init
-2. If MCU_DMA0_GLO_CFG has RX_DMA_EN = 0 → MCU RX DMA needs explicit enable
-3. If PDA_DWLD_STATE shows no activity → ROM not in download mode
+**If no page faults with test_fw_load.ko + old format:**
+Something else changed since Phase 27 that prevents DMA from being initiated at all.
 
-See **docs/ZOUYONGHAO_ANALYSIS.md** section "2f" for complete analysis.
+See **docs/ZOUYONGHAO_ANALYSIS.md** sections "2n" and "2o" for complete analysis.
 
 ---
 
@@ -178,7 +186,8 @@ mt7927/
 │       ├── test_power_ctrl.c          # Power management handshake test
 │       ├── test_wfsys_reset.c         # WiFi subsystem reset test
 │       ├── test_dma_queues.c          # DMA ring configuration test
-│       └── test_fw_load.c             # Complete firmware loading sequence
+│       ├── test_fw_load.c             # Complete firmware loading sequence
+│       └── test_dma_path.c            # DMA path verification (page fault test)
 │
 ├── diag/                              # Diagnostic modules
 │   ├── mt7927_diag.c                  # Safe read-only diagnostic
