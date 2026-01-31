@@ -395,6 +395,26 @@ Jump directly to:
 
 ### Analysis Documents
 
+#### [MT7996_COMPARISON.md](MT7996_COMPARISON.md)
+**Purpose:** Comparison analysis proving MT7927 is NOT an MT7996 variant
+
+**Contents:**
+- Device ID comparison (MT7927 not in MT7996 device table)
+- Hardware architecture comparison (WFDMA1, ring layout differences)
+- Firmware loading protocol comparison (mailbox vs polling)
+- Register map comparison (shared vs MT7927-specific)
+- CONNAC3X family tree diagram
+- Why MT7996 driver would fail on MT7927
+- Authoritative evidence from MediaTek BSP
+
+**When to Read:**
+- When questioning if MT7927 could be MT7996 variant
+- Understanding architectural differences between chip families
+- Validating why MT6639-based approach is correct
+- Comparing CONNAC3X family members
+
+---
+
 #### [REFERENCE_SOURCES.md](REFERENCE_SOURCES.md)
 **Purpose:** Analysis of reference source code origins and their relevance
 

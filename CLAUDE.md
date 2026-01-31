@@ -50,10 +50,11 @@ See **docs/ZOUYONGHAO_ANALYSIS.md** sections "2i" and "2j" for complete verifica
    - Section "2j": **Phase 27g** - Comprehensive memory reference verification (current)
 2. **docs/ROADMAP.md** - Current status, blockers, and next steps
 3. **docs/MT6639_ANALYSIS.md** - Proves MT7927 is MT6639 variant, validates rings 15/16
-4. **docs/REFERENCE_SOURCES.md** - Analysis of reference code origins and authoritative sources
-5. **DEVELOPMENT_LOG.md** - Complete chronological history (27 phases, Phase 27 = current)
-6. **AGENTS.md** - Session bootstrap with current blocker details, hardware context, and what's been tried
-7. **README.md** - Project overview, build instructions, expected outputs
+4. **docs/MT7996_COMPARISON.md** - Comparison analysis: why MT7927 is NOT an MT7996 variant
+5. **docs/REFERENCE_SOURCES.md** - Analysis of reference code origins and authoritative sources
+6. **DEVELOPMENT_LOG.md** - Complete chronological history (27 phases, Phase 27 = current)
+7. **AGENTS.md** - Session bootstrap with current blocker details, hardware context, and what's been tried
+8. **README.md** - Project overview, build instructions, expected outputs
 
 ## Build System
 
