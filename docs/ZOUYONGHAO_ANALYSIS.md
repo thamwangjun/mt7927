@@ -2808,16 +2808,54 @@ If the test shows NO page faults:
 
 ## 2o. Phase 28d - DMA Path Investigation Results (2026-01-31)
 
-### Test Results: No Page Faults With Either Descriptor Format
+### Final Test Results: Page Faults Confirm Correct Descriptor Format
 
-**Critical finding**: We ran `test_dma_path.ko` and also reverted to the OLD (buggy) descriptor format, but **no page faults occurred in either case**.
+| Test | Descriptor Format | Full Init | Page Faults | MEM_ERR |
+|------|-------------------|-----------|-------------|---------|
+| test_dma_path.ko | New (correct) | No | ❌ None | 1 |
+| test_dma_path.ko | Old (buggy) | No | ❌ None | 1 |
+| test_fw_load.ko | Old (buggy) | **Yes** | ✅ **YES at addr 0x0** | 1 |
+| test_fw_load.ko | New (correct) | Yes | ❌ None | 1 |
 
-| Test | Descriptor Format | Ring | Page Faults | MEM_ERR |
-|------|-------------------|------|-------------|---------|
-| test_dma_path.ko | New (correct) | Ring 0 | ❌ None | 1 |
-| test_dma_path.ko | New (correct) | Ring 16 | ❌ None | 1 |
-| test_dma_path.ko | Old (buggy) | Ring 16 | ❌ None | 1 |
-| test_fw_load.ko | Old (buggy) | Ring 15/16 | **Testing** | - |
+### Key Finding: Page Faults Validate Correct Format
+
+**Running test_fw_load.ko with OLD (buggy) format produced page faults:**
+```
+AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x000e address=0x0 flags=0x0000]
+AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x000e address=0x500 flags=0x0000]
+AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x000e address=0x700 flags=0x0000]
+...
+```
+
+**This proves:**
+1. ✅ **DMA IS working** - requests reach the host IOMMU
+2. ✅ **Bits 16-29 IS correct** for SD_LEN0 (hardware expects this format)
+3. ✅ **Old format (bits 0-13) is WRONG** - causes hardware to misread descriptor
+4. ❌ **But DIDX still never advances** - DMA reads correctly but doesn't complete
+
+### Why Old Format Causes Page Faults
+
+With **OLD format** (SD_LEN0 in bits 0-13):
+```c
+ctrl = 0x0000404c  // length 76 in bits 0-13, LAST_SEC0 at bit 14
+```
+
+Hardware interprets:
+- SD_LEN0 (bits 16-29) = **0** (wrong!)
+- Hardware sees length=0 for buffer 0
+- Falls through to buffer 1 (SDPtr1)
+- SDPtr1 = 0x00000000 (we set buf1=0 or upper bits which were 0)
+- DMA tries to read from **address 0x0** → IOMMU page fault!
+
+With **NEW format** (SD_LEN0 in bits 16-29):
+```c
+ctrl = 0x404C0000  // length 76 in bits 16-29, LAST_SEC0 at bit 30
+```
+
+Hardware interprets correctly:
+- SD_LEN0 (bits 16-29) = 76
+- Reads from buf0 address (correct)
+- No page fault because address is valid
 
 ### Key Discovery: Bus Master Disabled After Module Load
 
@@ -2885,39 +2923,48 @@ MCU state: 0x???????? (IDLE=0x1D1E)
 
 If MCU is NOT in IDLE state, DMA may not work regardless of descriptor format.
 
-### Current Test: test_fw_load.ko with Old Format
+### Why test_dma_path.ko Didn't Show Faults
 
-We've modified `test_fw_load.c` to use the OLD (buggy) descriptor format:
-- SD_LEN0 at bits 0-13 (wrong)
-- LAST_SEC0 at bit 14 (wrong)
-- buf1 = upper bits, info = 0 (old format)
+`test_dma_path.ko` has **minimal initialization** - no LPCTL handshake, no WFSYS reset, no MCU IDLE wait. The WFDMA engine wasn't properly initialized to process descriptors.
 
-**This test will determine:**
-- If full init + old format = page faults → confirms Phase 27 behavior was from buggy format
-- If full init + old format = no page faults → something else changed that prevents DMA entirely
+`test_fw_load.ko` has **full initialization** which puts WFDMA in a working state where it actually reads and processes descriptors.
 
-### Files Modified for Testing
+### The Remaining Mystery: Why DIDX Never Advances
 
-| File | Change | Purpose |
-|------|--------|---------|
-| `tests/05_dma_impl/test_dma_path.c` | Added MCU state check | Diagnose MCU initialization |
-| `tests/05_dma_impl/test_dma_path.c` | Reverted to old descriptor format | Test if old format causes faults |
-| `tests/05_dma_impl/test_fw_load.c` | Reverted to old descriptor format | Test full init + old format |
+Even with CORRECT format:
+- ✅ Hardware reads descriptors correctly (no page faults)
+- ✅ CIDX advances (CPU is queuing)
+- ❌ DIDX stays at 0 (hardware never completes)
+- ❌ MEM_ERR=1 persists
 
-### Next Steps
+**Possible causes:**
+1. **Memory access permission** - firmware target address rejected?
+2. **MCU not accepting data** - needs different handshake?
+3. **PDA configuration wrong** - firmware download state machine issue?
+4. **Missing interrupt/handshake** - hardware waiting for signal?
 
-1. **Run test_fw_load.ko with old format** - see if page faults return with full initialization
-2. **If no page faults**: bisect changes since Phase 27 to find what broke DMA initiation
-3. **If page faults**: confirms the descriptor format was the only issue, need to investigate why new format doesn't work
-4. **Check IOMMU configuration**: verify device is properly associated with IOMMU domain
+### Files Modified During Investigation
+
+| File | Change | Status |
+|------|--------|--------|
+| `tests/05_dma_impl/test_dma_path.c` | Created for DMA path testing | Keep for diagnostics |
+| `tests/05_dma_impl/test_fw_load.c` | Reverted to CORRECT format | ✅ Committed |
 
 ### Investigation Timeline
 
 | Time | Action | Result |
 |------|--------|--------|
 | Start | Created test_dma_path.ko | Minimal DMA path test |
-| +1 | Tested with Ring 0 | No page faults |
-| +2 | Changed to Ring 16 | No page faults |
+| +1 | Tested with Ring 0 | No page faults (minimal init) |
+| +2 | Changed to Ring 16 | No page faults (minimal init) |
 | +3 | Discovered Bus Master disable issue | Not the root cause |
-| +4 | Reverted test_dma_path.ko to old format | No page faults |
-| +5 | Reverted test_fw_load.c to old format | **Pending test** |
+| +4 | Reverted test_dma_path.ko to old format | No page faults (minimal init) |
+| +5 | Reverted test_fw_load.c to old format | ✅ **PAGE FAULTS at addr 0x0!** |
+| +6 | Reverted test_fw_load.c to CORRECT format | ✅ Committed |
+
+### Conclusions
+
+1. **Descriptor format validated**: bits 16-29 for SD_LEN0, bit 30 for LAST_SEC0
+2. **DMA path working**: requests reach IOMMU (page faults prove this)
+3. **New blocker identified**: DMA reads correctly but doesn't complete (MEM_ERR=1)
+4. **Investigation continues**: need to understand why MCU/PDA rejects the data

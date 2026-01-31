@@ -124,42 +124,42 @@ Diagnostic run revealed this is a **global DMA path issue**, not Ring 16-specifi
 - PDA_TAR_ADDR/PDA_TAR_LEN may not be configured
 - ROM bootloader may need explicit download mode activation
 
-### Next Step 🔧 - PHASE 28d: INVESTIGATE WHY DMA ISN'T BEING ATTEMPTED
+### Next Step 🔧 - PHASE 28e: INVESTIGATE MEM_ERR AND DMA COMPLETION
 
-**Critical Finding (Phase 28d)**: The Phase 27 page faults were a **BUG**, not proof of working DMA!
+**Phase 28d COMPLETED** - DMA path validated, descriptor format confirmed correct!
 
-The old descriptor format put length in wrong bits (SDLen1 vs SDLen0), causing hardware to read from `buf1` (address 0x0) instead of `buf0`. The page faults were IOMMU catching this incorrect access.
-
-**Test Results (2026-01-31):**
-| Test | Descriptor Format | Full Init | Page Faults |
-|------|-------------------|-----------|-------------|
-| test_dma_path.ko | New (correct) | No | ❌ None |
-| test_dma_path.ko | Old (buggy) | No | ❌ None |
-| test_fw_load.ko | Old (buggy) | Yes | **Pending** |
-
-**The mystery**: Reverting to old format should cause page faults, but doesn't. WFDMA isn't even attempting memory access.
-
-**Bus Master**: Test modules disable on exit (managed cleanup), but tests run WITH Bus Master enabled.
-
-**Current test**: `test_fw_load.ko` modified with old descriptor format:
-```bash
-# Reset device first
-DEVICE=$(lspci -nn | grep 14c3:7927 | cut -d' ' -f1)
-echo 1 | sudo tee /sys/bus/pci/devices/0000:$DEVICE/remove
-sleep 2
-echo 1 | sudo tee /sys/bus/pci/rescan
-sleep 1
-
-# Run test with old (buggy) format
-sudo insmod tests/05_dma_impl/test_fw_load.ko
-sudo dmesg | tail -80
-dmesg | grep -i 'page.fault\|amd-vi\|dmar' | tail -10
+**Key Finding**: Page fault test with old format PROVED DMA is working:
+```
+AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x000e address=0x0 flags=0x0000]
 ```
 
-**If no page faults with test_fw_load.ko + old format:**
-Something else changed since Phase 27 that prevents DMA from being initiated at all.
+**Final Test Results (2026-01-31):**
+| Test | Descriptor Format | Full Init | Page Faults | Result |
+|------|-------------------|-----------|-------------|--------|
+| test_dma_path.ko | New (correct) | No | ❌ None | Minimal init insufficient |
+| test_dma_path.ko | Old (buggy) | No | ❌ None | Minimal init insufficient |
+| test_fw_load.ko | Old (buggy) | Yes | ✅ **YES** | **DMA path works!** |
+| test_fw_load.ko | New (correct) | Yes | ❌ None | Correct format validated |
 
-See **docs/ZOUYONGHAO_ANALYSIS.md** sections "2n" and "2o" for complete analysis.
+**What this proves:**
+1. ✅ DMA IS working at PCIe/IOMMU level
+2. ✅ Hardware expects SD_LEN0 in bits 16-29 (old format = wrong = fault at addr 0)
+3. ✅ Correct format prevents faults (address read correctly)
+4. ❌ **NEW BLOCKER**: DMA reads correctly but doesn't complete (MEM_ERR=1, DIDX=0)
+
+**Current blocker**: Even with correct descriptor format:
+- CIDX advances (CPU queuing descriptors)
+- DIDX stays at 0 (hardware not completing)
+- MEM_ERR=1 in MCU_INT_STA (memory access error)
+- PDA_DWLD_STATE shows WFDMA_BUSY=1, WFDMA_OVERFLOW=1
+
+**Investigation areas:**
+1. Why does MEM_ERR occur with valid addresses?
+2. Is PDA (Patch Download Agent) configured correctly?
+3. Are firmware target addresses being rejected?
+4. Missing MCU handshake after DMA?
+
+See **docs/ZOUYONGHAO_ANALYSIS.md** section "2o" for complete analysis.
 
 ---
 
