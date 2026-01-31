@@ -1719,6 +1719,178 @@ Our test_fw_load.c bypasses the mt76 framework and does raw DMA, missing these h
 
 ---
 
+### 2h. Phase 27f - Firmware Structure Mismatch Discovery (2026-01-31)
+
+**Date**: 2026-01-31
+**Status**: **CRITICAL BUG FOUND** - Firmware header structures are wrong in test_fw_load.c
+
+#### Symptom
+
+After Phase 27e doorbell implementation, testing still showed DIDX=0:
+```
+[MT7927] Sending PATCH INIT_DOWNLOAD for section 0
+Patch section: addr=0x00000000 len=0 offs=38912   ← WRONG VALUES!
+Ring 16: Waiting for DIDX to increment...
+[MT7927] Ring 16 DMA timeout! DIDX stuck at 0
+```
+
+The MCU interrupt was delivered (`MCU_INT_STA=0x00000001`) but MCU still wasn't consuming data.
+
+#### Root Cause Analysis
+
+Comparing our `struct mt7927_patch_hdr` and `struct mt7927_patch_sec` against the reference `mt76_connac2_patch_*` structures in `reference_zouyonghao_mt7927/mt76-outoftree/mt76_connac_mcu.h`:
+
+**Our WRONG structures:**
+```c
+struct mt7927_patch_hdr {
+    char build_date[16];
+    char platform[4];
+    __be32 hw_sw_ver;
+    __be32 patch_ver;
+    __be16 checksum;
+    u16 rsv;
+    struct {
+        __be32 patch_ver;
+        __be32 subsys;
+        __be32 feature;
+        __be32 n_region;
+        __be32 crc;
+        // MISSING: u32 rsv[11]; - 44 bytes missing!
+    } desc;
+} __packed;
+
+struct mt7927_patch_sec {
+    __be32 type;
+    char reserved[4];  // WRONG field name and purpose
+    union {
+        __be32 spec[13];
+        struct {
+            __be32 addr;
+            __be32 len;
+            // ...
+        } __packed info;
+    };
+    __be32 offs;  // WRONG - offs at END instead of position 2!
+} __packed;
+```
+
+**Correct mt76_connac2 structures (reference_zouyonghao_mt7927/mt76-outoftree/mt76_connac_mcu.h:139-170):**
+```c
+struct mt76_connac2_patch_hdr {
+    char build_date[16];
+    char platform[4];
+    __be32 hw_sw_ver;
+    __be32 patch_ver;
+    __be16 checksum;
+    u16 rsv;
+    struct {
+        __be32 patch_ver;
+        __be32 subsys;
+        __be32 feature;
+        __be32 n_region;
+        __be32 crc;
+        u32 rsv[11];  // ✅ CORRECT - 44 extra bytes!
+    } desc;
+} __packed;
+
+struct mt76_connac2_patch_sec {
+    __be32 type;
+    __be32 offs;      // ✅ CORRECT - offs is SECOND field
+    __be32 size;      // ✅ CORRECT - size is THIRD field (we missed this entirely!)
+    union {
+        __be32 spec[13];
+        struct {
+            __be32 addr;
+            __be32 len;
+            __be32 sec_key_idx;
+            __be32 align_len;
+            u32 rsv[9];
+        } info;
+    };
+} __packed;
+```
+
+#### Size Discrepancy
+
+| Structure | Our Size | Correct Size | Difference |
+|-----------|----------|--------------|------------|
+| patch_hdr | 52 bytes | 96 bytes | **-44 bytes** (missing `rsv[11]`) |
+| patch_sec | 64 bytes | 68 bytes | **-4 bytes** (missing `size` field, wrong `offs` position) |
+
+#### Consequences
+
+1. **Header parsing offset error**: After reading our 52-byte header, we're 44 bytes too early in the file
+2. **Section field mismatch**: We read `addr=0x00000000` and `len=0` because fields are at wrong positions
+3. **INIT_DOWNLOAD fails silently**: MCU receives command with `addr=0, len=0` - nothing to download
+4. **PDA never configured**: `PDA_TAR_ADDR=0` is expected because we never sent valid addresses
+5. **Ring 16 data ignored**: Without valid PDA target, firmware chunks have nowhere to go
+
+This explains why:
+- Doorbell interrupt is delivered (`MCU_INT_STA=0x01`)
+- MCU never consumes Ring 15 data (`DIDX=0`) - commands are malformed
+- Ring 16 never processes (`DIDX=0`) - no valid download target configured
+
+#### Fix Required
+
+Update `tests/05_dma_impl/test_fw_load.c` structure definitions to match `mt76_connac2_patch_*`:
+
+```c
+// FIXED header - add rsv[11] to desc
+struct mt7927_patch_hdr {
+    char build_date[16];
+    char platform[4];
+    __be32 hw_sw_ver;
+    __be32 patch_ver;
+    __be16 checksum;
+    u16 rsv;
+    struct {
+        __be32 patch_ver;
+        __be32 subsys;
+        __be32 feature;
+        __be32 n_region;
+        __be32 crc;
+        u32 rsv[11];      // ← ADD THIS
+    } desc;
+} __packed;
+
+// FIXED section - reorder fields
+struct mt7927_patch_sec {
+    __be32 type;
+    __be32 offs;          // ← MOVE HERE (was at end)
+    __be32 size;          // ← ADD THIS
+    union {
+        __be32 spec[13];
+        struct {
+            __be32 addr;
+            __be32 len;
+            __be32 sec_key_idx;
+            __be32 align_len;
+            u32 rsv[9];
+        } info;
+    };
+} __packed;
+```
+
+#### Verification After Fix
+
+Once structures are fixed, verify:
+1. `addr` field reads non-zero (e.g., `0x00900000` - typical RAM address)
+2. `len` field reads actual size (e.g., `0x0001E000` - ~120KB typical)
+3. `offs` field reads file offset (e.g., `0x00009800` - after header)
+4. INIT_DOWNLOAD command contains valid parameters
+5. `PDA_TAR_ADDR` becomes non-zero after MCU processes command
+6. Ring 16 DIDX starts incrementing as firmware data is consumed
+
+#### Test Status
+
+- [x] Identified structure mismatch as root cause
+- [ ] Fix structure definitions in test_fw_load.c
+- [ ] Rebuild and test firmware parsing
+- [ ] Verify INIT_DOWNLOAD contains valid addr/len
+- [ ] Verify doorbell + correct structures enables MCU consumption
+
+---
+
 ### 3. Firmware Loading Comparison
 
 Both implementations use the **same core patterns**:

@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Status as of 2026-01-31**: **PHASE 27e - HOST2MCU SOFTWARE INTERRUPT FIX**
+**Status as of 2026-01-31**: **PHASE 27f - FIRMWARE STRUCTURE MISMATCH**
 
 **Progress**:
 - ✅ Root cause found (Phase 17): ROM doesn't support mailbox protocol
@@ -14,27 +14,27 @@
 - ✅ **RX_DMA_EN fix (Phase 27b)**: Only enable TX_DMA_EN during firmware loading
 - ✅ **TXD control word FIX VERIFIED (Phase 27c)**: No more page faults!
 - ✅ **Phase 27d diagnostics**: Found WFDMA_OVERFLOW=1, PDA_TAR_ADDR=0
-- 🔧 **HOST2MCU doorbell IMPLEMENTED (Phase 27e)**: Awaiting test!
+- ✅ **HOST2MCU doorbell IMPLEMENTED (Phase 27e)**: MCU interrupt delivered
+- 🔧 **FIRMWARE STRUCTURE FIX NEEDED (Phase 27f)**: Critical bug found!
 
-**Phase 27e Fix** - HOST2MCU Software Interrupt Doorbell:
+**Phase 27f Finding** - Firmware Header Structure Mismatch:
 
-Phase 27d diagnostics revealed MCU receives DMA data (`WFDMA_OVERFLOW=1`) but isn't consuming it
-(`PDA_TAR_ADDR=0`). The MCU ROM is IDLE (0x1D1E) but not polling DMA rings - it needs a software
-interrupt to wake up!
+Testing Phase 27e showed the doorbell is delivered (`MCU_INT_STA=0x01`) but MCU still doesn't consume
+data. Investigation revealed our firmware header structures have **wrong field layouts**:
 
-**Implementation** in `tests/05_dma_impl/test_fw_load.c`:
-```c
-/* After writing CIDX for Ring 15 or 16 */
-mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(ring), head);
-wmb();
-mt_wr(dev, MT_HOST2MCU_SW_INT_SET, BIT(0));  /* Doorbell at 0xd4108 */
-wmb();
-```
+1. `struct mt7927_patch_hdr.desc` missing `u32 rsv[11]` (44 bytes short)
+2. `struct mt7927_patch_sec.offs` at wrong position (should be field 2, not at end)
+3. `struct mt7927_patch_sec.size` field missing entirely
 
-> **⚠️ Bug Fixed**: Initial implementation incorrectly used MCU_DMA0 space (0x2108).
-> The correct register is in HOST_DMA0 space at **0xd4108**.
+This causes firmware parsing to read `addr=0, len=0` from wrong file offsets, making INIT_DOWNLOAD
+commands invalid. MCU receives "download zero bytes to address zero" and ignores Ring 16 data.
 
-See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** section "2g" for complete analysis.
+**Fix Required** in `tests/05_dma_impl/test_fw_load.c`:
+- Add `u32 rsv[11]` to patch_hdr.desc (makes header 96 bytes, not 52)
+- Move `offs` to position 2 in patch_sec
+- Add `size` field at position 3 in patch_sec
+
+See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** section "2h" for complete analysis.
 
 ## Phase 1: Get It Working 🎯 CURRENT PHASE
 

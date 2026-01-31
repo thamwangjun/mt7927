@@ -9,7 +9,7 @@ This document chronicles the development effort to create a Linux driver for the
 2. MT7927 ROM bootloader does **NOT support mailbox protocol** - this was the root cause of all DMA "blocker" issues
 3. Reference zouyonghao driver has correct polling-based FW loader functions, but **wiring is broken** (firmware never called)
 
-**Current Status (Phase 27d)**: **GLOBAL DMA PATH INVESTIGATION** - CRITICAL FINDING: **BOTH Ring 15 AND Ring 16 have DIDX stuck at 0**. This is NOT a Ring 16-specific issue - the entire TX DMA path is failing. Diagnostic run shows `TX_TIMEOUT=1` error, meaning DMA engine tried to send but MCU/target didn't acknowledge. Root cause hypothesis: MCU_DMA0 RX not enabled, or PDA target registers not configured. Enhanced diagnostics added to read PDA_TAR_ADDR, PDA_TAR_LEN, PDA_DWLD_STATE, and MCU_DMA0_GLO_CFG to investigate MCU receiving side.
+**Current Status (Phase 27f)**: **FIRMWARE STRUCTURE MISMATCH** - CRITICAL BUG: Our `struct mt7927_patch_hdr` and `struct mt7927_patch_sec` have wrong field layouts. The header is missing 44 bytes (`rsv[11]`) and the section struct has `offs` at wrong position. This causes firmware parsing to read `addr=0, len=0`, making INIT_DOWNLOAD commands invalid. The MCU doorbell (Phase 27e) works but we can't test it because firmware data is malformed. Fix: Update structure definitions to match `mt76_connac2_patch_*` from reference code.
 
 ---
 
@@ -3254,6 +3254,140 @@ sudo dmesg | tail -100
 
 ---
 
+## Phase 27f: Firmware Structure Mismatch Discovery (2026-01-31)
+
+### Status: 🎯 CRITICAL BUG FOUND
+
+### Test Results After Phase 27e Doorbell Implementation
+
+After implementing the HOST2MCU software interrupt doorbell, testing still showed DIDX=0:
+
+```
+[MT7927] Sending PATCH INIT_DOWNLOAD for section 0
+Patch section: addr=0x00000000 len=0 offs=38912   ← WRONG VALUES!
+Ring 16: Waiting for DIDX to increment...
+[MT7927] Ring 16 DMA timeout! DIDX stuck at 0
+MCU_INT_STA(0xd4200): 0x00000001   ← Doorbell delivered!
+```
+
+The MCU interrupt was delivered, but MCU still wasn't consuming data. Why?
+
+### Root Cause: Wrong Firmware Structure Definitions
+
+Comparing our `struct mt7927_patch_hdr` and `struct mt7927_patch_sec` against the correct mt76 structures revealed **critical mismatches**:
+
+#### Our WRONG patch_hdr (missing 44 bytes):
+```c
+struct mt7927_patch_hdr {
+    char build_date[16];
+    char platform[4];
+    __be32 hw_sw_ver;
+    __be32 patch_ver;
+    __be16 checksum;
+    u16 rsv;
+    struct {
+        __be32 patch_ver;
+        __be32 subsys;
+        __be32 feature;
+        __be32 n_region;
+        __be32 crc;
+        // MISSING: u32 rsv[11]; - 44 bytes missing!
+    } desc;
+} __packed;  // = 52 bytes
+```
+
+#### Correct mt76_connac2_patch_hdr (reference_zouyonghao_mt7927/mt76-outoftree/mt76_connac_mcu.h:139-158):
+```c
+struct mt76_connac2_patch_hdr {
+    char build_date[16];
+    char platform[4];
+    __be32 hw_sw_ver;
+    __be32 patch_ver;
+    __be16 checksum;
+    u16 rsv;
+    struct {
+        __be32 patch_ver;
+        __be32 subsys;
+        __be32 feature;
+        __be32 n_region;
+        __be32 crc;
+        u32 rsv[11];  // ← PRESENT in correct structure
+    } desc;
+} __packed;  // = 96 bytes
+```
+
+#### Our WRONG patch_sec (offs at wrong position):
+```c
+struct mt7927_patch_sec {
+    __be32 type;
+    char reserved[4];  // WRONG - should be offs!
+    union { ... };
+    __be32 offs;       // WRONG - offs at END instead of position 2!
+} __packed;
+```
+
+#### Correct mt76_connac2_patch_sec (reference_zouyonghao_mt7927/mt76-outoftree/mt76_connac_mcu.h:160-175):
+```c
+struct mt76_connac2_patch_sec {
+    __be32 type;
+    __be32 offs;      // ← offs is SECOND field
+    __be32 size;      // ← size is THIRD field (we missed this entirely!)
+    union {
+        __be32 spec[13];
+        struct {
+            __be32 addr;
+            __be32 len;
+            __be32 sec_key_idx;
+            __be32 align_len;
+            u32 rsv[9];
+        } info;
+    };
+} __packed;
+```
+
+### Impact Analysis
+
+| Issue | Our Structure | Correct Structure | Effect |
+|-------|--------------|-------------------|--------|
+| Header size | 52 bytes | 96 bytes | 44 bytes off, all section reads wrong |
+| Section offs position | At end | Position 2 | Read wrong file offset |
+| Section size field | Missing | Position 3 | Can't determine chunk size |
+| Parsed addr | 0x00000000 | Should be ~0x00900000 | MCU has no target address |
+| Parsed len | 0 | Should be ~0x0001E000 | MCU has zero bytes to expect |
+
+### Why This Explains All Symptoms
+
+1. **INIT_DOWNLOAD with addr=0, len=0** → MCU receives "download nothing to address zero"
+2. **PDA_TAR_ADDR = 0** → Correct! We told it to target address 0
+3. **Ring 16 DIDX = 0** → MCU has no valid download configured, ignores Ring 16 data
+4. **WFDMA_OVERFLOW = 1** → Ring 16 data has nowhere to go (no PDA target)
+
+The doorbell implementation (Phase 27e) is likely correct, but **we can't test it** because we're sending malformed commands due to structure mismatch.
+
+### Fix Required
+
+Update `tests/05_dma_impl/test_fw_load.c`:
+
+1. Add `u32 rsv[11];` to patch_hdr.desc
+2. Move `offs` field to position 2 in patch_sec
+3. Add `size` field at position 3 in patch_sec
+4. Update firmware parsing code to use correct field positions
+
+### Files Modified
+
+- **docs/ZOUYONGHAO_ANALYSIS.md** - Added section 2h documenting this discovery
+- **DEVELOPMENT_LOG.md** - Added this Phase 27f section
+
+### Next Steps
+
+1. [ ] Fix structure definitions in test_fw_load.c
+2. [ ] Rebuild and test firmware parsing
+3. [ ] Verify INIT_DOWNLOAD contains valid addr/len/offs values
+4. [ ] Verify doorbell + correct structures enables MCU consumption
+5. [ ] Verify PDA_TAR_ADDR becomes non-zero after MCU processes command
+
+---
+
 ## Appendix A: Debunked Assumptions (Comprehensive List)
 
 This section documents all assumptions made during development that were later proven wrong, with citations to the evidence that debunked them.
@@ -3301,6 +3435,8 @@ This section documents all assumptions made during development that were later p
 |------------|--------|--------------------|-----------------------|
 | **MT7927 needs unique firmware** | 1 | Different chip ID | Phase 14-15: Windows driver analysis proves same .bin files used |
 | **Firmware auto-detects chip** | 14 | Contains both 0x7925 and 0x7927 bytes | Not debunked, but clarified: Firmware works on both chips |
+| **Our patch_hdr struct is correct** | 1-27e | Copied from early MT76 code | Phase 27f: Missing `u32 rsv[11]` in desc (44 bytes short); mt76_connac2_patch_hdr has it |
+| **Our patch_sec struct is correct** | 1-27e | Copied from early MT76 code | Phase 27f: `offs` at wrong position, `size` field missing; causes addr=0, len=0 parsing |
 
 ### A.6 Reference Code Assumptions
 
@@ -3340,6 +3476,9 @@ Phase 17:    Assumed zouyonghao driver works end-to-end
 
 Phase 17-19: Assumed crypto MCU ownership at 0x70025380
              → WRONG: Correct SET register is 0x70025034
+
+Phase 1-27e: Assumed our patch_hdr/patch_sec structures were correct
+             → WRONG: Missing rsv[11] in header, offs at wrong position in section
 ```
 
 ---

@@ -8,33 +8,46 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 
 **Official Product Name**: MT7927 802.11be 320MHz 2x2 PCIe Wireless Network Adapter [Filogic 380]
 
-**Current Status**: **PHASE 27e - HOST2MCU SOFTWARE INTERRUPT FIX IMPLEMENTED**:
+**Current Status**: **PHASE 27f - FIRMWARE STRUCTURE MISMATCH DISCOVERED**:
 - ✅ **MCU reaches IDLE state (0x1D1E)** - Confirmed!
 - ✅ **CB_INFRA and WFDMA global registers work correctly**
 - ✅ **Ring configuration registers accept writes** - Phase 27 GLO_CFG timing fix worked!
 - ✅ **TX rings 0-16 all have valid BASE addresses** - Phase 27 unused ring fix worked!
 - ✅ **TXD control word FIX VERIFIED** - Phase 27c fix works! No more page faults!
 - ✅ **MCU_DMA0 RX_DMA_EN = 1** - MCU DMA receive is enabled
-- 🔧 **HOST2MCU_SW_INT doorbell IMPLEMENTED** - Awaiting test!
+- ✅ **HOST2MCU_SW_INT doorbell IMPLEMENTED** - Phase 27e
+- 🔧 **FIRMWARE STRUCTURE FIX NEEDED** - Critical bug found!
 
-**Phase 27e FIX** - HOST2MCU Software Interrupt Doorbell:
+**Phase 27f FINDING** - Firmware Header Structure Mismatch:
 
-ROOT CAUSE: MCU ROM is in IDLE (0x1D1E) but **not polling DMA rings**. The WFDMA_OVERFLOW=1 flag showed data was arriving but MCU wasn't consuming it. MCU needs a software interrupt to wake up and process rings!
+ROOT CAUSE: Our `struct mt7927_patch_hdr` and `struct mt7927_patch_sec` have **wrong field layouts**:
+1. **patch_hdr.desc** is missing `u32 rsv[11]` (44 bytes short)
+2. **patch_sec.offs** is at wrong position (should be field 2, not at end)
+3. **patch_sec.size** field is missing entirely
 
-**Fix Applied** in `tests/05_dma_impl/test_fw_load.c`:
+This causes firmware parsing to read **addr=0, len=0** from wrong file offsets, making INIT_DOWNLOAD commands invalid. The MCU receives "download zero bytes to address zero" and ignores Ring 16 data.
+
+**Fix Required** in `tests/05_dma_impl/test_fw_load.c`:
 ```c
-/* After kicking Ring 15 or Ring 16 with CIDX */
-mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(ring_idx), ring_head);  /* Kick ring */
-wmb();
-mt_wr(dev, MT_HOST2MCU_SW_INT_SET, BIT(0));  /* Doorbell to wake MCU */
-wmb();
+// Fix 1: Add rsv[11] to patch_hdr.desc
+struct mt7927_patch_hdr {
+    ...
+    struct {
+        __be32 patch_ver, subsys, feature, n_region, crc;
+        u32 rsv[11];  // ← ADD THIS (44 bytes)
+    } desc;
+} __packed;
+
+// Fix 2: Reorder patch_sec fields
+struct mt7927_patch_sec {
+    __be32 type;
+    __be32 offs;   // ← MOVE HERE (was at end)
+    __be32 size;   // ← ADD THIS
+    union { ... };
+} __packed;
 ```
 
-| Register | BAR0 Offset | Purpose |
-|----------|-------------|---------|
-| HOST2MCU_SW_INT_SET | **0xd4108** | Write BIT(0) to generate MCU interrupt |
-
-See **docs/ZOUYONGHAO_ANALYSIS.md** section "2g" for discovery details.
+See **docs/ZOUYONGHAO_ANALYSIS.md** section "2h" for complete analysis.
 
 ## Critical Files to Review First
 
@@ -45,7 +58,8 @@ See **docs/ZOUYONGHAO_ANALYSIS.md** section "2g" for discovery details.
    - Section "2d": Phase 27b fix - RX_DMA_EN timing
    - Section "2e": Phase 27c fix - TXD control word bit positions (verified!)
    - Section "2f": Phase 27d - Global DMA path investigation
-   - Section "2g": **Phase 27e** - HOST2MCU software interrupt discovery (current)
+   - Section "2g": Phase 27e - HOST2MCU software interrupt discovery
+   - Section "2h": **Phase 27f** - Firmware structure mismatch discovery (current)
 2. **docs/ROADMAP.md** - Current status, blockers, and next steps
 3. **docs/MT6639_ANALYSIS.md** - Proves MT7927 is MT6639 variant, validates rings 15/16
 4. **docs/REFERENCE_SOURCES.md** - Analysis of reference code origins and authoritative sources

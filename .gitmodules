@@ -7,3 +7,6 @@
 [submodule "reference_gen4m"]
 	path = reference_gen4m
 	url = https://github.com/MotorolaMobilityLLC/vendor-mediatek-kernel_modules-connectivity-wlan-core-gen4m.git
+[submodule "reference_mt76"]
+	path = reference_mt76
+	url = https://github.com/openwrt/mt76.git
