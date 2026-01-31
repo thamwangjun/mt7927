@@ -1975,6 +1975,133 @@ With structures and register values verified correct:
 
 ---
 
+### 2j. Phase 27g - Comprehensive Memory Reference Verification (2026-01-31)
+
+**Date**: 2026-01-31
+**Status**: **ALL MEMORY REFERENCES VERIFIED CORRECT**
+
+All 40+ memory references in `tests/05_dma_impl/test_fw_load.c` have been systematically verified against authoritative reference sources.
+
+#### WFDMA0 Base and Register Offsets
+
+| Register | test_fw_load.c | Calculation/Reference | Status |
+|----------|----------------|----------------------|--------|
+| **MT_WFDMA0_BASE** | `0xd4000` | fixed_map: {0x7c020000 → 0x0d0000} + 0x4000 | ✅ |
+| MT_WFDMA0_HOST_INT_STA | `0xd4200` | wf_wfdma_host_dma0.h: BASE + 0x200 | ✅ |
+| MT_WFDMA0_HOST_INT_ENA | `0xd4204` | wf_wfdma_host_dma0.h: BASE + 0x204 | ✅ |
+| MT_WFDMA0_GLO_CFG | `0xd4208` | wf_wfdma_host_dma0.h: BASE + 0x208 | ✅ |
+| MT_WFDMA0_RST_DTX_PTR | `0xd420c` | wf_wfdma_host_dma0.h: BASE + 0x20c | ✅ |
+| MT_WFDMA0_RST_DRX_PTR | `0xd4280` | wf_wfdma_host_dma0.h: BASE + 0x280 | ✅ |
+| MT_WFDMA0_RST | `0xd4100` | wf_wfdma_host_dma0.h: CONN_HIF_RST at BASE + 0x100 | ✅ |
+| MT_HOST2MCU_SW_INT_SET | `0xd4108` | wf_wfdma_host_dma0.h: BASE + 0x108 | ✅ |
+| MT_WFDMA0_MCU_INT_STA | `0xd4110` | wf_wfdma_host_dma0.h: BASE + 0x110 | ✅ |
+| MT_WFDMA0_WPDMA2HOST_ERR_INT_STA | `0xd41E8` | wf_wfdma_host_dma0.h: BASE + 0x1E8 | ✅ |
+| MT_WFDMA0_INT_RX_PRI | `0xd4298` | wf_wfdma_host_dma0.h: BASE + 0x298 | ✅ |
+| MT_WFDMA0_INT_TX_PRI | `0xd429c` | wf_wfdma_host_dma0.h: BASE + 0x29c | ✅ |
+| MT_WFDMA0_PRI_DLY_INT_CFG0 | `0xd42f0` | wf_wfdma_host_dma0.h: BASE + 0x2f0 | ✅ |
+| MT_WFDMA0_GLO_CFG_EXT0 | `0xd42b0` | wf_wfdma_host_dma0.h: BASE + 0x2b0 | ✅ |
+| MT_WFDMA0_GLO_CFG_EXT1 | `0xd42b4` | wf_wfdma_host_dma0.h: BASE + 0x2b4 | ✅ |
+| TX_RING0_CTRL0 | `0xd4300` | wf_wfdma_host_dma0.h: BASE + 0x300 | ✅ |
+| TX_RING15_CTRL0 | `0xd43F0` | wf_wfdma_host_dma0.h: BASE + 0x3F0 | ✅ |
+| TX_RING16_CTRL0 | `0xd4400` | wf_wfdma_host_dma0.h: BASE + 0x400 | ✅ |
+| TX_RING15_EXT_CTRL | `0xd463c` | BASE + 0x63c (prefetch config) | ✅ |
+| TX_RING16_EXT_CTRL | `0xd4640` | BASE + 0x640 (prefetch config) | ✅ |
+
+#### CB_INFRA Registers (via fixed_map {0x70020000 → 0x1f0000})
+
+| Register | BAR0 Offset | Chip Address | Reference Source | Status |
+|----------|-------------|--------------|------------------|--------|
+| CB_INFRA_PCIE_REMAP_WF | `0x1f6554` | 0x70026554 | mt7927_regs.h: CB_INFRA_MISC0_BASE + 0x554 | ✅ |
+| CB_INFRA_PCIE_REMAP_WF_BT | `0x1f6558` | 0x70026558 | mt7927_regs.h: CB_INFRA_MISC0_BASE + 0x558 | ✅ |
+| CB_INFRA_WF_SUBSYS_RST | `0x1f8600` | 0x70028600 | mt7927_regs.h: CB_INFRA_RGU_BASE + 0x600 | ✅ |
+| CB_INFRA_BT_SUBSYS_RST | `0x1f8610` | 0x70028610 | mt7927_regs.h: CB_INFRA_RGU_BASE + 0x610 | ✅ |
+| CB_INFRA_CRYPTO_MCU_OWN_SET | `0x1f5034` | 0x70025034 | cb_infra_slp_ctrl.h: BASE + 0x034 | ✅ |
+
+#### CONN_INFRA Registers (via various fixed_map entries)
+
+| Register | BAR0 Offset | Chip Address | fixed_map Entry | Status |
+|----------|-------------|--------------|-----------------|--------|
+| MT_CONN_ON_LPCTL | `0x0e0010` | 0x7c060010 | {0x7c060000 → 0x0e0000} + 0x10 | ✅ |
+| MT_MCU_STATUS | `0x0e0204` | 0x7c060204 | {0x7c060000 → 0x0e0000} + 0x204 | ✅ |
+| MT_CONN_ON_MISC | `0x0e00f0` | 0x7c0600f0 | {0x7c060000 → 0x0e0000} + 0xf0 | ✅ |
+| MT_CONNINFRA_WAKEUP | `0x0e01a0` | 0x7c0601a0 | {0x7c060000 → 0x0e0000} + 0x1a0 | ✅ |
+| MT_CONNINFRA_VERSION | `0x101000` | 0x7c011000 | {0x7c010000 → 0x100000} + 0x1000 | ✅ |
+| MT_WFSYS_SW_RST_B | `0x0f0140` | 0x7c000140 | {0x7c000000 → 0x0f0000} + 0x140 | ✅ |
+| MT_MCU_ROMCODE_INDEX | `0x0c1604` | 0x81021604 | {0x81020000 → 0x0c0000} + 0x1604 | ✅ |
+| CONN_BUS_CR_VON_PCIE2AP_REMAP | `0x0d1034` | 0x7C021034 | {0x7c020000 → 0x0d0000} + 0x1034 | ✅ |
+
+#### WFDMA Extension Registers (via {0x7c020000 → 0x0d0000})
+
+| Register | BAR0 Offset | Chip Address | Status |
+|----------|-------------|--------------|--------|
+| MT_WFDMA_HOST_CONFIG | `0x0d7030` | 0x7C027030 | ✅ |
+| MT_WFDMA_MSI_INT_CFG0 | `0x0d70F0` | 0x7C0270F0 | ✅ |
+| MT_WFDMA_MSI_INT_CFG1 | `0x0d70F4` | 0x7C0270F4 | ✅ |
+| MT_WFDMA_MSI_INT_CFG2 | `0x0d70F8` | 0x7C0270F8 | ✅ |
+| MT_WFDMA_MSI_INT_CFG3 | `0x0d70FC` | 0x7C0270FC | ✅ |
+| MT_WFDMA_GLO_CFG_EXT1 | `0x0d42B4` | 0x7C0242B4 | ✅ |
+| MT_WFDMA_GLO_CFG_EXT2 | `0x0d42B8` | 0x7C0242B8 | ✅ |
+| MT_WFDMA_HOST_PER_DLY_INT_CFG | `0x0d42E8` | 0x7C0242E8 | ✅ |
+| MT_WFDMA_PAUSE_RX_Q_TH10 | `0x0d4260` | 0x7C024260 | ✅ |
+| MT_WFDMA_PAUSE_RX_Q_TH1110 | `0x0d4274` | 0x7C024274 | ✅ |
+| MT_WFDMA_HIF_PERF_MAVG_DIV | `0x0d70C0` | 0x7C0270C0 | ✅ |
+| MT_WFDMA_DLY_IDX_CFG_0 | `0x0d70E8` | 0x7C0270E8 | ✅ |
+
+#### L1 Remap Registers (from mt7925/regs.h)
+
+| Register | test_fw_load.c | Reference | Status |
+|----------|----------------|-----------|--------|
+| MT_HIF_REMAP_L1 | `0x155024` | mt7925/regs.h:70 | ✅ |
+| MT_HIF_REMAP_L1_MASK | `GENMASK(31, 16)` | mt7925/regs.h:71 | ✅ |
+| MT_HIF_REMAP_L1_OFFSET | `GENMASK(15, 0)` | mt7925/regs.h:72 | ✅ |
+| MT_HIF_REMAP_L1_BASE | `GENMASK(31, 16)` | mt7925/regs.h:73 | ✅ |
+| MT_HIF_REMAP_BASE_L1 | `0x130000` | mt7925/regs.h:74 | ✅ |
+
+#### MCU DMA0 (PDA) Registers
+
+| Register | test_fw_load.c | Calculation | Status |
+|----------|----------------|-------------|--------|
+| MT_MCU_DMA0_BASE | `0x2000` | fixed_map: {0x54000000 → 0x002000} | ✅ |
+| MT_PDA_TAR_ADDR | `0x2800` | MCU_DMA0_BASE + 0x800 | ✅ |
+| MT_PDA_TAR_LEN | `0x2804` | MCU_DMA0_BASE + 0x804 | ✅ |
+| MT_PDA_DWLD_STATE | `0x2808` | MCU_DMA0_BASE + 0x808 | ✅ |
+| MT_PDA_CONFG | `0x280c` | MCU_DMA0_BASE + 0x80c | ✅ |
+| MT_MCU_DMA0_GLO_CFG | `0x2208` | MCU_DMA0_BASE + 0x208 | ✅ |
+
+#### GPIO Registers (via L1 remap - 0x70005xxx range)
+
+| Register | Chip Address | Value | Reference | Status |
+|----------|--------------|-------|-----------|--------|
+| CBTOP_GPIO_MODE5 | `0x7000535c` | `0x80000000` | mt7927_regs.h:177 | ✅ |
+| CBTOP_GPIO_MODE6 | `0x7000536c` | `0x80` | mt7927_regs.h:178 | ✅ |
+
+#### Note on zouyonghao mt7927_regs.h Discrepancy
+
+The zouyonghao `mt7927_regs.h` line 35 shows:
+```c
+#define CB_INFRA_SLP_CTRL_CB_INFRA_CRYPTO_TOP_MCU_OWN_SET_ADDR (CB_INFRA_SLP_CTRL_BASE + 0x380)
+```
+This gives chip address `0x70025380`, which differs from the **authoritative MTK coda headers** (`cb_infra_slp_ctrl.h`):
+```c
+#define CB_INFRA_SLP_CTRL_CB_INFRA_CRYPTO_TOP_MCU_OWN_SET_ADDR \
+    (CB_INFRA_SLP_CTRL_BASE + 0x034)  // = 0x70025034
+```
+
+**Our test_fw_load.c uses `0x1f5034` (chip `0x70025034`) which is CORRECT per the authoritative MTK coda headers.**
+
+#### Verification Summary
+
+- **Total registers verified**: 40+
+- **Errors found**: 0
+- **Reference sources used**:
+  - `reference_mtk_modules/.../coda/mt6639/wf_wfdma_host_dma0.h` (WFDMA registers)
+  - `reference_mtk_modules/.../coda/mt6639/cb_infra_slp_ctrl.h` (CB_INFRA SLP_CTRL)
+  - `reference_zouyonghao_mt7927/mt76-outoftree/mt7925/pci.c` (fixed_map)
+  - `reference_zouyonghao_mt7927/mt76-outoftree/mt7925/mt7927_regs.h` (MT7927-specific)
+  - `reference_zouyonghao_mt7927/mt76-outoftree/mt7925/regs.h` (L1 remap)
+
+---
+
 ### 3. Firmware Loading Comparison
 
 Both implementations use the **same core patterns**:

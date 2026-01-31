@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Status as of 2026-01-31**: **PHASE 27f - FIXES APPLIED AND VERIFIED**
+**Status as of 2026-01-31**: **PHASE 27g - ALL MEMORY REFERENCES VERIFIED**
 
 **Progress**:
 - ✅ Root cause found (Phase 17): ROM doesn't support mailbox protocol
@@ -16,25 +16,23 @@
 - ✅ **Phase 27d diagnostics**: Found WFDMA_OVERFLOW=1, PDA_TAR_ADDR=0
 - ✅ **HOST2MCU doorbell IMPLEMENTED (Phase 27e)**: MCU interrupt delivered
 - ✅ **FIRMWARE STRUCTURES FIXED (Phase 27f)**: All structures match reference!
-- ✅ **ALL REGISTER VALUES VERIFIED**: Checked against mt6639.c, mt7927_regs.h, mt76_connac_mcu.h
+- ✅ **ALL REGISTER VALUES VERIFIED (Phase 27f)**: Checked against mt6639.c, mt7927_regs.h
+- ✅ **ALL MEMORY REFERENCES VERIFIED (Phase 27g)**: 40+ addresses verified against sources
 
-**Phase 27f Fixes Applied** (2026-01-31):
+**Phase 27g Verification Complete** (2026-01-31):
 
-1. **Structure fixes in `tests/05_dma_impl/test_fw_load.c`**:
-   - `mt7927_patch_hdr`: Added `u32 rsv[11]` to desc (44 bytes were missing)
-   - `mt7927_patch_sec`: Moved `offs` to position 2, added `size` field
-   - `mt7927_desc`: Added `__aligned(4)` for consistency with reference
-
-2. **All register values verified correct**:
-   - CB_INFRA: PCIE_REMAP_WF, WF_SUBSYS_RST values ✅
-   - WFDMA: BASE address, PREFETCH values ✅
-   - GLO_CFG_EXT1/EXT2: Configuration values ✅
-   - MSI_INT_CFG0-3: Interrupt configuration ✅
-   - MCU commands: TARGET_ADDR, PATCH_START, FW_SCATTER ✅
+All 40+ memory references in `tests/05_dma_impl/test_fw_load.c` verified:
+- WFDMA0 registers (20 addresses) ✅
+- CB_INFRA registers (5 addresses) ✅
+- CONN_INFRA registers (8 addresses) ✅
+- WFDMA extension registers (12 addresses) ✅
+- L1 remap registers (5 addresses) ✅
+- MCU DMA0/PDA registers (6 addresses) ✅
+- GPIO registers (2 addresses) ✅
 
 **Next Step**: Load test module and verify patch section parsing shows valid addr/len/offs values.
 
-See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** section "2i" for complete verification details.
+See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** sections "2i" and "2j" for complete verification tables.
 
 ## Phase 1: Get It Working 🎯 CURRENT PHASE
 

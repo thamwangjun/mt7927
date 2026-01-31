@@ -8,7 +8,7 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 
 **Official Product Name**: MT7927 802.11be 320MHz 2x2 PCIe Wireless Network Adapter [Filogic 380]
 
-**Current Status**: **PHASE 27f - FIRMWARE STRUCTURES FIXED AND VERIFIED**:
+**Current Status**: **PHASE 27g - ALL MEMORY REFERENCES VERIFIED**:
 - ✅ **MCU reaches IDLE state (0x1D1E)** - Confirmed!
 - ✅ **CB_INFRA and WFDMA global registers work correctly**
 - ✅ **Ring configuration registers accept writes** - Phase 27 GLO_CFG timing fix worked!
@@ -17,25 +17,23 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 - ✅ **MCU_DMA0 RX_DMA_EN = 1** - MCU DMA receive is enabled
 - ✅ **HOST2MCU_SW_INT doorbell IMPLEMENTED** - Phase 27e
 - ✅ **FIRMWARE STRUCTURES FIXED** - Phase 27f (2026-01-31)
-- ✅ **ALL REGISTER VALUES VERIFIED** - Checked against reference sources
+- ✅ **ALL REGISTER VALUES VERIFIED** - Phase 27f (2026-01-31)
+- ✅ **ALL MEMORY REFERENCES VERIFIED** - Phase 27g (2026-01-31) - 40+ addresses verified
 
-**Phase 27f FIXES APPLIED** (2026-01-31):
+**Phase 27g VERIFICATION COMPLETE** (2026-01-31):
 
-1. **Structure fixes in `tests/05_dma_impl/test_fw_load.c`**:
-   - `mt7927_patch_hdr`: Added `u32 rsv[11]` to desc (44 bytes were missing)
-   - `mt7927_patch_sec`: Moved `offs` to position 2, added `size` field
-   - `mt7927_desc`: Added `__aligned(4)` for consistency
-
-2. **All register values verified against references**:
-   - CB_INFRA registers: `PCIE_REMAP_WF=0x74037001`, `WF_SUBSYS_RST=0x10351/0x10340` ✅
-   - WFDMA: `BASE=0xd4000`, `PREFETCH_RING15=0x05000004`, `PREFETCH_RING16=0x05400004` ✅
-   - GLO_CFG_EXT: `EXT1=0x8C800404`, `EXT2=0x44` ✅
-   - MSI_INT_CFG: `CFG0=0x00660077`, `CFG1=0x00001100`, `CFG2=0x0030004F`, `CFG3=0x00542200` ✅
-   - MCU commands: `TARGET_ADDR=0x01`, `PATCH_START=0x05`, `PATCH_FINISH=0x07`, `FW_SCATTER=0xee` ✅
+All 40+ memory references in `tests/05_dma_impl/test_fw_load.c` verified against authoritative sources:
+- WFDMA0 registers (20 addresses) ✅
+- CB_INFRA registers (5 addresses) ✅
+- CONN_INFRA registers (8 addresses) ✅
+- WFDMA extension registers (12 addresses) ✅
+- L1 remap registers (5 addresses) ✅
+- MCU DMA0/PDA registers (6 addresses) ✅
+- GPIO registers (2 addresses) ✅
 
 **Next**: Load test module and verify patch section shows valid `addr`/`len`/`offs` values.
 
-See **docs/ZOUYONGHAO_ANALYSIS.md** section "2i" for complete verification details.
+See **docs/ZOUYONGHAO_ANALYSIS.md** sections "2i" and "2j" for complete verification tables.
 
 ## Critical Files to Review First
 
@@ -48,7 +46,8 @@ See **docs/ZOUYONGHAO_ANALYSIS.md** section "2i" for complete verification detai
    - Section "2f": Phase 27d - Global DMA path investigation
    - Section "2g": Phase 27e - HOST2MCU software interrupt discovery
    - Section "2h": Phase 27f - Firmware structure mismatch discovery
-   - Section "2i": **Phase 27f** - Structure fixes and register verification (current)
+   - Section "2i": Phase 27f - Structure fixes and register verification
+   - Section "2j": **Phase 27g** - Comprehensive memory reference verification (current)
 2. **docs/ROADMAP.md** - Current status, blockers, and next steps
 3. **docs/MT6639_ANALYSIS.md** - Proves MT7927 is MT6639 variant, validates rings 15/16
 4. **docs/REFERENCE_SOURCES.md** - Analysis of reference code origins and authoritative sources

@@ -3400,10 +3400,59 @@ See **docs/ZOUYONGHAO_ANALYSIS.md** section "2i" for complete verification table
 1. [x] Fix structure definitions in test_fw_load.c
 2. [x] Rebuild and test firmware parsing
 3. [x] Verify all register values against references
-4. [ ] Load module and verify patch section shows valid addr/len/offs
-5. [ ] Verify INIT_DOWNLOAD contains valid addr/len/offs values
-6. [ ] Verify doorbell + correct structures enables MCU consumption
-7. [ ] Verify PDA_TAR_ADDR becomes non-zero after MCU processes command
+4. [x] Comprehensive memory reference verification (Phase 27g)
+5. [ ] Load module and verify patch section shows valid addr/len/offs
+6. [ ] Verify INIT_DOWNLOAD contains valid addr/len/offs values
+7. [ ] Verify doorbell + correct structures enables MCU consumption
+8. [ ] Verify PDA_TAR_ADDR becomes non-zero after MCU processes command
+
+---
+
+## Phase 27g: Comprehensive Memory Reference Verification (2026-01-31)
+
+**Status**: ✅ ALL MEMORY REFERENCES VERIFIED CORRECT
+
+### Summary
+
+All 40+ memory references in `tests/05_dma_impl/test_fw_load.c` have been systematically verified against authoritative reference sources.
+
+### Verification Scope
+
+| Category | Count | Status |
+|----------|-------|--------|
+| WFDMA0 Base and Registers | 20 | ✅ All Correct |
+| CB_INFRA Registers | 5 | ✅ All Correct |
+| CONN_INFRA Registers | 8 | ✅ All Correct |
+| WFDMA Extension Registers | 12 | ✅ All Correct |
+| L1 Remap Registers | 5 | ✅ All Correct |
+| MCU DMA0 (PDA) Registers | 6 | ✅ All Correct |
+| GPIO Registers | 2 | ✅ All Correct |
+
+### Key Verifications
+
+- **WFDMA0_BASE = 0xd4000** ✅ (fixed_map: {0x7c020000 → 0x0d0000} + 0x4000)
+- **CB_INFRA_CRYPTO_MCU_OWN_SET = 0x1f5034** ✅ (cb_infra_slp_ctrl.h: BASE + 0x034)
+- **MT_HIF_REMAP_L1 = 0x155024, BASE_L1 = 0x130000** ✅ (mt7925/regs.h)
+- All ring offsets verified against wf_wfdma_host_dma0.h
+
+### Note: zouyonghao mt7927_regs.h Discrepancy
+
+Found a discrepancy in `reference_zouyonghao_mt7927/mt76-outoftree/mt7925/mt7927_regs.h` line 35:
+- zouyonghao shows: `CB_INFRA_SLP_CTRL_BASE + 0x380` = chip 0x70025380
+- **MTK coda (authoritative)**: `CB_INFRA_SLP_CTRL_BASE + 0x034` = chip 0x70025034
+
+Our code uses the **correct value** from MTK coda headers.
+
+### Reference Sources
+
+- `reference_mtk_modules/.../coda/mt6639/wf_wfdma_host_dma0.h`
+- `reference_mtk_modules/.../coda/mt6639/cb_infra_slp_ctrl.h`
+- `reference_zouyonghao_mt7927/mt76-outoftree/mt7925/pci.c` (fixed_map)
+- `reference_zouyonghao_mt7927/mt76-outoftree/mt7925/regs.h`
+
+### Files Modified
+
+- **docs/ZOUYONGHAO_ANALYSIS.md** - Added section 2j with complete verification tables
 
 ---
 
