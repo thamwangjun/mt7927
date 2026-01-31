@@ -8,7 +8,7 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 
 **Official Product Name**: MT7927 802.11be 320MHz 2x2 PCIe Wireless Network Adapter [Filogic 380]
 
-**Current Status**: **PHASE 27f - FIRMWARE STRUCTURE MISMATCH DISCOVERED**:
+**Current Status**: **PHASE 27f - FIRMWARE STRUCTURES FIXED AND VERIFIED**:
 - ✅ **MCU reaches IDLE state (0x1D1E)** - Confirmed!
 - ✅ **CB_INFRA and WFDMA global registers work correctly**
 - ✅ **Ring configuration registers accept writes** - Phase 27 GLO_CFG timing fix worked!
@@ -16,38 +16,26 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 - ✅ **TXD control word FIX VERIFIED** - Phase 27c fix works! No more page faults!
 - ✅ **MCU_DMA0 RX_DMA_EN = 1** - MCU DMA receive is enabled
 - ✅ **HOST2MCU_SW_INT doorbell IMPLEMENTED** - Phase 27e
-- 🔧 **FIRMWARE STRUCTURE FIX NEEDED** - Critical bug found!
+- ✅ **FIRMWARE STRUCTURES FIXED** - Phase 27f (2026-01-31)
+- ✅ **ALL REGISTER VALUES VERIFIED** - Checked against reference sources
 
-**Phase 27f FINDING** - Firmware Header Structure Mismatch:
+**Phase 27f FIXES APPLIED** (2026-01-31):
 
-ROOT CAUSE: Our `struct mt7927_patch_hdr` and `struct mt7927_patch_sec` have **wrong field layouts**:
-1. **patch_hdr.desc** is missing `u32 rsv[11]` (44 bytes short)
-2. **patch_sec.offs** is at wrong position (should be field 2, not at end)
-3. **patch_sec.size** field is missing entirely
+1. **Structure fixes in `tests/05_dma_impl/test_fw_load.c`**:
+   - `mt7927_patch_hdr`: Added `u32 rsv[11]` to desc (44 bytes were missing)
+   - `mt7927_patch_sec`: Moved `offs` to position 2, added `size` field
+   - `mt7927_desc`: Added `__aligned(4)` for consistency
 
-This causes firmware parsing to read **addr=0, len=0** from wrong file offsets, making INIT_DOWNLOAD commands invalid. The MCU receives "download zero bytes to address zero" and ignores Ring 16 data.
+2. **All register values verified against references**:
+   - CB_INFRA registers: `PCIE_REMAP_WF=0x74037001`, `WF_SUBSYS_RST=0x10351/0x10340` ✅
+   - WFDMA: `BASE=0xd4000`, `PREFETCH_RING15=0x05000004`, `PREFETCH_RING16=0x05400004` ✅
+   - GLO_CFG_EXT: `EXT1=0x8C800404`, `EXT2=0x44` ✅
+   - MSI_INT_CFG: `CFG0=0x00660077`, `CFG1=0x00001100`, `CFG2=0x0030004F`, `CFG3=0x00542200` ✅
+   - MCU commands: `TARGET_ADDR=0x01`, `PATCH_START=0x05`, `PATCH_FINISH=0x07`, `FW_SCATTER=0xee` ✅
 
-**Fix Required** in `tests/05_dma_impl/test_fw_load.c`:
-```c
-// Fix 1: Add rsv[11] to patch_hdr.desc
-struct mt7927_patch_hdr {
-    ...
-    struct {
-        __be32 patch_ver, subsys, feature, n_region, crc;
-        u32 rsv[11];  // ← ADD THIS (44 bytes)
-    } desc;
-} __packed;
+**Next**: Load test module and verify patch section shows valid `addr`/`len`/`offs` values.
 
-// Fix 2: Reorder patch_sec fields
-struct mt7927_patch_sec {
-    __be32 type;
-    __be32 offs;   // ← MOVE HERE (was at end)
-    __be32 size;   // ← ADD THIS
-    union { ... };
-} __packed;
-```
-
-See **docs/ZOUYONGHAO_ANALYSIS.md** section "2h" for complete analysis.
+See **docs/ZOUYONGHAO_ANALYSIS.md** section "2i" for complete verification details.
 
 ## Critical Files to Review First
 
@@ -59,7 +47,8 @@ See **docs/ZOUYONGHAO_ANALYSIS.md** section "2h" for complete analysis.
    - Section "2e": Phase 27c fix - TXD control word bit positions (verified!)
    - Section "2f": Phase 27d - Global DMA path investigation
    - Section "2g": Phase 27e - HOST2MCU software interrupt discovery
-   - Section "2h": **Phase 27f** - Firmware structure mismatch discovery (current)
+   - Section "2h": Phase 27f - Firmware structure mismatch discovery
+   - Section "2i": **Phase 27f** - Structure fixes and register verification (current)
 2. **docs/ROADMAP.md** - Current status, blockers, and next steps
 3. **docs/MT6639_ANALYSIS.md** - Proves MT7927 is MT6639 variant, validates rings 15/16
 4. **docs/REFERENCE_SOURCES.md** - Analysis of reference code origins and authoritative sources

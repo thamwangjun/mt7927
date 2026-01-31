@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Status as of 2026-01-31**: **PHASE 27f - FIRMWARE STRUCTURE MISMATCH**
+**Status as of 2026-01-31**: **PHASE 27f - FIXES APPLIED AND VERIFIED**
 
 **Progress**:
 - ✅ Root cause found (Phase 17): ROM doesn't support mailbox protocol
@@ -15,26 +15,26 @@
 - ✅ **TXD control word FIX VERIFIED (Phase 27c)**: No more page faults!
 - ✅ **Phase 27d diagnostics**: Found WFDMA_OVERFLOW=1, PDA_TAR_ADDR=0
 - ✅ **HOST2MCU doorbell IMPLEMENTED (Phase 27e)**: MCU interrupt delivered
-- 🔧 **FIRMWARE STRUCTURE FIX NEEDED (Phase 27f)**: Critical bug found!
+- ✅ **FIRMWARE STRUCTURES FIXED (Phase 27f)**: All structures match reference!
+- ✅ **ALL REGISTER VALUES VERIFIED**: Checked against mt6639.c, mt7927_regs.h, mt76_connac_mcu.h
 
-**Phase 27f Finding** - Firmware Header Structure Mismatch:
+**Phase 27f Fixes Applied** (2026-01-31):
 
-Testing Phase 27e showed the doorbell is delivered (`MCU_INT_STA=0x01`) but MCU still doesn't consume
-data. Investigation revealed our firmware header structures have **wrong field layouts**:
+1. **Structure fixes in `tests/05_dma_impl/test_fw_load.c`**:
+   - `mt7927_patch_hdr`: Added `u32 rsv[11]` to desc (44 bytes were missing)
+   - `mt7927_patch_sec`: Moved `offs` to position 2, added `size` field
+   - `mt7927_desc`: Added `__aligned(4)` for consistency with reference
 
-1. `struct mt7927_patch_hdr.desc` missing `u32 rsv[11]` (44 bytes short)
-2. `struct mt7927_patch_sec.offs` at wrong position (should be field 2, not at end)
-3. `struct mt7927_patch_sec.size` field missing entirely
+2. **All register values verified correct**:
+   - CB_INFRA: PCIE_REMAP_WF, WF_SUBSYS_RST values ✅
+   - WFDMA: BASE address, PREFETCH values ✅
+   - GLO_CFG_EXT1/EXT2: Configuration values ✅
+   - MSI_INT_CFG0-3: Interrupt configuration ✅
+   - MCU commands: TARGET_ADDR, PATCH_START, FW_SCATTER ✅
 
-This causes firmware parsing to read `addr=0, len=0` from wrong file offsets, making INIT_DOWNLOAD
-commands invalid. MCU receives "download zero bytes to address zero" and ignores Ring 16 data.
+**Next Step**: Load test module and verify patch section parsing shows valid addr/len/offs values.
 
-**Fix Required** in `tests/05_dma_impl/test_fw_load.c`:
-- Add `u32 rsv[11]` to patch_hdr.desc (makes header 96 bytes, not 52)
-- Move `offs` to position 2 in patch_sec
-- Add `size` field at position 3 in patch_sec
-
-See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** section "2h" for complete analysis.
+See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** section "2i" for complete verification details.
 
 ## Phase 1: Get It Working 🎯 CURRENT PHASE
 

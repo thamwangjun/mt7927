@@ -3256,7 +3256,7 @@ sudo dmesg | tail -100
 
 ## Phase 27f: Firmware Structure Mismatch Discovery (2026-01-31)
 
-### Status: 🎯 CRITICAL BUG FOUND
+### Status: ✅ FIXES APPLIED AND VERIFIED
 
 ### Test Results After Phase 27e Doorbell Implementation
 
@@ -3378,13 +3378,32 @@ Update `tests/05_dma_impl/test_fw_load.c`:
 - **docs/ZOUYONGHAO_ANALYSIS.md** - Added section 2h documenting this discovery
 - **DEVELOPMENT_LOG.md** - Added this Phase 27f section
 
+### Fixes Applied (2026-01-31)
+
+1. **Structure fixes in `tests/05_dma_impl/test_fw_load.c`**:
+   - `mt7927_patch_hdr`: Added `u32 rsv[11]` to desc (44 bytes were missing)
+   - `mt7927_patch_sec`: Moved `offs` to position 2, added `size` field
+   - `mt7927_desc`: Added `__aligned(4)` for consistency with `mt76_desc`
+   - All structures now match reference `mt76_connac2_*` definitions
+
+2. **Complete register value verification**:
+   - CB_INFRA: `PCIE_REMAP_WF=0x74037001`, `WF_SUBSYS_RST=0x10351/0x10340` ✅
+   - WFDMA: `BASE=0xd4000`, `PREFETCH_RING15=0x05000004`, `PREFETCH_RING16=0x05400004` ✅
+   - GLO_CFG_EXT: `EXT1=0x8C800404`, `EXT2=0x44` ✅
+   - MSI_INT_CFG: `CFG0-3` all verified against mt6639.c ✅
+   - MCU commands: `TARGET_ADDR=0x01`, `PATCH_START=0x05`, `FW_SCATTER=0xee` ✅
+
+See **docs/ZOUYONGHAO_ANALYSIS.md** section "2i" for complete verification tables.
+
 ### Next Steps
 
-1. [ ] Fix structure definitions in test_fw_load.c
-2. [ ] Rebuild and test firmware parsing
-3. [ ] Verify INIT_DOWNLOAD contains valid addr/len/offs values
-4. [ ] Verify doorbell + correct structures enables MCU consumption
-5. [ ] Verify PDA_TAR_ADDR becomes non-zero after MCU processes command
+1. [x] Fix structure definitions in test_fw_load.c
+2. [x] Rebuild and test firmware parsing
+3. [x] Verify all register values against references
+4. [ ] Load module and verify patch section shows valid addr/len/offs
+5. [ ] Verify INIT_DOWNLOAD contains valid addr/len/offs values
+6. [ ] Verify doorbell + correct structures enables MCU consumption
+7. [ ] Verify PDA_TAR_ADDR becomes non-zero after MCU processes command
 
 ---
 

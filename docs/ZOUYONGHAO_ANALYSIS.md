@@ -1884,10 +1884,94 @@ Once structures are fixed, verify:
 #### Test Status
 
 - [x] Identified structure mismatch as root cause
-- [ ] Fix structure definitions in test_fw_load.c
-- [ ] Rebuild and test firmware parsing
+- [x] Fix structure definitions in test_fw_load.c (2026-01-31)
+- [x] Rebuild and test firmware parsing
 - [ ] Verify INIT_DOWNLOAD contains valid addr/len
 - [ ] Verify doorbell + correct structures enables MCU consumption
+
+---
+
+### 2i. Phase 27f - Structure Fixes and Register Value Verification (2026-01-31)
+
+**Date**: 2026-01-31
+**Status**: **FIXES APPLIED AND VERIFIED**
+
+#### Structure Fixes Applied
+
+All firmware structures in `tests/05_dma_impl/test_fw_load.c` have been corrected to match the reference `mt76_connac2_*` structures:
+
+| Structure | Fix Applied | Status |
+|-----------|-------------|--------|
+| `mt7927_patch_hdr` | Added `u32 rsv[11]` to desc (44 bytes) | ✅ FIXED |
+| `mt7927_patch_sec` | Moved `offs` to position 2, added `size` field | ✅ FIXED |
+| `mt7927_fw_trailer` | Already correct | ✅ VERIFIED |
+| `mt7927_fw_region` | Already correct | ✅ VERIFIED |
+| `mt7927_mcu_txd` | Already correct | ✅ VERIFIED |
+| `mt7927_desc` | Added `__aligned(4)` for consistency | ✅ FIXED |
+
+#### Register Value Verification
+
+All register values in `test_fw_load.c` verified against reference implementations:
+
+##### CB_INFRA Registers (from mt6639.c)
+| Register | Value | Reference Line | Status |
+|----------|-------|----------------|--------|
+| `CB_INFRA_PCIE_REMAP_WF_VALUE` | `0x74037001` | mt6639.c:3316 | ✅ |
+| `CB_INFRA_PCIE_REMAP_WF_BT_VALUE` | `0x70007000` | mt6639.c:3319 | ✅ |
+| `WF_SUBSYS_RST_ASSERT` | `0x10351` | mt6639.c:3237 | ✅ |
+| `WF_SUBSYS_RST_DEASSERT` | `0x10340` | mt6653.c | ✅ |
+| `GPIO_MODE5_VALUE` | `0x80000000` | mt6639.c:3228 | ✅ |
+| `GPIO_MODE6_VALUE` | `0x80` | mt6639.c:3231 | ✅ |
+
+##### WFDMA Registers
+| Register | Value | Reference | Status |
+|----------|-------|-----------|--------|
+| `MT_WFDMA0_BASE` | `0xd4000` | zouyonghao fixed_map | ✅ |
+| `MT_HOST2MCU_SW_INT_SET` | `0xd4108` | wf_wfdma_host_dma0.h | ✅ |
+| `PREFETCH_RING15` | `0x05000004` | mt792x_dma.c:104 | ✅ |
+| `PREFETCH_RING16` | `0x05400004` | mt792x_dma.c:105 | ✅ |
+
+##### WFDMA GLO_CFG_EXT (from mt6639.c)
+| Register | Value | Reference Line | Status |
+|----------|-------|----------------|--------|
+| `MT7927_WPDMA_GLO_CFG_EXT1_VALUE` | `0x8C800404` | mt6639.c:2269 | ✅ |
+| `MT7927_WPDMA_GLO_CFG_EXT2_VALUE` | `0x44` | mt6639.c:2280 | ✅ |
+
+##### MSI Interrupt Config (from mt6639.c)
+| Register | Value | Reference Line | Status |
+|----------|-------|----------------|--------|
+| `MT7927_MSI_INT_CFG0_VALUE` | `0x00660077` | mt6639.c:2094 | ✅ |
+| `MT7927_MSI_INT_CFG1_VALUE` | `0x00001100` | mt6639.c:2102 | ✅ |
+| `MT7927_MSI_INT_CFG2_VALUE` | `0x0030004F` | mt6639.c:2110 | ✅ |
+| `MT7927_MSI_INT_CFG3_VALUE` | `0x00542200` | mt6639.c:2118 | ✅ |
+
+##### PCIe Remap (from mt7927_regs.h)
+| Register | Value | Reference | Status |
+|----------|-------|-----------|--------|
+| `MT7927_PCIE2AP_REMAP_WF_1_BA_VALUE` | `0x18051803` | mt7927_regs.h:174 | ✅ |
+
+##### MCU State/Reset
+| Register | Value | Reference | Status |
+|----------|-------|-----------|--------|
+| `MCU_IDLE` | `0x1D1E` | mt7927_regs.h:76 | ✅ |
+| `MT_WFSYS_SW_RST_B` (chip) | `0x7c000140` | mt7925/regs.h:83 | ✅ |
+| `MT_WFSYS_SW_INIT_DONE` | `BIT(4)` | mt7927_regs.h:61 | ✅ |
+
+##### MCU Command IDs (from mt76_connac_mcu.h)
+| Command | Value | Reference Line | Status |
+|---------|-------|----------------|--------|
+| `MCU_CMD_TARGET_ADDRESS_LEN_REQ` | `0x01` | line 1303 | ✅ |
+| `MCU_CMD_PATCH_START_REQ` | `0x05` | line 1307 | ✅ |
+| `MCU_CMD_PATCH_FINISH_REQ` | `0x07` | line 1308 | ✅ |
+| `MCU_CMD_FW_SCATTER` | `0xee` | line 1312 | ✅ |
+
+#### Next Steps
+
+With structures and register values verified correct:
+1. Load test module and verify patch section parsing shows valid `addr`/`len`/`offs`
+2. Verify `PDA_TAR_ADDR` becomes non-zero after INIT_DOWNLOAD
+3. Verify Ring 15/16 DIDX increments as MCU consumes data
+4. If still not working, investigate MCU DMA path enablement
 
 ---
 

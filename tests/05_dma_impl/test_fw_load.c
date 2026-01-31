@@ -369,7 +369,7 @@ struct mt7927_desc {
 	__le32 ctrl;
 	__le32 buf1;
 	__le32 info;
-} __packed;
+} __packed __aligned(4);
 
 /* Descriptor control bits - from MediaTek TXD_STRUCT in hif_pdma.h
  *
@@ -444,24 +444,24 @@ struct mt7927_patch_hdr {
 		__be32 feature;
 		__be32 n_region;
 		__be32 crc;
+		u32 rsv[11];	/* Phase 27f fix: was missing 44 bytes */
 	} desc;
 } __packed;
 
 struct mt7927_patch_sec {
 	__be32 type;
-	char reserved[4];
+	__be32 offs;	/* Phase 27f fix: moved from end to position 2 */
+	__be32 size;	/* Phase 27f fix: was missing entirely */
 	union {
 		__be32 spec[13];
 		struct {
 			__be32 addr;
 			__be32 len;
-			u8 sec_key_idx;
-			u8 align_len;
-			u8 reserved[2];
-			__be32 enc_type;
-		} __packed info;
+			__be32 sec_key_idx;
+			__be32 align_len;
+			u32 rsv[9];
+		} info;
 	};
-	__be32 offs;
 } __packed;
 
 struct mt7927_fw_region {
