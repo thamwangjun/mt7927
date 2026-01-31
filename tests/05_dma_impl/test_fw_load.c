@@ -248,6 +248,13 @@
 #define MT_WFDMA_HIF_PERF_MAVG_DIV                      0x0d70C0    /* 0x7C0270C0 */
 #define MT_WFDMA_DLY_IDX_CFG_0                          0x0d70E8    /* 0x7C0270E8 */
 
+/* PCIe MAC Interrupt Routing - CRITICAL for DMA completion signaling!
+ * From zouyonghao pci.c:608-612: Set AFTER IRQ registration, BEFORE DMA init
+ * fixed_map: { 0x74030000, 0x010000, 0x0010000 }
+ * Chip address 0x74030074 → BAR0 0x010074 */
+#define MT_PCIE_MAC_INT_CONFIG                          0x010074
+#define MT_PCIE_MAC_INT_CONFIG_VALUE                    0x08021000
+
 /* MT7927 MSI configuration values (from MTK driver) */
 #define MT7927_MSI_NUM_SINGLE                           0
 #define MT7927_MSI_INT_CFG0_VALUE                       0x00660077
@@ -1065,31 +1072,52 @@ static int claim_host_ownership(struct test_dev *dev)
 }
 
 /* ============================================================
- * Phase 2.5: PCIE2AP Remap and WFDMA Extension Configuration
- * Reference: pci_mcu.c::mt7927e_mcu_init() lines 146-207
+ * Phase 2a: PCIe MAC Interrupt Routing Configuration
+ * Reference: zouyonghao pci.c:608-612
  *
- * CRITICAL: These settings enable proper PCIe to MCU communication
- * and must be done BEFORE DMA ring setup.
+ * CRITICAL: This configures how DMA completion interrupts are routed
+ * through the PCIe MAC. Without this, DMA engine might work but
+ * can't signal completion properly (DIDX doesn't advance).
+ *
+ * Set AFTER power control/IRQ setup, BEFORE DMA init.
  * ============================================================ */
 
-static int configure_pcie_wfdma(struct test_dev *dev)
+static int configure_pcie_mac_int(struct test_dev *dev)
 {
 	u32 val;
 
-	dev_info(&dev->pdev->dev, "=== Phase 2.5: PCIE/WFDMA Configuration ===\n");
+	dev_info(&dev->pdev->dev, "=== Phase 2a: PCIe MAC Interrupt Routing ===\n");
 
-	/* Step 1: Set PCIE2AP remap for MCU communication
-	 * This maps PCIe address space to MCU's address space
-	 * Register: 0x7C021034 (CONN_BUS_CR_VON + 0x34)
-	 * Value: 0x18051803
+	/* From zouyonghao pci.c:608-612:
+	 * if (pdev->device == 0x7927) {
+	 *     mt76_wr(dev, MT7927_PCIE_MAC_INT_CONFIG_ADDR, MT7927_PCIE_MAC_INT_CONFIG_VALUE);
+	 * }
+	 * This is MT7927-specific - MT7925 doesn't need it.
 	 */
-	dev_info(&dev->pdev->dev, "  Setting PCIE2AP remap for MCU communication...\n");
-	mt_wr(dev, CONN_BUS_CR_VON_PCIE2AP_REMAP_WF_1_BA, MT7927_PCIE2AP_REMAP_WF_1_BA_VALUE);
-	val = mt_rr(dev, CONN_BUS_CR_VON_PCIE2AP_REMAP_WF_1_BA);
-	dev_info(&dev->pdev->dev, "    PCIE2AP_REMAP_WF_1_BA = 0x%08x (expected 0x%08x)\n",
-		 val, MT7927_PCIE2AP_REMAP_WF_1_BA_VALUE);
+	dev_info(&dev->pdev->dev, "  Setting PCIe MAC interrupt config (BAR0 + 0x%06x)...\n",
+		 MT_PCIE_MAC_INT_CONFIG);
+	mt_wr(dev, MT_PCIE_MAC_INT_CONFIG, MT_PCIE_MAC_INT_CONFIG_VALUE);
+	val = mt_rr(dev, MT_PCIE_MAC_INT_CONFIG);
+	dev_info(&dev->pdev->dev, "    PCIE_MAC_INT_CONFIG = 0x%08x (expected 0x%08x) %s\n",
+		 val, MT_PCIE_MAC_INT_CONFIG_VALUE,
+		 val == MT_PCIE_MAC_INT_CONFIG_VALUE ? "OK" : "MISMATCH!");
 
-	/* Step 2: Configure WFDMA MSI (single MSI mode) */
+	return 0;
+}
+
+/* ============================================================
+ * Phase 2.5: WFDMA Extension Configuration (MSI, GLO_CFG_EXT, etc.)
+ * Reference: pci_mcu.c::mt7927e_mcu_init() lines 159-206
+ *
+ * NOTE: PCIE2AP remap moved to Phase 3.5 (after DMA init) per
+ * zouyonghao initialization order analysis.
+ * ============================================================ */
+
+static int configure_wfdma_extensions(struct test_dev *dev)
+{
+	dev_info(&dev->pdev->dev, "=== Phase 2.5: WFDMA Extension Configuration ===\n");
+
+	/* Step 1: Configure WFDMA MSI (single MSI mode) */
 	dev_info(&dev->pdev->dev, "  Configuring WFDMA MSI...\n");
 	mt_wr(dev, MT_WFDMA_HOST_CONFIG, MT7927_MSI_NUM_SINGLE);
 	mt_wr(dev, MT_WFDMA_MSI_INT_CFG0, MT7927_MSI_INT_CFG0_VALUE);
@@ -1098,21 +1126,21 @@ static int configure_pcie_wfdma(struct test_dev *dev)
 	mt_wr(dev, MT_WFDMA_MSI_INT_CFG3, MT7927_MSI_INT_CFG3_VALUE);
 	dev_info(&dev->pdev->dev, "    MSI_INT_CFG0-3 configured\n");
 
-	/* Step 3: Configure WFDMA extensions (TX flow control) */
+	/* Step 2: Configure WFDMA extensions (TX flow control) */
 	dev_info(&dev->pdev->dev, "  Configuring WFDMA extensions...\n");
 	mt_wr(dev, MT_WFDMA_GLO_CFG_EXT1, MT7927_WPDMA_GLO_CFG_EXT1_VALUE);
 	mt_wr(dev, MT_WFDMA_GLO_CFG_EXT2, MT7927_WPDMA_GLO_CFG_EXT2_VALUE);
 	dev_info(&dev->pdev->dev, "    GLO_CFG_EXT1 = 0x%08x, EXT2 = 0x%08x\n",
 		 mt_rr(dev, MT_WFDMA_GLO_CFG_EXT1), mt_rr(dev, MT_WFDMA_GLO_CFG_EXT2));
 
-	/* Step 4: Configure HIF performance moving average divisor
+	/* Step 3: Configure HIF performance moving average divisor
 	 * From zouyonghao pci_mcu.c: mt7927e_mcu_init() */
 	dev_info(&dev->pdev->dev, "  Configuring WFDMA HIF performance...\n");
 	mt_wr(dev, MT_WFDMA_HIF_PERF_MAVG_DIV, MT7927_WFDMA_HIF_PERF_MAVG_DIV_VALUE);
 	dev_info(&dev->pdev->dev, "    HIF_PERF_MAVG_DIV = 0x%08x\n",
 		 mt_rr(dev, MT_WFDMA_HIF_PERF_MAVG_DIV));
 
-	/* Step 5: Configure RX ring thresholds
+	/* Step 4: Configure RX ring thresholds
 	 * From zouyonghao pci_mcu.c: Loop from TH10 to TH1110 */
 	dev_info(&dev->pdev->dev, "  Configuring RX ring thresholds...\n");
 	{
@@ -1126,14 +1154,14 @@ static int configure_pcie_wfdma(struct test_dev *dev)
 	dev_info(&dev->pdev->dev, "    RX thresholds set to 0x%02x\n",
 		 MT7927_RX_RING_THRESHOLD_DEFAULT);
 
-	/* Step 6: Configure periodic delayed interrupt
+	/* Step 5: Configure periodic delayed interrupt
 	 * From zouyonghao pci_mcu.c */
 	dev_info(&dev->pdev->dev, "  Configuring delay interrupts...\n");
 	mt_wr(dev, MT_WFDMA_HOST_PER_DLY_INT_CFG, MT7927_PER_DLY_INT_CFG_VALUE);
 	dev_info(&dev->pdev->dev, "    PER_DLY_INT_CFG = 0x%08x\n",
 		 mt_rr(dev, MT_WFDMA_HOST_PER_DLY_INT_CFG));
 
-	/* Step 7: Configure ring 4-7 delay interrupt
+	/* Step 6: Configure ring 4-7 delay interrupt
 	 * From zouyonghao pci_mcu.c */
 	mt_wr(dev, MT_WFDMA_DLY_IDX_CFG_0, MT7927_DLY_IDX_CFG_RING4_7_VALUE);
 	dev_info(&dev->pdev->dev, "    DLY_IDX_CFG_0 = 0x%08x\n",
@@ -1499,6 +1527,40 @@ static int setup_dma_ring(struct test_dev *dev)
 	}
 
 	dev_info(&dev->pdev->dev, "  DMA setup complete!\n");
+	return 0;
+}
+
+/* ============================================================
+ * Phase 3.5: PCIE2AP Remap Configuration (AFTER DMA init!)
+ * Reference: pci_mcu.c::mt7927e_mcu_init() line 148
+ *
+ * CRITICAL TIMING: Zouyonghao sets this in mt7927e_mcu_init() which is
+ * called AFTER DMA queues are allocated (mt792x_dma_init).
+ * This is different from our previous approach of setting it early.
+ *
+ * This maps PCIe address space to MCU's address space for communication.
+ * ============================================================ */
+
+static int configure_pcie2ap_remap(struct test_dev *dev)
+{
+	u32 val;
+
+	dev_info(&dev->pdev->dev, "=== Phase 3.5: PCIE2AP Remap (AFTER DMA init!) ===\n");
+
+	/* Set PCIE2AP remap for MCU communication
+	 * From zouyonghao pci_mcu.c:148:
+	 *   mt76_wr(dev, CONN_BUS_CR_VON_CONN_INFRA_PCIE2AP_REMAP_WF_1_BA_ADDR, 0x18051803);
+	 *
+	 * Register: 0x7C021034 → BAR0 0x0d1034
+	 * Value: 0x18051803
+	 */
+	dev_info(&dev->pdev->dev, "  Setting PCIE2AP remap for MCU communication...\n");
+	mt_wr(dev, CONN_BUS_CR_VON_PCIE2AP_REMAP_WF_1_BA, MT7927_PCIE2AP_REMAP_WF_1_BA_VALUE);
+	val = mt_rr(dev, CONN_BUS_CR_VON_PCIE2AP_REMAP_WF_1_BA);
+	dev_info(&dev->pdev->dev, "    PCIE2AP_REMAP_WF_1_BA = 0x%08x (expected 0x%08x) %s\n",
+		 val, MT7927_PCIE2AP_REMAP_WF_1_BA_VALUE,
+		 val == MT7927_PCIE2AP_REMAP_WF_1_BA_VALUE ? "OK" : "MISMATCH!");
+
 	return 0;
 }
 
@@ -1984,11 +2046,20 @@ static int test_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		dev_warn(&pdev->dev, "Host ownership claim issue: %d\n", ret);
 	}
 
-	/* Phase 2.5: PCIE2AP remap and WFDMA extension configuration
-	 * CRITICAL: Must be done before DMA ring setup */
-	ret = configure_pcie_wfdma(dev);
+	/* Phase 2a: PCIe MAC Interrupt Routing - CRITICAL for DMA completion!
+	 * Reference: zouyonghao pci.c:608-612
+	 * Set AFTER power control/ownership, BEFORE DMA init.
+	 * Without this, DMA completion signals may not reach the host. */
+	ret = configure_pcie_mac_int(dev);
 	if (ret) {
-		dev_warn(&pdev->dev, "PCIE/WFDMA config issue: %d\n", ret);
+		dev_warn(&pdev->dev, "PCIe MAC int config issue: %d\n", ret);
+	}
+
+	/* Phase 2.5: WFDMA extension configuration (MSI, GLO_CFG_EXT, etc.)
+	 * NOTE: PCIE2AP remap moved to Phase 3.5 (after DMA init) per zouyonghao order */
+	ret = configure_wfdma_extensions(dev);
+	if (ret) {
+		dev_warn(&pdev->dev, "WFDMA extension config issue: %d\n", ret);
 	}
 
 	/* Phase 3: Setup DMA ring */
@@ -1996,6 +2067,14 @@ static int test_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret) {
 		dev_err(&pdev->dev, "DMA ring setup failed: %d\n", ret);
 		goto err_release_ram;
+	}
+
+	/* Phase 3.5: PCIE2AP remap - CRITICAL, must be AFTER DMA init!
+	 * Reference: zouyonghao pci_mcu.c::mt7927e_mcu_init() line 148
+	 * This is a timing fix - zouyonghao sets this AFTER DMA queues are allocated. */
+	ret = configure_pcie2ap_remap(dev);
+	if (ret) {
+		dev_warn(&pdev->dev, "PCIE2AP remap issue: %d\n", ret);
 	}
 
 	/* Phase 4-5: Load firmware */
