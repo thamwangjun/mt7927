@@ -2336,3 +2336,194 @@ Our manual `dma_alloc_coherent()` + direct register writes may be missing subtle
 3. **Add GLO_CFG_EXT1 BIT(28)** - MT7927-specific flag
 4. **Use `RST_DTX_PTR = ~0`** to reset all rings
 5. **Consider using mt76 framework** instead of manual approach
+
+---
+
+## 2l. Phase 28 Analysis: DMA Memory Access Failure (2026-01-31)
+
+### Test Results Summary
+
+Loaded `test_fw_load.ko` after implementing all zouyonghao patterns. The test completed all initialization phases successfully but **DMA transfers completely failed** - the device never consumed any descriptors.
+
+### What's Working (All Initialization Phases)
+
+| Phase | Status | Evidence |
+|-------|--------|----------|
+| CB_INFRA PCIe Remap | ✅ OK | `PCIE_REMAP_WF = 0x74037001` |
+| Power Control | ✅ OK | `LPCTL = 0x00000000` (driver owns) |
+| WF/BT Subsystem Reset | ✅ OK | Reset sequence completed |
+| CONN_INFRA Init | ✅ OK | Version = 0x03010002 |
+| MCU IDLE Wait | ✅ OK | `ROMCODE_INDEX = 0x00001d1e` |
+| PCIE2AP Remap | ✅ OK | `0x18051803` configured |
+| WFDMA MSI Config | ✅ OK | MSI_INT_CFG0-3 set |
+| WFDMA Extensions | ✅ OK | GLO_CFG_EXT1 = 0x9c800404 |
+| Ring 15 (MCU_WM) | ✅ OK | BASE=0xffff9000, CNT=128 |
+| Ring 16 (FWDL) | ✅ OK | BASE=0xffff8000, CNT=128 |
+| GLO_CFG | ✅ OK | 0x5030b871 (TX_DMA_EN set) |
+| DMA Priority Regs | ✅ OK | INT_RX_PRI=0x0F00, INT_TX_PRI=0x7F00 |
+
+### Critical Failure: DIDX Never Advances
+
+```
+Ring 16 DMA timeout (CIDX=1, DIDX=0)
+Ring 16 DMA timeout (CIDX=2, DIDX=0)
+...
+Ring 16 DMA timeout (CIDX=60, DIDX=0)
+```
+
+**Key observation**: Host successfully writes descriptors and increments CIDX, but device's DIDX stays at 0 forever. The DMA engine is NOT consuming ANY descriptors.
+
+### Error Indicators
+
+**1. Memory Error from First Attempt**
+```
+MCU_INT_STA(0xd4110)=0x00000001 (MEM_ERR=1 DMA_ERR=0)
+```
+The DMA engine immediately reports a memory access error on the very first DMA operation.
+
+**2. Final Error State**
+```
+WPDMA2HOST_ERR_INT_STA(0xd41E8): 0x00000001
+  TX_TIMEOUT=1          ← DMA timed out
+
+MCU_INT_STA(0xd4110): 0x00010001
+  MEM_ERR=1             ← Memory access error persists
+
+PDA_DWLD_STATE(0x2808): 0x0fffe01a
+  PDA_FINISH=0          ← PDA never finished
+  PDA_BUSY=1            ← PDA stuck
+  WFDMA_FINISH=0        ← WFDMA never finished
+  WFDMA_BUSY=1          ← WFDMA stuck
+  WFDMA_OVERFLOW=1      ← Ring overflowed (nothing consumed)
+```
+
+### Descriptor Analysis
+
+The descriptors appear correctly formatted:
+```
+[DIAG] Ring 16 desc[0] before kick:
+  buf0=0xffff7000 (SDPtr0 lower32)
+  ctrl=0x50000000 (SDLen0=4096, LS0=1, DONE=0)
+  buf1=0x00000000 (SDPtr1 - should be 0)
+  info=0x00000000 (SDPtr0Ext=0, SDPtr1Ext=0)
+  dma_buf_phys=0xffff7000
+```
+
+- buf0 = physical address lower 32 bits ✓
+- ctrl has LS0=1 (last segment), length=4096 ✓
+- buf1/info = 0 (single buffer mode) ✓
+
+### DMA Address Analysis
+
+```
+Ring 15 (MCU_WM) allocated at DMA 0x00000000ffff9000
+Ring 16 (FWDL) allocated at DMA 0x00000000ffff8000
+DMA buffer: phys=0xffff7000 (lower=0xffff7000 upper=0x00000000)
+```
+
+All DMA addresses are 32-bit addresses in the sub-1MB range. These are likely IOMMU-mapped addresses (IOVAs) rather than raw physical addresses.
+
+### Root Cause Theories
+
+**Theory 1: Missing WFDMA-to-PCIe Bridge Configuration (MOST LIKELY)**
+
+We configure `PCIE_REMAP_WF` for CPU-to-chip register access, and `PCIE2AP_REMAP` for MCU-to-host communication. But there may be additional configuration needed for **WFDMA-to-host memory access** (the DMA engine reading descriptors and data buffers from host RAM).
+
+The `MEM_ERR=1` on the first attempt suggests the WFDMA's AXI bus cannot resolve the target address when trying to fetch descriptors.
+
+**Theory 2: IOMMU/DMA Address Translation Issue**
+
+On systems with IOMMU, `dma_alloc_coherent()` returns IOVA (I/O Virtual Address) that only the device can use. The address 0xffff7000 might be an IOVA that requires proper IOMMU setup to translate to actual physical memory. If the device's DMA doesn't go through the IOMMU properly, it would fail.
+
+**Theory 3: PCIe Bus Address vs Physical Address Mismatch**
+
+On some platforms, PCI bus addresses differ from CPU physical addresses. The device might need different address configuration to reach host memory via PCIe.
+
+**Theory 4: AXI Bus Configuration Missing**
+
+MediaTek gen4m code has extensive PCIe/WFDMA configuration for address decoding. The WFDMA engine may need specific AXI bus configuration to route DMA requests through PCIe to host memory.
+
+### Evidence Supporting Memory Access Issue
+
+1. **MEM_ERR appears immediately** - Not a timing issue; fundamental access problem
+2. **DIDX stays at 0** - DMA engine never even started processing
+3. **WFDMA_BUSY=1 with WFDMA_FINISH=0** - Engine stuck, not progressing
+4. **No DMA_ERR** - It's specifically a memory access error, not a DMA protocol error
+
+### Comparison with Zouyonghao
+
+Zouyonghao uses **mt76 framework** which handles DMA setup via:
+- `mt76_dma_attach()` - Attaches DMA engine
+- `mt76_init_mcu_queue()` - Initializes MCU queues with proper DMA config
+- `mt76_queue_alloc()` - Allocates queues with correct attributes
+
+The mt76 framework may configure additional registers or use different allocation strategies that we're missing in our standalone test.
+
+### Registers to Investigate
+
+| Register | Purpose | Current Status |
+|----------|---------|----------------|
+| WFDMA AXI config | Configure AXI bus for memory access | Unknown |
+| PCIe BAR aperture | Define accessible memory regions | Not configured |
+| Address remap for DMA | Translate host addresses | May be missing |
+| WFDMA bus master enable | Allow DMA engine to initiate transactions | Assumed enabled |
+
+### Recommended Next Steps
+
+1. **Search for AXI/bus configuration** in reference_mtk_modules - look for registers that configure WFDMA memory access path
+
+2. **Verify IOMMU status** - Check if system has active IOMMU and if our DMA addresses are being translated correctly:
+   ```bash
+   dmesg | grep -i iommu
+   cat /sys/kernel/iommu_groups/*/devices/*
+   ```
+
+3. **Try different DMA allocation** - Use `GFP_DMA32` explicitly or try allocating above 4GB to rule out address range issues
+
+4. **Check descriptor after timeout** - Read back the descriptor's DONE bit to see if DMA engine touched it at all
+
+5. **Investigate AP2PCIE direction** - We configure PCIE2AP (device→host for responses), but may need AP2PCIE (host→device) configuration for DMA fetches
+
+6. **Compare with mt7925 DMA init** - MT7925 (which works on Linux) has similar architecture; check if there are additional DMA setup steps
+
+### Raw Log Excerpts for Reference
+
+**Successful Initialization:**
+```
+CB_INFRA PCIe remap initialization complete
+CONN_INFRA version: 0x03010002 (OK)
+MCU IDLE reached: 0x00001d1e
+Driver owns device: LPCTL=0x00000000
+Ring 15: BASE=0xffff9000 CTRL1=0x00000080 CIDX=0 DIDX=0
+Ring 16: BASE=0xffff8000 CTRL1=0x00000080 CIDX=0 DIDX=0
+DMA enabled, GLO_CFG=0x5030b871
+```
+
+**DMA Failure Pattern:**
+```
+[DIAG] Ring 16 desc[0] before kick:
+  buf0=0xffff7000 ctrl=0x50000000 buf1=0x00000000 info=0x00000000
+Ring 16 DMA timeout (CIDX=1, DIDX=0)
+MCU_INT_STA(0xd4110)=0x00000001 (MEM_ERR=1 DMA_ERR=0)
+```
+
+**Final State:**
+```
+WFDMA GLO_CFG: 0x5030b873
+Ring 16 (FWDL) CIDX/DIDX: 60/0  ← Host wrote 60 descriptors, device consumed 0
+MCU_INT_STA: 0x00010001 (MEM_ERR=1)
+PDA_DWLD_STATE: 0x0fffe01a (WFDMA_OVERFLOW=1, WFDMA_BUSY=1, WFDMA_FINISH=0)
+```
+
+---
+
+### Conclusion
+
+The firmware loading **protocol** is correct (polling mode, no mailbox waits, proper delays). The **initialization sequence** completes successfully (MCU reaches IDLE, rings configured, DMA enabled).
+
+The blocker is at a **lower level**: the WFDMA engine cannot access host memory to fetch descriptors. This manifests as `MEM_ERR=1` immediately on the first DMA attempt and DIDX never advancing.
+
+**Next investigation should focus on**:
+1. WFDMA bus/AXI configuration registers
+2. PCIe address translation for DMA
+3. IOMMU interaction with MediaTek WiFi DMA

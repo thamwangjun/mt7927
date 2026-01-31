@@ -3456,6 +3456,106 @@ Our code uses the **correct value** from MTK coda headers.
 
 ---
 
+## Phase 28: DMA Memory Access Failure (2026-01-31)
+
+**Status**: ❌ BLOCKED - WFDMA engine cannot access host memory
+
+### Summary
+
+Loaded `test_fw_load.ko` with all zouyonghao patterns implemented. All initialization phases complete successfully but DMA transfers completely fail - the device never consumes any descriptors.
+
+### Test Results
+
+**What's Working (All Initialization)**:
+
+| Phase | Status | Evidence |
+|-------|--------|----------|
+| CB_INFRA PCIe Remap | ✅ | `PCIE_REMAP_WF = 0x74037001` |
+| Power Control | ✅ | `LPCTL = 0x00000000` (driver owns) |
+| WF/BT Subsystem Reset | ✅ | Completed successfully |
+| CONN_INFRA Init | ✅ | Version = 0x03010002 |
+| MCU IDLE Wait | ✅ | `ROMCODE_INDEX = 0x00001d1e` |
+| Ring 15 (MCU_WM) | ✅ | BASE=0xffff9000, CNT=128 |
+| Ring 16 (FWDL) | ✅ | BASE=0xffff8000, CNT=128 |
+| GLO_CFG | ✅ | 0x5030b871 (TX_DMA_EN set) |
+| All priority regs | ✅ | INT_RX_PRI, INT_TX_PRI configured |
+
+**What's Failing (DMA Transfers)**:
+
+| Symptom | Evidence |
+|---------|----------|
+| DIDX never advances | `Ring 16 DMA timeout (CIDX=1..60, DIDX=0)` |
+| Memory error | `MCU_INT_STA = 0x00000001 (MEM_ERR=1)` |
+| WFDMA stuck | `PDA_DWLD_STATE: WFDMA_BUSY=1, WFDMA_FINISH=0` |
+| Ring overflow | `WFDMA_OVERFLOW=1` (nothing consumed) |
+| TX timeout | `WPDMA2HOST_ERR_INT_STA: TX_TIMEOUT=1` |
+
+### Root Cause Analysis
+
+The `MEM_ERR=1` appearing on the **very first DMA attempt** indicates the WFDMA engine is trying to fetch descriptors from host RAM but failing.
+
+**Most Likely Causes**:
+
+1. **Missing WFDMA-to-PCIe bridge configuration** - We configure `PCIE_REMAP_WF` for CPU→chip register access, and `PCIE2AP_REMAP` for MCU→host communication, but there may be additional configuration for WFDMA→host memory access (DMA engine reading descriptors/data from host RAM).
+
+2. **IOMMU/DMA address translation issue** - DMA addresses (0xffff7000, 0xffff8000, 0xffff9000) are likely IOMMU-mapped IOVAs. If device doesn't go through IOMMU correctly, access fails.
+
+3. **AXI bus configuration missing** - WFDMA may need specific AXI bus configuration to route DMA requests through PCIe to host memory.
+
+### Key Evidence
+
+**Error from first DMA attempt**:
+```
+MCU_INT_STA(0xd4110)=0x00000001 (MEM_ERR=1 DMA_ERR=0)
+```
+
+**Final error state**:
+```
+WPDMA2HOST_ERR_INT_STA: 0x00000001 (TX_TIMEOUT=1)
+MCU_INT_STA: 0x00010001 (MEM_ERR=1)
+PDA_DWLD_STATE: 0x0fffe01a
+  PDA_FINISH=0, PDA_BUSY=1
+  WFDMA_FINISH=0, WFDMA_BUSY=1, WFDMA_OVERFLOW=1
+```
+
+**DMA addresses**:
+```
+Ring 15: DMA 0x00000000ffff9000
+Ring 16: DMA 0x00000000ffff8000
+Buffer:  DMA 0x00000000ffff7000
+```
+
+### What We Learned
+
+1. **Protocol is correct** - Polling-based loading, no mailbox waits, proper delays
+2. **Initialization is correct** - MCU reaches IDLE, rings configured, DMA enabled
+3. **Blocker is lower-level** - WFDMA cannot access host memory at all
+4. **Not a timing issue** - MEM_ERR appears on very first attempt
+
+### Comparison with Zouyonghao
+
+Zouyonghao uses **mt76 framework** for DMA setup:
+- `mt76_dma_attach()` - Attaches DMA engine
+- `mt76_init_mcu_queue()` - Initializes MCU queues
+- `mt76_queue_alloc()` - Allocates with correct attributes
+
+The mt76 framework may configure additional registers we're missing in standalone test.
+
+### Next Steps
+
+1. Search for WFDMA AXI/bus configuration registers in reference code
+2. Verify IOMMU status and DMA address translation
+3. Compare with mt7925 DMA init (similar architecture, works on Linux)
+4. Try different DMA allocation strategies
+5. Investigate AP2PCIE (host→device) direction for DMA fetches
+
+### Files Modified
+
+- **docs/ZOUYONGHAO_ANALYSIS.md** - Added section 2l with complete Phase 28 analysis
+- **CLAUDE.md** - Updated current status to Phase 28
+
+---
+
 ## Appendix A: Debunked Assumptions (Comprehensive List)
 
 This section documents all assumptions made during development that were later proven wrong, with citations to the evidence that debunked them.
