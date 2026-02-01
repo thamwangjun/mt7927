@@ -1,83 +1,56 @@
 # MT7927 WiFi 7 Linux Driver Development - Session Bootstrap
 
-## Critical Discoveries
+> **⚠️ PROJECT STATUS: STALLED (Phase 29c) ⚠️**
+>
+> This driver does not work. After 29+ phases of investigation, firmware loads but never executes.
+> DMA data never reaches device memory. See [README.md](README.md) for details.
 
-1. **MT7927 = MT6639 variant** (NOT MT7925 as initially assumed). MediaTek kernel modules prove this. MT7925 firmware is compatible (CONNAC3X shared firmware).
-
-2. **ROOT CAUSE FOUND (Phase 17)**: MT7927 ROM bootloader does **NOT support mailbox protocol**! DMA hardware works fine - we're using the wrong communication protocol.
-
-3. **WIRING GAP (Phase 18)**: Zouyonghao reference driver has correct polling-based FW loader functions, but they are **never called** - firmware loading is not wired into MCU init!
-
-4. **REGISTER MAPPING CLARIFIED (Phase 19)**: MediaTek vendor code confirms WFDMA0 is at BAR0 offset **0xd4000** (NOT 0x2000). Previous documentation had wrong base address. Also discovered mandatory CB_INFRA PCIe remap initialization.
-
-5. **CB_INFRA VALUES CONFIRMED (Phase 20)**: Deep analysis of both `reference_mtk_modules/` and `reference_gen4m/` confirmed exact register values:
-   - PCIe Remap WF: **0x74037001** (from mt6639.c:2727-2737)
-   - PCIe Remap WF_BT: **0x70007000**
-   - Crypto MCU ownership uses **SET register** at 0x70025034 (not status at 0x70025030)
-   - Firmware loading confirmed to use **polling mode** (`fgCheckStatus=FALSE` in fw_dl.c)
-
-6. **⚠️ CRITICAL BUG FOUND (Phase 21)**: Driver was writing to WRONG DMA engine!
-   - BAR0+0x2000 = **MCU DMA** (for chip's internal MCU, NOT for host)
-   - BAR0+0xd4000 = **HOST DMA** (what firmware loading actually needs!)
-   - All previous ring configuration went to wrong address space
-   - Ring 15 should be at **0xd43f0** (not 0x23f0)
-   - Ring 16 should be at **0xd4400** (not 0x2400)
-   - From MT6639 bus2chip: `{0x7c020000, 0xd0000, 0x10000}` → chip 0x7c024000 = BAR0+0xd4000
-
-7. **✅ MCU IDLE CONFIRMED (Phase 24)**: First successful MCU IDLE (0x1D1E) - hardware initialization progresses correctly!
-
-8. **⚠️ RING CONFIG FAILURE (Phase 25)**: Ring configuration registers not accepting writes despite correct WFDMA base. Missing DMA initialization steps identified.
-
-9. **🔧 PHASE 26 FIXES**: Implemented 6 critical differences from zouyonghao reference:
-   - **DMA priority registers**: Added `INT_RX_PRI=0x0F00`, `INT_TX_PRI=0x7F00`
-   - **GLO_CFG_EXT1 BIT(28)**: Added MT7927-specific enable bit
-   - **WFDMA_DUMMY_CR**: Added `MT_WFDMA_NEED_REINIT` flag
-   - **Reset scope**: Changed `RST_DTX_PTR` to `~0` (all rings)
-   - **Descriptor init**: Set DMA_DONE bit on all descriptors (was memset to 0)
-   - **DIDX write**: Now write both CIDX and DIDX to 0
-
-10. **✅ GLO_CFG TIMING FIX (Phase 27)**: Fixed ring configuration by reordering:
-    - Clear GLO_CFG BEFORE ring configuration
-    - Set CLK_GAT_DIS AFTER ring configuration
-    - Ring 15/16 BASE and EXT_CTRL now accept writes!
-
-11. **✅ PAGE FAULT ROOT CAUSE (Phase 27)**: DMA page faults at address 0x0 were caused by:
-    - **15 unused TX rings (0-14) had BASE=0**
-    - DMA engine scans ALL rings when enabled → tries to fetch from 0x0 → IOMMU fault
-    - **Fix implemented**: Initialize all unused rings to valid DMA address
-
-12. **✅ RX_DMA_EN TIMING (Phase 27b)**: After TX ring fix, 3 page faults remained:
-    - **RX rings have BASE=0** (not initialized) but `RX_DMA_EN` was enabled
-    - DMA engine scans RX rings → access 0x0 → IOMMU fault → DMA halts → DIDX stuck at 0
-    - **Fix implemented**: Only enable `TX_DMA_EN` during firmware loading
-    - RX_DMA_EN should be enabled later after RX rings are properly configured
-
-13. **✅ TXD CONTROL WORD FIX VERIFIED (Phase 27c)**: TRUE root cause of page faults FIXED:
-    - **TXD descriptor control word bit layout was WRONG!**
-    - SDLen0 was in bits 0-13 (should be **bits 16-29**)
-    - LastSec0 was in bit 14 (should be **bit 30**)
-    - With ctrl=0x404C, hardware read SDLen1=76 bytes at SDPtr1=0x0 → DMA tried to fetch from address 0!
-    - **Fix verified**: Control word now shows `ctrl=0x404c0000` (correct format)
-    - **No more AMD-Vi IO_PAGE_FAULT errors!**
-
-14. **⚠️ GLOBAL DMA PATH ISSUE (Phase 27d)**: Critical finding from diagnostic run:
-    - **BOTH Ring 15 AND Ring 16 have DIDX stuck at 0** - NOT a Ring 16-specific issue!
-    - Ring 15 (MCU_WM): CIDX=7, DIDX=0 - commands not processed
-    - Ring 16 (FWDL): CIDX=50, DIDX=0 - data not processed
-    - `TX_TIMEOUT=1` error at end - DMA tried to send but MCU didn't acknowledge
-    - `tx_done_int_sts_15=1` but DIDX=0 - interrupt may be stale or spurious
-    - **Root cause**: MCU/target side not accepting DMA data
-    - Hypothesis: MCU_DMA0 RX not enabled, or PDA not configured
+---
 
 ## Current Status
 
-**Status**: 🔧 PHASE 27d - RING 16 DIDX INVESTIGATION
-**Last Updated**: January 2026 (Phase 27c fix verified)
+**Status**: ❌ STALLED - Phase 29c
+**Last Updated**: 2026-02-01
 
-### What's Working ✅
-- Driver successfully binds to MT7927 hardware (PCI ID: 14c3:7927)
-- Power management handshake completes (LPCTL: 0x04 → 0x00)
-- WiFi subsystem reset completes (INIT_DONE achieved)
+### The Unsolved Problem
+
+**DMA data never reaches device memory.**
+
+- MCU status stays at 0x00000000 after all firmware regions
+- FW_N9_RDY stuck at 0x00000002 (download mode, N9 not ready)
+- FW_START command times out
+- IOMMU page faults observed in some runs
+
+### What Works ✅
+- Driver binds to MT7927 hardware (PCI ID: 14c3:7927)
+- Power management handshake completes
+- WiFi subsystem reset completes
+- CB_INFRA initialization (PCIe remap 0x74037001)
+- MCU reaches IDLE state (0x1D1E)
+- DMA rings configured correctly (verified via hardware readback)
+- Host-side DMA transfer completes
+
+### What Does NOT Work ❌
+- Device never receives firmware data
+- Firmware never executes
+- No WiFi interface created
+- No network functionality
+
+---
+
+## Critical Discoveries (Historical)
+
+1. **MT7927 = MT6639 variant** (NOT MT7925). MediaTek kernel modules prove this.
+
+2. **ROOT CAUSE FOUND (Phase 17)**: ROM bootloader does NOT support mailbox protocol - use polling.
+
+3. **WFDMA base is 0xd4000** (NOT 0x2000) - Phase 21 discovery.
+
+4. **CB_INFRA remap required**: 0x74037001 at BAR0+0x1f6554 before WFDMA access.
+
+5. **Many fixes applied** (Phases 22-28): GLO_CFG timing, TXD format, ring initialization, doorbell interrupts, etc.
+
+6. **Final blocker** (Phase 29c): Despite all fixes, DMA data never reaches device. Cause unknown.
 - CB_INFRA PCIe remap configured (0x74037001)
 - **MCU reaches IDLE state (0x1D1E)** - Confirmed! ✅
 - CONN_INFRA version correct (0x03010002)

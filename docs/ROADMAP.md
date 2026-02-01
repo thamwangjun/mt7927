@@ -1,442 +1,213 @@
 # Development Roadmap
 
+> **⚠️ PROJECT STATUS: STALLED (Phase 29c) ⚠️**
+>
+> This project has reached an impasse. The driver does not work and WiFi functionality is not available.
+
+---
+
 ## Current Status
 
-**Status as of 2026-01-31**: **PHASE 28b - DMA MEMORY ACCESS FAILURE**
+**Status as of 2026-02-01**: **PHASE 29c - DMA PATH FAILURE (UNSOLVED)**
 
-**Progress**:
-- ✅ Root cause found (Phase 17): ROM doesn't support mailbox protocol
-- ✅ Correct WFDMA base address (Phase 21): 0xd4000 (not 0x2000)
-- ✅ MCU reaches IDLE state (Phase 24): 0x1D1E confirmed!
-- ✅ Phase 26 fixes implemented: DMA priority, GLO_CFG_EXT1, descriptor init, etc.
-- ✅ **GLO_CFG timing fix (Phase 27)**: Ring registers NOW accept writes!
-- ✅ **TX ring fix (Phase 27)**: All 17 TX rings now have valid BASE addresses
-- ✅ **RX_DMA_EN fix (Phase 27b)**: Only enable TX_DMA_EN during firmware loading
-- ✅ **TXD control word FIX VERIFIED (Phase 27c)**: No more page faults!
-- ✅ **Phase 27d diagnostics**: Found WFDMA_OVERFLOW=1, PDA_TAR_ADDR=0
-- ✅ **HOST2MCU doorbell IMPLEMENTED (Phase 27e)**: MCU interrupt delivered
-- ✅ **FIRMWARE STRUCTURES FIXED (Phase 27f)**: All structures match reference!
-- ✅ **ALL REGISTER VALUES VERIFIED (Phase 27f)**: Checked against mt6639.c, mt7927_regs.h
-- ✅ **ALL MEMORY REFERENCES VERIFIED (Phase 27g)**: 40+ addresses verified against sources
-- ✅ **Phase 28 - DMA blocker identified**: MEM_ERR=1, DIDX never advances
-- ✅ **Phase 28b - Zouyonghao config additions**: PCIe MAC int routing + PCIE2AP timing fix applied
-- ❌ **DMA STILL FAILS** - WFDMA cannot access host memory
+After 29+ phases of investigation, firmware loading fails because DMA data never reaches device memory.
 
-**Phase 28b BLOCKER** (2026-01-31):
+### Summary
 
-Despite implementing ALL zouyonghao configuration steps, DMA transfers fail with:
-- `MEM_ERR=1` from first DMA attempt
-- `DIDX=0` (never advances, device consumes nothing)
-- `WFDMA_OVERFLOW=1` (ring overflowed because nothing processed)
+| Milestone | Status |
+|-----------|--------|
+| PCI enumeration | ✅ Complete |
+| BAR mapping | ✅ Complete |
+| CB_INFRA initialization | ✅ Complete |
+| WiFi subsystem reset | ✅ Complete |
+| DMA ring configuration | ✅ Complete |
+| Firmware file parsing | ✅ Complete |
+| Host-side DMA transfer | ✅ Complete |
+| **Device receives data** | ❌ **FAILED** |
+| Firmware execution | ❌ BLOCKED |
+| WiFi interface | ❌ BLOCKED |
 
-**Verified configurations**:
-- PCIe MAC Interrupt Routing: `0x010074` = `0x08021000` ✅
-- PCIE2AP Remap (after DMA init): `0x0d1034` = `0x18051803` ✅
-- All 40+ register addresses verified ✅
-- All firmware structures corrected ✅
-- Descriptor format verified (Phase 27c) ✅
+---
 
-**Root cause**: WFDMA engine cannot access host memory addresses via PCIe. Not an interrupt routing or configuration ordering issue.
+## The Unsolved Problem
 
-**Next Steps**:
-1. Check IOMMU status (`dmesg | grep -i iommu`)
-2. Verify PCIe bus master enabled
-3. Search for AP2PCIE/WFDMA AXI configuration in reference sources
-4. Try booting with `intel_iommu=off` or `amd_iommu=off`
-5. Compare with working MT7925 DMA initialization
+**DMA data never reaches device memory.**
 
-See **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** section "2m" for complete Phase 28b analysis.
+### Evidence
 
-## Phase 1: Get It Working 🎯 CURRENT PHASE
+1. **MCU status = 0x00000000** after all firmware regions
+   - MCU never acknowledges receiving any data
+   - Expected: status updates as each region is processed
 
-### Completed ✅
+2. **FW_N9_RDY = 0x00000002** (stuck)
+   - BIT(1) = 1: Download mode entered
+   - BIT(0) = 0: N9 CPU not ready
+   - Expected: 0x00000003 (both bits set)
 
-- [x] Bind driver to device
-- [x] Load firmware files into kernel memory
-- [x] Implement power management handshake (host claims DMA ownership)
-- [x] Implement WiFi subsystem reset (WFSYS_SW_RST_B timing)
-- [x] Implement DMA ring allocation and configuration
-- [x] Implement MCU communication protocol structures
-- [x] Implement firmware download sequence (mailbox-based - wrong protocol)
-- [x] **Identify root cause** - Mailbox protocol not supported by ROM bootloader
-- [x] **Fix WFDMA base address** - Changed from 0x2000 to 0xd4000
-- [x] **Implement CB_INFRA initialization** - PCIe remap, crypto MCU ownership
-- [x] **Confirm MCU IDLE state** - 0x1D1E reached successfully!
-- [x] **Phase 26 fixes** - DMA priority, GLO_CFG_EXT1, descriptor init, RST_DTX_PTR
+3. **FW_START command times out**
+   - Tested with wait=true: 3-second timeout
+   - Firmware not running, cannot respond
 
-### In Progress 🔧
+4. **IOMMU page faults** observed in some runs
+   - Addresses like 0xff6b0xxx cause AMD-Vi IO_PAGE_FAULT
+   - Suggests DMA mapping issues
 
-- [x] ~~**Fix ring configuration**~~ - DONE (Phase 27)
-  - ✅ GLO_CFG timing fix applied: Clear GLO_CFG → configure rings → set CLK_GAT_DIS
-  - ✅ Ring BASE and EXT_CTRL now show correct DMA addresses
+### Investigated But Not Resolved
 
-- [x] ~~**Fix DMA page fault (TX rings)**~~ - DONE (Phase 27)
-  - ✅ Root cause: 15 unused TX rings (0-14) had BASE=0
-  - ✅ Fix implemented: Initialize all TX rings to valid DMA address
+- IOMMU domain configuration
+- Coherent vs streaming DMA differences
+- DMA address mask (32-bit vs 64-bit)
+- MediaTek-specific DMA enable bits
+- PCIe bus master configuration
+- Power/clock gating for DMA engine
 
-- [x] ~~**Fix DMA page fault (RX rings)**~~ - DONE (Phase 27b)
-  - ✅ Root cause: RX rings have BASE=0 but RX_DMA_EN was enabled
-  - ✅ Fix implemented: Only enable TX_DMA_EN during firmware loading
+---
 
-- [x] ~~**Fix TXD control word bit layout**~~ - VERIFIED (Phase 27c)
-  - ✅ Fix implemented and **verified working**: `ctrl=0x404c0000` (correct format)
-  - ✅ **No more AMD-Vi IO_PAGE_FAULT errors!**
+## Investigation History
 
-- [x] ~~**Investigate global DMA path issue**~~ - ROOT CAUSE FOUND (Phase 27d)
-  - **Finding**: WFDMA_OVERFLOW=1 proves data IS reaching MCU's WFDMA
-  - **Finding**: PDA_TAR_ADDR=0 proves MCU didn't process INIT_DOWNLOAD commands
-  - See ZOUYONGHAO_ANALYSIS.md section "2f" for diagnostics
+### Phase 1-16: Initial Development
+- Assumed MT7927 = MT7925 variant (wrong)
+- Assumed mailbox protocol works (wrong)
+- Assumed WFDMA at 0x2000 (wrong)
 
-- [x] ~~**HOST2MCU software interrupt fix**~~ - IMPLEMENTED (Phase 27e)
-  - ✅ Added `HOST2MCU_SW_INT_SET` doorbell writes after CIDX updates
-  - ✅ Bug fixed: Use HOST_DMA0 offset (0xd4108), not MCU_DMA0 (0x2108)
+### Phase 17: Root Cause Discovery
+- **Found**: ROM doesn't support mailbox protocol
+- **Solution**: Use polling-based firmware loading
 
-- [x] ~~**Firmware structure fixes**~~ - DONE (Phase 27f)
-  - ✅ All structures match reference implementations
+### Phase 18-21: Architecture Fixes
+- **Found**: MT7927 = MT6639 variant (not MT7925)
+- **Found**: WFDMA base is 0xd4000 (not 0x2000)
+- **Found**: CB_INFRA remap required (0x74037001)
 
-- [x] ~~**Zouyonghao config additions**~~ - DONE (Phase 28b)
-  - ✅ PCIe MAC Interrupt Routing (0x010074 = 0x08021000)
-  - ✅ PCIE2AP Remap timing fix (moved after DMA init)
-  - ❌ DMA still fails - these don't address memory access path
+### Phase 22-26: Ring Configuration
+- Fixed GLO_CFG timing
+- Fixed unused ring initialization
+- Fixed TXD control word format
 
-- [ ] **Fix WFDMA memory access** ← Current blocker (Phase 28b)
-  - ❌ WFDMA cannot access host memory (MEM_ERR=1)
-  - ❌ DIDX never advances (device consumes nothing)
-  - 🔧 Investigate: IOMMU, PCIe bus master, AXI config
-  - See ZOUYONGHAO_ANALYSIS.md section "2m" for analysis
+### Phase 27: DMA Page Faults
+- Fixed TX ring page faults (all rings need valid BASE)
+- Fixed RX_DMA_EN timing (only enable TX during FWDL)
+- Added HOST2MCU doorbell interrupts
 
-### Blocked (Pending Implementation) ⏸️
+### Phase 28: Memory Access Failure
+- WFDMA_OVERFLOW=1 but DIDX=0
+- Device sees something but doesn't process it
+- Investigated zouyonghao config additions
 
-- [ ] Fix DMA descriptor processing (blocked on page fault investigation)
-- [ ] Achieve MCU command completion
-- [ ] Complete firmware transfer and activation
-- [ ] Create network interface (wlan0)
+### Phase 29: Linux 6.18 Adaptation
+- Fixed mac80211 API changes
+- Fixed hrtimer API changes
+- **Firmware "loads" but never executes**
 
-### Implementation Approaches
+### Phase 29b-29c: Final Investigation
+- Verified ring configuration is correct (hardware readback matches)
+- Tested FW_START with wait=true (times out)
+- MCU status never changes from 0x00000000
+- **Concluded: DMA path failure, cause unknown**
 
-#### Current Approach: Fix GLO_CFG Timing
+---
 
-**File**: `tests/05_dma_impl/test_fw_load.c`
+## What Would Be Needed to Continue
 
-Reorder initialization sequence to match zouyonghao:
+### Option 1: IOMMU Investigation
+Test with `iommu=off` kernel parameter to rule out IOMMU as the cause.
 
-```c
-// Phase 1: Clear/minimize GLO_CFG
-mt_wr(dev, MT_WFDMA0_GLO_CFG, 0);  // Or minimal value
+### Option 2: DMA Tracing
+Add extensive tracing to understand exactly where DMA fails:
+- Verify dma_map_single returns valid addresses
+- Check if IOMMU page tables include mapped addresses
+- Monitor PCIe traffic (if tools available)
 
-// Phase 2: Configure rings (GLO_CFG cleared!)
-mt_wr(dev, MT_WFDMA0_TX_RING_BASE(15), dma_addr_15);
-mt_wr(dev, MT_WFDMA0_TX_RING_CNT(15), ring_count);
-mt_wr(dev, MT_WFDMA0_TX_RING_CIDX(15), 0);
-mt_wr(dev, MT_WFDMA0_TX_RING_DIDX(15), 0);
-// ... same for ring 16 ...
+### Option 3: MediaTek Documentation
+Obtain official MediaTek documentation for:
+- MT6639/MT7927 DMA configuration
+- Required enable bits and remap registers
+- Initialization sequence
 
-// Phase 3: Configure prefetch
-mt_wr(dev, MT_WFDMA0_TX_RING15_EXT_CTRL, PREFETCH_RING15);
-mt_wr(dev, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH_RING16);
+### Option 4: Reference Implementation
+Find a working MT7927 driver implementation:
+- Check if MediaTek has released official Linux support
+- Look for other community efforts
+- Analyze Windows driver behavior
 
-// Phase 4: NOW set GLO_CFG with CLK_GAT_DIS (AFTER rings!)
-mt_wr(dev, MT_WFDMA0_GLO_CFG, MT_WFDMA0_GLO_CFG_SETUP);
+---
 
-// Phase 5: Enable TX/RX DMA
-mt_set(dev, MT_WFDMA0_GLO_CFG, TX_DMA_EN | RX_DMA_EN);
-```
+## Lessons Learned
 
-**Expected Result**: Ring registers should accept writes when GLO_CFG is in cleared state.
+1. **Wrong initial assumptions** led to months of debugging
+   - MT7927 is NOT MT7925
+   - ROM doesn't support mailbox
+   - WFDMA base is not at 0x2000
 
-#### Already Implemented (Phase 26)
+2. **Hardware debugging without documentation is difficult**
+   - MediaTek provides limited public documentation
+   - Reference code analysis was essential
+   - Many discoveries came from comparing implementations
 
-1. ✅ DMA priority registers (INT_RX_PRI=0x0F00, INT_TX_PRI=0x7F00)
-2. ✅ GLO_CFG_EXT1 BIT(28) for MT7927
-3. ✅ WFDMA_DUMMY_CR with NEED_REINIT flag
-4. ✅ RST_DTX_PTR = ~0 (reset all rings)
-5. ✅ Descriptor init with DMA_DONE bit
-6. ✅ DIDX register writes
-7. ✅ Polling-based firmware loading (no mailbox waits)
+3. **DMA issues are hard to diagnose**
+   - Host-side success doesn't mean device receives data
+   - IOMMU adds complexity
+   - Need visibility into device-side behavior
 
-See [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) section "2a. Critical GLO_CFG Timing Difference" for details.
+---
 
-### Expected Output (Current State)
+## Completed Components
 
-**Before mailbox fix (current state)**:
-```
-[   10.123] mt7927: Chip ID: 0x00511163
-[   10.124] mt7927: BAR0 mapped, size=1048576
-[   10.125] mt7927: Power management: Host claimed DMA
-[   10.126] mt7927: WFSYS reset complete
-[   10.127] mt7927: DMA rings allocated
-[   10.128] mt7927: MCU ready (status=0x00000001)
-[   10.129] mt7927: Sending patch semaphore command...
-[   15.130] mt7927: ERROR: MCU command timeout  ← Expected blocker
-```
+Despite the failure, significant work was completed:
 
-**After mailbox fix (expected)**:
-```
-[   10.123] mt7927: Chip ID: 0x00511163
-[   10.124] mt7927: BAR0 mapped, size=1048576
-[   10.125] mt7927: Power management: Host claimed DMA
-[   10.126] mt7927: WFSYS reset complete
-[   10.127] mt7927: DMA rings allocated
-[   10.128] mt7927: MCU ready (status=0x00000001)
-[   10.129] mt7927: Loading patch (polling mode)
-[   10.145] mt7927: Patch sent successfully
-[   10.146] mt7927: Loading RAM firmware
-[   10.230] mt7927: Firmware loaded successfully
-[   10.231] mt7927: Network interface created: wlan0
-```
+### Working Code
+- PCI probe and initialization
+- BAR mapping and register access
+- CB_INFRA configuration
+- WiFi subsystem reset
+- DMA ring allocation and configuration
+- Firmware file parsing
+- Polling-based firmware loader structure
+- Linux 6.18 API compatibility
 
-## Phase 2: Make It Good
+### Documentation
+- Complete 29-phase development log
+- Architecture analysis (MT6639 relationship)
+- Register definitions
+- Reference code analysis
+- Hardware specifications
 
-### Network Functionality
-- [ ] Port full mt7925 functionality
-  - [ ] TX/RX queue management
-  - [ ] MAC80211 integration
-  - [ ] Power saving modes
-  - [ ] Multi-BSS support
-- [ ] Add 320MHz channel support
-  - [ ] Update channel definitions
-  - [ ] PHY configuration for 320MHz
-  - [ ] Regulatory domain handling
-- [ ] Implement WiFi 7 features
-  - [ ] MLO (Multi-Link Operation)
-  - [ ] 4096-QAM modulation
-  - [ ] Enhanced puncturing
-  - [ ] Multi-RU support
+### Test Infrastructure
+- Diagnostic modules
+- Test modules for each component
+- Debug output throughout driver
 
-### Performance Optimization
-- [ ] Enable MSI/MSI-X interrupts (currently using legacy INTx)
-- [ ] Optimize DMA buffer sizes
-- [ ] Implement interrupt coalescing
-- [ ] Add CPU affinity for interrupt handling
-- [ ] Profile and optimize hot paths
+---
 
-### Power Management
-- [ ] Implement runtime PM
-- [ ] Add suspend/resume support
-- [ ] Optimize power saving modes
-- [ ] Implement wake-on-WLAN
+## Future Phases (If Continued)
 
-### Robustness
-- [ ] Add comprehensive error handling
-- [ ] Implement firmware recovery
-- [ ] Add hardware watchdog
-- [ ] Improve diagnostics and debugging
+### Phase 2: Make It Work
+- [ ] Resolve DMA path failure
+- [ ] Achieve firmware execution
+- [ ] Create WiFi interface
+- [ ] Basic connectivity
 
-## Phase 3: Make It Official
+### Phase 3: Make It Good
+- [ ] Full network functionality
+- [ ] Power management
+- [ ] Performance optimization
+- [ ] WiFi 7 features (320MHz, MLO)
 
-### Code Quality
-- [ ] Clean up code for upstream standards
-  - [ ] Follow Linux kernel coding style strictly
-  - [ ] Remove debug code and comments
-  - [ ] Add comprehensive documentation
-  - [ ] Add KUnit tests where appropriate
-- [ ] Split into logical patch series
-- [ ] Write detailed commit messages
-- [ ] Add maintainer documentation
-
-### Upstream Submission
-- [ ] Submit RFC (Request for Comments) to linux-wireless
-  - [ ] Get initial feedback from maintainers
-  - [ ] Address architectural concerns
-  - [ ] Clarify relationship with MT6639/MT7925
+### Phase 4: Make It Official
+- [ ] Code cleanup for upstream
+- [ ] Submit to linux-wireless
 - [ ] Address review feedback
-  - [ ] Implement requested changes
-  - [ ] Provide additional documentation
-  - [ ] Add tests as needed
-- [ ] Submit formal patch series
-  - [ ] Follow linux-wireless submission guidelines
-  - [ ] Provide cover letter with context
-  - [ ] Tag relevant maintainers
-- [ ] Iterate based on maintainer feedback
-- [ ] Get Acked-by/Reviewed-by from maintainers
-- [ ] Wait for merge into wireless-next tree
-- [ ] Propagate to mainline kernel (2-3 kernel cycles)
+- [ ] Merge to mainline
 
-**Timeline estimate**: 3-6 months from working driver to mainline merge.
-
-## Implementation Status
-
-### What's Working ✅
-
-- PCI enumeration and BAR mapping (BAR0: 2MB confirmed, BAR2: 32KB)
-- Driver successfully binds to device and handles IRQs
-- Firmware files load into kernel memory (MT7925 firmware compatible via CONNAC3X)
-- Power management handshake (host claims DMA ownership via PMCTRL)
-- WiFi/BT subsystem reset sequence via CB_INFRA_RGU
-- DMA descriptor rings allocated (sparse layout: 0,1,2,15,16)
-- **Queue assignments validated** - Ring 15 (MCU_WM), Ring 16 (FWDL) per MT6639 config
-- PCIe ASPM L0s and L1 disabled
-- **CB_INFRA initialization** - PCIe remap (0x74037001) configured
-- **CONN_INFRA version** - 0x03010002 confirmed
-- **MCU reaches IDLE (0x1D1E)** - First time confirmed! ✅
-- **GLO_CFG setup** - Clock gating disabled, WFDMA extensions configured
-- **Ring protocol confirmed** - MT6639 analysis validates CONNAC3X ring assignments
-- **Architectural foundation confirmed** - MT7927 is MT6639 variant with CONNAC3X protocol
-
-### What's Not Working ❌
-
-- **DMA memory access** - WFDMA cannot access host memory (MEM_ERR=1)
-- **DMA descriptor processing** - DIDX stuck at 0 (device consumes nothing)
-- Firmware transfer (blocked on DMA memory access)
-- Network interface creation (requires successful initialization)
-
-### Fixed in Phase 27/27b/27c/27d/27e/27f/28b ✅
-
-- ~~Ring register writes~~ - GLO_CFG timing fixed (Phase 27)
-- ~~Unused TX rings causing page faults~~ - All rings initialized (Phase 27)
-- ~~RX_DMA_EN causing page faults~~ - Only TX_DMA_EN during FWDL (Phase 27b)
-- ~~TXD control word bit layout~~ - Correct bit positions applied (Phase 27c)
-- ~~HOST2MCU doorbell~~ - Implemented with correct offset (Phase 27e)
-- ~~Firmware structures~~ - All structures match reference (Phase 27f)
-- ~~Register values~~ - All 40+ addresses verified (Phase 27g)
-- ~~Zouyonghao config additions~~ - PCIe MAC int routing, PCIE2AP timing (Phase 28b)
-
-### Root Cause Analysis
-
-**Phase 17-21 (RESOLVED)**: Mailbox protocol and WFDMA base address
-- ✅ ROM doesn't support mailbox → Polling-based approach implemented
-- ✅ Wrong WFDMA base (0x2000 vs 0xd4000) → Fixed to use 0xd4000
-
-**Phase 24-26 (RESOLVED)**: Ring configuration registers
-- ✅ GLO_CFG timing fixed → Set CLK_GAT_DIS AFTER ring configuration (Phase 27)
-
-**Phase 27 (RESOLVED)**: DMA page faults at address 0x0
-- ✅ Unused TX rings (0-14) had BASE=0 → All rings initialized to valid DMA address
-- ✅ RX rings had BASE=0 but RX_DMA_EN enabled → Only enable TX_DMA_EN during FWDL
-
-**Phase 27c (RESOLVED)**: TXD control word bit layout
-- ✅ Root cause FOUND: SDLen0 in bits 0-13 (should be 16-29), LastSec0 in bit 14 (should be 30)
-- ✅ Fix IMPLEMENTED: Corrected bit positions to match MediaTek TXD_STRUCT
-- ✅ **VERIFIED**: No more AMD-Vi IO_PAGE_FAULT errors!
-
-**Phase 27d/27e (RESOLVED)**: HOST2MCU doorbell
-- ✅ Diagnostics showed WFDMA_OVERFLOW=1 (data arrives) but PDA_TAR_ADDR=0 (not processed)
-- ✅ ROOT CAUSE: MCU ROM is IDLE but not polling DMA rings - needs doorbell interrupt
-- ✅ FIX IMPLEMENTED: Added HOST2MCU_SW_INT_SET writes after CIDX updates
-- ✅ Bug FIXED: Use HOST_DMA0 offset (0xd4108), NOT MCU_DMA0 (0x2108)
-
-**Phase 28/28b (CURRENT)**: DMA memory access failure
-- ❌ MEM_ERR=1 from first DMA attempt - WFDMA cannot read host memory
-- ❌ DIDX stays at 0 - device never processes any descriptors
-- ❌ WFDMA_OVERFLOW=1 - ring overflows because nothing consumed
-- ✅ Zouyonghao config additions applied - didn't fix the issue
-- 🔧 ROOT CAUSE: WFDMA-to-host memory access path not working
-- 🔧 HYPOTHESIS: IOMMU, PCIe bus master, or AXI bus configuration issue
-
-## Testing and Validation
-
-### Test Infrastructure (Completed)
-
-- [x] Test modules framework (`tests/05_dma_impl/`)
-  - [x] test_power_ctrl.ko - Power management
-  - [x] test_wfsys_reset.ko - WiFi subsystem reset
-  - [x] test_dma_queues.ko - DMA ring allocation
-  - [x] test_fw_load.ko - Complete firmware loading
-- [x] Diagnostic modules (`diag/`)
-  - [x] 18 hardware exploration modules
-  - [x] Register scanners
-  - [x] Ring validators
-  - [x] Power state analyzers
-
-### Validation Completed
-
-- [x] Chip ID verification (0x00511163)
-- [x] BAR mapping correctness (BAR0: 2MB, BAR2: 32KB)
-- [x] Power management handshake
-- [x] WFSYS reset timing and completion
-- [x] DMA ring allocation (8 TX rings: 0-7)
-- [x] Ring 15/16 physical existence confirmed
-- [x] MT6639 architectural relationship proven
-- [x] CONNAC3X ring protocol validated
-- [x] Firmware file compatibility (MT7925 firmware)
-
-### Validation Pending (After Firmware Loader)
-
-- [ ] Firmware patch transfer success
-- [ ] Firmware RAM transfer success
-- [ ] MCU firmware activation
-- [ ] Network interface creation
-- [ ] Basic connectivity (association, authentication)
-- [ ] Data path (TX/RX packets)
-- [ ] Performance benchmarks
-- [ ] Stability testing (long-term operation)
-
-## Documentation Status
-
-### Completed Documentation ✅
-
-- [x] README.md - Project overview and quick start
-- [x] DEVELOPMENT_LOG.md - Complete chronological history (17 phases)
-- [x] AGENTS.md - Session bootstrap for developers
-- [x] CLAUDE.md - AI agent instructions
-- [x] docs/README.md - Documentation navigation
-- [x] docs/mt7927_pci_documentation.md - PCI layer API
-- [x] docs/dma_mcu_documentation.md - DMA and MCU layer
-- [x] docs/headers_documentation.md - Header file reference
-- [x] docs/test_modules_documentation.md - Test framework
-- [x] docs/diagnostic_modules_documentation.md - Diagnostic tools
-- [x] docs/TEST_RESULTS_SUMMARY.md - Validation results
-- [x] docs/MT6639_ANALYSIS.md - Architecture proof
-- [x] docs/ZOUYONGHAO_ANALYSIS.md - Root cause analysis
-- [x] docs/FIRMWARE_ANALYSIS.md - Firmware compatibility
-- [x] docs/WINDOWS_FIRMWARE_ANALYSIS.md - Windows driver analysis
-- [x] docs/HARDWARE.md - Hardware specifications
-- [x] docs/TROUBLESHOOTING.md - Common issues and solutions
-- [x] docs/FAQ.md - Frequently asked questions
-- [x] docs/ROADMAP.md - This file
-
-### Documentation Pending
-
-- [ ] API reference (when stable)
-- [ ] User guide (when functional)
-- [ ] Performance tuning guide (when optimized)
-- [ ] Kernel submission guide (when ready for upstream)
-
-## Dependencies and Requirements
-
-### Build Requirements
-- Linux kernel 6.7+ (for mt7925 infrastructure)
-- Kernel headers matching running kernel
-- GCC or Clang compiler
-- Make build system
-
-### Runtime Requirements
-- MediaTek MT7927 WiFi 7 hardware (PCI ID: 14c3:7927)
-- MT7925 firmware files in `/lib/firmware/mediatek/mt7925/`
-- PCIe slot (Gen3 x1 or better)
-- 2MB+ system memory for firmware and DMA buffers
-
-### Development Requirements
-- Understanding of Linux kernel module development
-- Familiarity with WiFi driver architecture
-- Knowledge of PCI/DMA programming
-- Access to MT7927 hardware for testing
-
-## Known Issues and Limitations
-
-### Current Limitations
-1. **No network interface** - Blocked on firmware loader implementation
-2. **Legacy INTx interrupts** - MSI/MSI-X not yet implemented
-3. **No power management** - Suspend/resume not implemented
-4. **Limited error recovery** - Firmware recovery not implemented
-5. **Debug code present** - Extensive logging needs cleanup for upstream
-
-### Hardware Limitations
-1. **BAR0 size** - 2MB total (adequate but smaller than some competitors)
-2. **Single WFDMA** - Only WFDMA0 present (vs WFDMA0+1 on MT7925)
-3. **Sparse rings** - Only 8 TX rings vs 17 on MT7925
-4. **ROM bootloader** - Limited protocol support (no mailbox commands)
-
-### Architectural Constraints
-1. **MT6639 variant** - Must follow MT6639 configuration, not MT7925
-2. **CONNAC3X family** - Limited to CONNAC3X capabilities
-3. **Firmware shared** - Uses MT7925 firmware (cannot optimize for MT7927-specific features)
+---
 
 ## See Also
 
-- **[ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md)** - Root cause and solution (CRITICAL!)
-- **[MT6639_ANALYSIS.md](MT6639_ANALYSIS.md)** - Architectural foundation
-- **[../DEVELOPMENT_LOG.md](../DEVELOPMENT_LOG.md)** - Complete history
-- **[HARDWARE.md](HARDWARE.md)** - Hardware specifications
-- **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** - Common issues
-- **[FAQ.md](FAQ.md)** - Frequently asked questions
+- [../README.md](../README.md) - Project status summary
+- [../DEVELOPMENT_LOG.md](../DEVELOPMENT_LOG.md) - Complete investigation history
+- [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) - DMA debugging analysis
+- [MT6639_ANALYSIS.md](MT6639_ANALYSIS.md) - Architecture proof
+
+---
+
+*Last updated: 2026-02-01 (Phase 29c - Project Stalled)*

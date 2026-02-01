@@ -1,5 +1,12 @@
 # Troubleshooting Guide
 
+> **⚠️ PROJECT STATUS: STALLED (Phase 29c) ⚠️**
+>
+> This driver does not work. The issues below document problems encountered during development,
+> but the fundamental issue (DMA path failure) remains unsolved.
+
+---
+
 ## Driver Won't Load
 
 ### Symptoms

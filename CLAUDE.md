@@ -8,45 +8,35 @@ This is a Linux kernel driver for the MediaTek MT7927 WiFi 7 chipset. **CRITICAL
 
 **Official Product Name**: MT7927 802.11be 320MHz 2x2 PCIe Wireless Network Adapter [Filogic 380]
 
-**Current Status**: **PHASE 28d - DMA PATH VALIDATED, NEW BLOCKER IDENTIFIED**:
-- ✅ **All initialization phases complete** - MCU IDLE, rings configured, DMA enabled
-- ✅ **Firmware loading protocol correct** - Polling mode, no mailbox waits
-- ✅ **DMA path verified working** - Page faults prove requests reach IOMMU
-- ✅ **Descriptor format validated** - SD_LEN0 in bits 16-29, LAST_SEC0 in bit 30
-- ❌ **DMA transfers not completing** - DIDX never advances (stays at 0)
-- ❌ **MEM_ERR=1** - Memory access error persists even with correct format
-- 🔬 **New blocker**: DMA reads descriptors correctly but doesn't complete transfer
+**Current Status**: **PHASE 29c - DMA PATH FAILURE CONFIRMED**
+- ✅ **Ring configuration correct** - HW desc_base matches desc_dma (verified!)
+- ✅ **Firmware transfer completes** - All 5 RAM regions sent "successfully"
+- ❌ **MCU never acknowledges** - Status stays 0x00000000 after all regions
+- ❌ **Firmware not ready** - FW_N9_RDY stuck at 0x00000002 (download mode, N9 not ready)
+- ❌ **FW_START times out** - No mailbox response when waiting (tested wait=true)
+- 🔬 **Current blocker**: DMA data not reaching device memory
 
-**Phase 28d Critical Finding** (2026-01-31):
+**Phase 29c Finding** (2026-02-01):
 
-**Page fault test VALIDATES the correct descriptor format!**
+**FW_START wait=true experiment confirms DMA path failure.**
 
-Running `test_fw_load.ko` with OLD (buggy) format produced page faults at address 0x0:
+Tested FW_START with `wait=true` instead of `wait=false`:
 ```
-AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x000e address=0x0 flags=0x0000]
+[MT7927] Sending FW_START command (waiting for response)
+Message 00000002 (seq 9) timeout
+[MT7927] FW_START send failed: -110 (continuing)
+[MT7927] Waiting for FW_N9_RDY... (0x00000002)   <- BIT(1) set, BIT(0) clear
 ```
 
-**Key test results:**
+**Key findings**:
+- MCU status = 0x00000000 after ALL firmware regions (never changes)
+- FW_N9_RDY = 0x00000002: Download mode entered, but N9 CPU not ready
+- FW_START times out: Firmware not executing, cannot respond
+- wait=true vs wait=false: Same result, just longer timeout
 
-| Test | Descriptor Format | Full Init | Page Faults | Result |
-|------|-------------------|-----------|-------------|--------|
-| test_dma_path.ko | New (correct) | No | ❌ None | Minimal init insufficient |
-| test_dma_path.ko | Old (buggy) | No | ❌ None | Minimal init insufficient |
-| test_fw_load.ko | Old (buggy) | Yes | ✅ **YES** | Proves DMA path works! |
-| test_fw_load.ko | New (correct) | Yes | ❌ None | Correct format, no fault |
+**Root cause**: DMA transfers complete from host's perspective but data never reaches device memory.
 
-**What this proves:**
-1. **DMA IS working** at PCIe/IOMMU level (requests reach host)
-2. **Hardware expects bits 16-29** for SD_LEN0 (old format misread → fault at addr 0)
-3. **Correct format prevents faults** because address is read correctly
-4. **New blocker**: DMA completes read but MCU/PDA doesn't accept data (MEM_ERR=1)
-
-**Next Steps**:
-1. Investigate why MEM_ERR=1 occurs even with correct addressing
-2. Check PDA (Patch Download Agent) state machine configuration
-3. Verify firmware target addresses are valid/accepted
-
-See **docs/ZOUYONGHAO_ANALYSIS.md** section "2o" for complete investigation.
+See **DEVELOPMENT_LOG.md** Phase 29c for complete analysis.
 
 ## Critical Files to Review First
 
@@ -65,12 +55,15 @@ See **docs/ZOUYONGHAO_ANALYSIS.md** section "2o" for complete investigation.
    - Section "2l": Phase 28 - DMA memory access failure analysis
    - Section "2m": Phase 28b - Zouyonghao config additions test
    - Section "2n": Phase 28c - DMA path verification insight
-   - Section "2o": **Phase 28d** - DMA path investigation results (current)
+   - Section "2o": Phase 28d - DMA path investigation results
+   - Section "2p": Phase 29 - Linux 6.18 adaptation
+   - Section "2q": Phase 29b - IOMMU page fault deep analysis
+   - Section "2r": **Phase 29c** - FW_START response test (CURRENT)
 2. **docs/ROADMAP.md** - Current status, blockers, and next steps
 3. **docs/MT6639_ANALYSIS.md** - Proves MT7927 is MT6639 variant, validates rings 15/16
 4. **docs/MT7996_COMPARISON.md** - Comparison analysis: why MT7927 is NOT an MT7996 variant
 5. **docs/REFERENCE_SOURCES.md** - Analysis of reference code origins and authoritative sources
-6. **DEVELOPMENT_LOG.md** - Complete chronological history (28+ phases, Phase 28b = current)
+6. **DEVELOPMENT_LOG.md** - Complete chronological history (29+ phases, Phase 29 = current)
 7. **AGENTS.md** - Session bootstrap with current blocker details, hardware context, and what's been tried
 8. **README.md** - Project overview, build instructions, expected outputs
 
@@ -96,12 +89,24 @@ make diag      # Diagnostic modules (diag/)
 ### Testing Commands
 
 ```bash
-# Load production driver
+# Build and load the working zouyonghao driver (Phase 29 - firmware loads!)
+cd reference_zouyonghao_mt7927/mt76-outoftree
+make clean && make
+sudo rmmod mt7925e mt7925_common mt792x_lib mt76_connac_lib mt76 2>/dev/null
+sudo insmod mt76.ko && sudo insmod mt76-connac-lib.ko && sudo insmod mt792x-lib.ko
+sudo insmod mt7925/mt7925-common.ko && sudo insmod mt7925/mt7925e.ko
+sudo dmesg | tail -60
+
+# Check if wlan interface was created
+ip link | grep wlan
+iw dev
+
+# Load original production driver (development/testing)
 sudo rmmod mt7927 2>/dev/null
 sudo insmod src/mt7927.ko
 sudo dmesg | tail -40
 
-# Load test module (recommended for development)
+# Load test module (for DMA debugging)
 sudo rmmod test_fw_load 2>/dev/null
 sudo insmod tests/05_dma_impl/test_fw_load.ko
 sudo dmesg | tail -40
@@ -645,18 +650,20 @@ RING_16_PREFETCH_CNT       = 0x4
 2. **Root cause insight** - Comments explain why mailbox protocol fails
 3. **DMA validation** - Hardware works when correct protocol is used
 
-**⚠️ CRITICAL GAP (discovered 2026-01-31)**:
-The zouyonghao code has correct firmware loading *functions* (`mt7927_load_patch`, `mt7927_load_ram`) but they are **never called**!
-- `mt7927e_mcu_init()` says "firmware already loaded" but skips `mt792x_load_firmware()`
-- The comment is misleading - no probe phase actually loads firmware
-- See `docs/ZOUYONGHAO_ANALYSIS.md` section "CRITICAL GAP IN ZOUYONGHAO CODE"
+**✅ CRITICAL GAP FIXED (Phase 29, 2026-01-31)**:
+The zouyonghao code had correct firmware loading *functions* (`mt7927_load_patch`, `mt7927_load_ram`) but they were **never called**!
+- `mt7927e_mcu_init()` said "firmware already loaded" but skipped `mt792x_load_firmware()`
+- **FIXED**: Added actual call to `mt792x_load_firmware()` in `pci_mcu.c`
+- **FIXED**: Skip LPCTL power control for MT7927 (not usable before reset sequence)
+- **FIXED**: Use MT7925 firmware paths (confirmed CONNAC3X compatible)
+- **FIXED**: Linux 6.18 API compatibility (hrtimer, mac80211 MLO callbacks)
 
 **Key files**:
-- `mt7927_fw_load.c` - Polling-based firmware loader (correct patterns, use as reference)
-- `pci_mcu.c:mt7927e_mcu_init()` - **Missing call to firmware loader!**
+- `mt7927_fw_load.c` - Polling-based firmware loader (working!)
+- `pci_mcu.c:mt7927e_mcu_init()` - **NOW calls firmware loader correctly**
 - `mt792x_core.c:mt792x_load_firmware()` - Has MT7927 detection, calls polling loader
 
-**When to use**: Firmware loading protocol patterns, polling delays, TX cleanup - but must fix wiring
+**When to use**: This is now the primary driver! Build with `make` in `reference_zouyonghao_mt7927/mt76-outoftree/`
 
 #### Priority 3: Linux Kernel MT7925 (drivers/net/wireless/mediatek/mt76/mt7925/) - **CONNAC3X PATTERNS**
 
@@ -681,10 +688,10 @@ The zouyonghao code has correct firmware loading *functions* (`mt7927_load_patch
 ---
 
 **Reference Priority Summary**:
-1. **Architecture & Registers** → reference_mtk_modules (MT6639 official code)
-1b. **CB_INFRA Values & Init Sequences** → reference_gen4m (exact register values for init)
-2. **Firmware Loading** → reference_zouyonghao_mt7927 (polling-based, proven working)
-3. **Network Operations** → Linux mt7925 (CONNAC3X family patterns, after init)
+1. **Working Driver** → reference_zouyonghao_mt7927/mt76-outoftree/ (firmware loads! Phase 29)
+2. **Architecture & Registers** → reference_mtk_modules (MT6639 official code)
+3. **CB_INFRA Values & Init Sequences** → reference_gen4m (exact register values for init)
+4. **Network Operations** → Linux mt7925 (CONNAC3X family patterns, after init)
 
 ### Debugging DMA Issues
 1. Check ring indices via test modules (test_dma_queues.ko shows CIDX/DIDX/CPU_DIDX)
@@ -791,6 +798,6 @@ Download from: https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-fi
 ## Hardware Requirements
 
 - **Chip**: MediaTek MT7927 WiFi 7 (PCI ID: 14c3:7927)
-- **Kernel**: Linux 6.7+ (for mt7925 infrastructure)
+- **Kernel**: Linux 6.18+ (tested), 6.7+ (minimum for mt7925 infrastructure)
 - **Memory**: 2MB+ for firmware and DMA buffers
 - **PCI Slot**: Confirmed working at 0000:0a:00.0 (update commands if different)

@@ -9,7 +9,7 @@ This document chronicles the development effort to create a Linux driver for the
 2. MT7927 ROM bootloader does **NOT support mailbox protocol** - this was the root cause of all DMA "blocker" issues
 3. Reference zouyonghao driver has correct polling-based FW loader functions, but **wiring is broken** (firmware never called)
 
-**Current Status (Phase 27f)**: **FIRMWARE STRUCTURE MISMATCH** - CRITICAL BUG: Our `struct mt7927_patch_hdr` and `struct mt7927_patch_sec` have wrong field layouts. The header is missing 44 bytes (`rsv[11]`) and the section struct has `offs` at wrong position. This causes firmware parsing to read `addr=0, len=0`, making INIT_DOWNLOAD commands invalid. The MCU doorbell (Phase 27e) works but we can't test it because firmware data is malformed. Fix: Update structure definitions to match `mt76_connac2_patch_*` from reference code.
+**Current Status (Phase 29c)**: **DMA PATH FAILURE** - Firmware data is sent via DMA but never reaches device memory. MCU status stays at 0x00000000 after all firmware regions. FW_N9_RDY stuck at 0x00000002 (download mode, N9 not ready). FW_START command times out when waiting for response. IOMMU page faults observed in some runs. Root cause: DMA buffers mapped by host are not accessible to device - either IOMMU domain issue or MediaTek-specific DMA configuration missing.
 
 ---
 
@@ -3553,6 +3553,319 @@ The mt76 framework may configure additional registers we're missing in standalon
 
 - **docs/ZOUYONGHAO_ANALYSIS.md** - Added section 2l with complete Phase 28 analysis
 - **CLAUDE.md** - Updated current status to Phase 28
+
+---
+
+## Phase 29: Linux 6.18 Adaptation - FIRMWARE LOADING SUCCESS! 🎉 (2026-01-31)
+
+**Status**: ✅ SUCCESS - Firmware loads completely on Linux 6.18
+
+### Summary
+
+Successfully adapted the zouyonghao mt76-based MT7927 driver to work on Linux 6.18. All 5 RAM regions load successfully. This is the first time we've achieved complete firmware loading.
+
+### Key Fixes Applied
+
+#### 1. hrtimer API Change (Linux 6.18)
+**File**: `mt76x02_usb_core.c`
+
+```c
+// Old API (Linux 6.14):
+hrtimer_setup(&dev->pre_tbtt_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+dev->pre_tbtt_timer.function = mt76x02u_pre_tbtt_interrupt;
+
+// New API (Linux 6.18):
+hrtimer_setup(&dev->pre_tbtt_timer, mt76x02u_pre_tbtt_interrupt,
+              CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+```
+
+#### 2. mac80211 MLO Callback Changes (Linux 6.18)
+WiFi 7 Multi-Link Operation support added `link_id`/`radio_idx` parameter to callbacks:
+
+| Function | Old Signature | New Signature |
+|----------|---------------|---------------|
+| `config` | `(hw, changed)` | `(hw, radio_idx, changed)` |
+| `set_rts_threshold` | `(hw, val)` | `(hw, link_id, val)` |
+| `set_antenna` | `(hw, tx, rx)` | `(hw, link_id, tx, rx)` |
+| `get_antenna` | `(hw, tx, rx)` | `(hw, link_id, tx, rx)` |
+| `set_coverage_class` | `(hw, class)` | `(hw, link_id, class)` |
+
+**Files modified**: `mt7925/main.c`, `mt76.h`, `mac80211.c`, `mt792x.h`, `mt792x_core.c`
+
+#### 3. Timer API Rename (Linux 6.18)
+**File**: `mt7925/main.c`
+
+```c
+// Old: del_timer_sync()
+// New: timer_delete_sync()
+```
+
+#### 4. LPCTL Power Control Skip for MT7927
+**File**: `mt7925/pci.c`
+
+MT7927 doesn't support LPCTL before reset sequence. Skip power control entirely:
+
+```c
+if (pdev->device != 0x7927) {
+    ret = __mt792x_mcu_fw_pmctrl(dev);
+    // ...
+} else {
+    dev_info(mdev->dev, "MT7927: Skipping LPCTL power control\n");
+}
+```
+
+#### 5. Firmware Path Fix
+**File**: `mt792x.h`
+
+MT7927 uses MT7925 firmware (confirmed CONNAC3X compatible):
+
+```c
+#define MT7927_FIRMWARE_WM  "mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin"
+#define MT7927_ROM_PATCH    "mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin"
+```
+
+#### 6. Actually Call Firmware Loader (CRITICAL FIX!)
+**File**: `mt7925/pci_mcu.c`
+
+The original code had a misleading comment "firmware already loaded" but never called `mt792x_load_firmware()`:
+
+```c
+// Now actually loads firmware:
+dev_info(mdev->dev, "MT7927: Loading firmware via polling loader\n");
+err = mt792x_load_firmware(dev);
+if (err) {
+    dev_err(mdev->dev, "MT7927: Firmware loading failed: %d\n", err);
+    return err;
+}
+dev_info(mdev->dev, "MT7927: Firmware loaded successfully\n");
+set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+```
+
+### Test Results
+
+**Successful Firmware Loading Log**:
+```
+MT7927: Starting MCU pre-initialization
+MT7927: CONN_INFRA VERSION = 0x03010001 - OK
+MT7927: Performing WiFi subsystem reset
+MT7927: MCU IDLE (0x00001d1e)
+MT7927: MCU initialization (post-DMA)
+MT7927: Loading firmware via polling loader
+mt7925e: Driver has cap: 02 00 00 00 (WF_SEM_CTRL), fw has cap: 02 00 00 00
+mt7925e: WM Firmware Version: ____010000, Build Time: 20241014163636
+mt7925e: WM Patch Image version: -, WM patch built time: -
+Loading region 1 (1/5): 81020000, size=7312, mode=17
+Loading region 2 (2/5): 81000100, size=130016, mode=1
+Loading region 3 (3/5): 82090200, size=1299600, mode=1
+Loading region 4 (4/5): 00908000, size=4156, mode=1
+Loading region 5 (5/5): 0091c000, size=640, mode=1
+MT7927: Firmware loaded successfully
+MT7927: MCU marked as running
+MT7927: mcu_init complete
+```
+
+### Known Issues
+
+**IO_PAGE_FAULT during patch send** (non-fatal):
+```
+AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x000e address=0xffff9d2f05f20000]
+```
+This occurs during patch sending but firmware continues to load successfully. May indicate DMA address translation issue that warrants future investigation.
+
+### Build Instructions
+
+```bash
+cd reference_zouyonghao_mt7927/mt76-outoftree
+make clean && make
+sudo rmmod mt7925e mt7925_common mt792x_lib mt76_connac_lib mt76 2>/dev/null
+sudo insmod mt76.ko && sudo insmod mt76-connac-lib.ko && sudo insmod mt792x-lib.ko
+sudo insmod mt7925/mt7925-common.ko && sudo insmod mt7925/mt7925e.ko
+sudo dmesg | tail -60
+```
+
+### Next Steps
+
+1. Verify wlan interface creation (`ip link`, `iw dev`)
+2. Test WiFi scanning and connection
+3. Investigate IO_PAGE_FAULT cause (non-fatal but concerning)
+4. Consider upstreaming the Linux 6.18 API fixes
+
+### Files Modified
+
+- **reference_zouyonghao_mt7927/mt76-outoftree/mt76x02_usb_core.c** - hrtimer API fix
+- **reference_zouyonghao_mt7927/mt76-outoftree/mt7925/main.c** - mac80211 callback fixes, timer_delete_sync
+- **reference_zouyonghao_mt7927/mt76-outoftree/mt76.h** - get_antenna declaration
+- **reference_zouyonghao_mt7927/mt76-outoftree/mac80211.c** - get_antenna implementation
+- **reference_zouyonghao_mt7927/mt76-outoftree/mt792x.h** - coverage_class declaration, firmware paths
+- **reference_zouyonghao_mt7927/mt76-outoftree/mt792x_core.c** - coverage_class implementation
+- **reference_zouyonghao_mt7927/mt76-outoftree/mt7925/pci.c** - LPCTL skip for MT7927
+- **reference_zouyonghao_mt7927/mt76-outoftree/mt7925/pci_mcu.c** - Actually call firmware loader
+- **docs/ZOUYONGHAO_ANALYSIS.md** - Added section 2p with complete Phase 29 documentation
+- **docs/ROADMAP.md** - Updated status to Phase 29
+- **CLAUDE.md** - Updated current status to Phase 29
+
+---
+
+## Phase 29b: IOMMU Page Fault Deep Analysis (2026-01-31)
+
+**Status**: 🔬 IN PROGRESS - Ring config verified, investigating DMA buffer mapping
+
+### Problem Statement
+
+After fixing Linux 6.18 API issues and enabling firmware loading, WiFi scanning fails. The firmware loads but never becomes ready (FW_N9_RDY bit never set). IOMMU page faults occur during firmware transfer.
+
+### Symptoms
+
+1. **Firmware regions transfer "successfully"** but MCU status stays at 0x00000000
+2. **FW_N9_RDY never gets set** - stuck at 0x00000001 (only FW_PWR_ON)
+3. **Over 3000 IOMMU page faults** during each firmware load attempt
+4. **Page fault addresses** like `0xff6b0040`, `0xff6b0500` (varying each boot)
+
+### Key Diagnostic Finding
+
+Added debug output to trace FWDL ring configuration:
+
+```
+[MT7927] FWDL Ring Debug:
+  Ring desc_dma (phys): 0xffa69000
+  Ring desc (virt): ffffd026c04b7000
+  Ring ndesc: 128, hw_idx: 16
+  Ring regs: ffffd026ccad4400
+  HW desc_base: 0xffa69000      <-- MATCHES desc_dma! ✅
+  HW ring_size: 128, cpu_idx: 0, dma_idx: 0
+```
+
+**Critical insight**: The hardware desc_base register MATCHES the allocated desc_dma address. The ring configuration is CORRECT.
+
+### Page Fault Analysis
+
+| Item | Address | Notes |
+|------|---------|-------|
+| Ring base (desc_dma) | `0xffa69000` | Where descriptors are allocated |
+| HW desc_base readback | `0xffa69000` | Hardware confirms same location |
+| Page fault addresses | `0xff6b0xxx` | Where DATA buffers should be |
+
+**The page fault addresses are NOT the ring base.** They are the buf0 values from descriptors - the addresses where `dma_map_single()` mapped the firmware data buffers.
+
+### Root Cause Hypothesis
+
+The `dma_map_single()` function returns DMA addresses like `0xff6b0040`, but the IOMMU's page tables for this device (domain 0x000e) don't have these addresses mapped.
+
+Possible causes:
+1. **DMA mask issue**: Driver uses `DMA_BIT_MASK(32)` - addresses in high 32-bit range may have issues
+2. **IOMMU domain mismatch**: Coherent DMA (ring) vs streaming DMA (buffers) may be in different domains
+3. **Race condition**: Mapping torn down before DMA completes
+4. **dma_dev misconfiguration**: Wrong device being used for DMA mapping
+
+### Debug Code Added
+
+**mt7927_fw_load.c** - Ring configuration dump:
+```c
+struct mt76_queue *fwdl_q = dev->q_mcu[MT_MCUQ_FWDL];
+dev_info(dev->dev, "  Ring desc_dma (phys): 0x%llx\n", fwdl_q->desc_dma);
+u32 base_lo = readl(&fwdl_q->regs->desc_base);
+dev_info(dev->dev, "  HW desc_base: 0x%08x\n", base_lo);
+```
+
+**dma.c** - DMA address tracing:
+```c
+addr = dma_map_single(dev->dma_dev, skb->data, skb->len, DMA_TO_DEVICE);
+if (debug_cnt < 5) {
+    dev_info(dev->dev, "[DMA DEBUG] tx_queue_skb_raw: dma_addr=0x%llx len=%d\n",
+             (unsigned long long)addr, skb->len);
+}
+```
+
+### Current Status
+
+- **Ring configuration**: ✅ VERIFIED CORRECT
+- **Descriptor format**: ✅ Standard mt76 format
+- **DMA buffer mapping**: ❓ UNDER INVESTIGATION
+- **Firmware execution**: ❌ Never starts
+
+### Next Steps
+
+1. Check if `dma_map_single` addresses match page fault addresses
+2. Verify IOMMU domain includes mapped addresses
+3. Test with `iommu=soft` kernel parameter
+4. Check `dma_dev` is correctly set to PCI device
+5. Review coherent vs streaming DMA domain differences
+
+### Files Modified
+
+- **reference_zouyonghao_mt7927/mt76-outoftree/mt7927_fw_load.c** - Added ring debug output
+- **reference_zouyonghao_mt7927/mt76-outoftree/dma.c** - Added DMA address tracing
+- **docs/ZOUYONGHAO_ANALYSIS.md** - Added section 2q with Phase 29b analysis
+- **CLAUDE.md** - Updated current status to Phase 29b
+
+---
+
+## Phase 29c: FW_START Response Test (2026-02-01)
+
+**Status**: 🔬 EXPERIMENT - Testing mailbox response behavior
+
+### Experiment
+
+Changed FW_START command from `wait=false` to `wait=true` in `mt7927_fw_load.c:315` to determine if the firmware responds to commands after loading.
+
+### Results
+
+```
+[MT7927] Sending FW_START command (waiting for response)
+Message 00000002 (seq 9) timeout
+[MT7927] FW_START send failed: -110 (continuing)
+```
+
+**FW_START times out after 3 seconds** - the firmware does not respond via mailbox.
+
+### Key Observations
+
+| Metric | Value | Interpretation |
+|--------|-------|----------------|
+| MCU status after each region | `0x00000000` | MCU never acknowledges firmware data |
+| FW_N9_RDY register | `0x00000002` | BIT(1) set, BIT(0) clear = download mode but not ready |
+| FW_START response | Timeout (-110) | No mailbox response from firmware |
+| Later MCU commands | Timeout | `Message 00020002 (seq 10) timeout` |
+
+### Analysis
+
+1. **MCU never processes firmware data**: Status stays at 0x00000000 through all 5 regions
+2. **FW_N9_RDY = 0x00000002**: Indicates "download mode entered" but "N9 CPU not ready"
+3. **Mailbox completely non-functional**: Both FW_START and subsequent commands timeout
+
+### Comparison: wait=false vs wait=true
+
+| Behavior | wait=false | wait=true |
+|----------|------------|-----------|
+| FW_START send | Returns immediately | Times out after 3s |
+| FW_N9_RDY | 0x00000002 | 0x00000002 |
+| Root cause | Same | Same |
+
+Waiting doesn't help - the firmware never starts executing, so there's nothing to respond.
+
+### DMA Addresses This Run
+
+```
+[DMA COHERENT] q=15 len=76 dma=0x1263000
+[DMA COHERENT] q=16 len=4096 dma=0x421ba000
+```
+
+Different from Phase 29b's `0xff6b0xxx` addresses. Memory allocator returns different addresses each boot, but the fundamental issue (data not reaching device) persists.
+
+### Conclusion
+
+The `wait=true` experiment confirms our Phase 29b hypothesis: **DMA data isn't reaching device memory**. The MCU status never changes because it never receives the firmware. The IOMMU page faults (when they occur) or another DMA path issue prevents actual data transfer.
+
+### Next Steps
+
+1. Revert to `wait=false` to reduce timeout delays
+2. Focus on DMA/IOMMU path debugging
+3. Consider testing with `iommu=off` kernel parameter
+4. Investigate MediaTek-specific DMA requirements
+
+### Files Modified
+
+- **reference_zouyonghao_mt7927/mt76-outoftree/mt7927_fw_load.c** - Changed FW_START wait=false→true (line 315)
 
 ---
 

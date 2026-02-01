@@ -1,5 +1,10 @@
 # MT7927 Hardware Specifications
 
+> **Note**: This is technical reference documentation. The driver project is stalled (Phase 29c).
+> See [README.md](README.md) for current status.
+
+---
+
 ## Hardware Information
 
 - **Chip**: MediaTek MT7927 WiFi 7 (802.11be) - also known as "Filogic 380"

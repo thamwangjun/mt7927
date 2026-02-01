@@ -1,5 +1,32 @@
 # Frequently Asked Questions
 
+> **⚠️ PROJECT STATUS: STALLED (Phase 29c) ⚠️**
+>
+> This driver does not work. See first question below.
+
+---
+
+## Project Status
+
+### Q: Does this driver work?
+
+**A**: **No.** After 29+ phases of investigation, the driver does not provide WiFi functionality. The driver:
+- ✅ Loads and binds to hardware
+- ✅ Configures DMA rings correctly
+- ✅ Attempts firmware transfer
+- ❌ **Firmware never executes** (DMA data doesn't reach device)
+- ❌ No WiFi interface created
+- ❌ Cannot scan or connect to networks
+
+**Root cause**: DMA data never reaches device memory. MCU status stays at 0x00000000.
+
+If you need working MT7927 WiFi on Linux, check:
+- [Linux kernel mailing list](https://lore.kernel.org/linux-wireless/) for official upstream progress
+- Your distribution's kernel updates
+- Windows or other operating systems with vendor support
+
+---
+
 ## General Questions
 
 ### Q: Why not just use the mt7925e driver?
@@ -21,11 +48,10 @@ See [MT6639_ANALYSIS.md](MT6639_ANALYSIS.md) for complete evidence.
 
 ### Q: When will this be in the mainline kernel?
 
-**A**: Once we have a working driver, submission typically takes 2-3 kernel cycles (3-6 months). The timeline depends on:
-1. Getting basic functionality working (current focus)
-2. Code cleanup for upstream standards
-3. Review process on linux-wireless mailing list
-4. Maintainer acceptance and merge
+**A**: **Unknown.** This project is stalled and the driver does not work. For official MT7927 support:
+- Monitor the linux-wireless mailing list for MediaTek submissions
+- Check future kernel releases
+- MediaTek may provide official support independently
 
 ## Technical Questions
 

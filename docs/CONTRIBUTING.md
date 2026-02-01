@@ -1,14 +1,31 @@
 # Contributing to MT7927 Linux Driver
 
-## Welcome!
+> **⚠️ PROJECT STATUS: STALLED (Phase 29c) ⚠️**
+>
+> This project has reached an impasse after 29+ phases of investigation. The driver does not work.
+> Contributions are still welcome, but be aware that the core problem (DMA path failure) remains unsolved.
 
-Thank you for your interest in contributing to the MT7927 Linux driver project! This guide will help you get started.
+---
 
-## Current Priority: Implement Firmware Loader 🎯
+## The Unsolved Problem
+
+**DMA data never reaches device memory.** Despite correct ring configuration and successful host-side DMA transfer, the device MCU never acknowledges receiving firmware data.
+
+If you can help solve this, contributions are very welcome. Key investigation areas:
+1. **IOMMU configuration** - Test with `iommu=off`
+2. **MediaTek-specific DMA init** - Missing enable bits or remap registers
+3. **PCIe configuration** - Bus master, TLP settings
+4. **Power/clock domains** - DMA engine power state
+
+See [DEVELOPMENT_LOG.md](../DEVELOPMENT_LOG.md) and [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) for complete investigation history.
+
+---
+
+## Previous Priority (Completed but didn't solve issue)
 
 **ROOT CAUSE IDENTIFIED (2026-01-31)**: MT7927 ROM bootloader does NOT support mailbox command protocol!
 
-The highest priority contribution is implementing the polling-based firmware loader. See [Implementation Needed](#implementation-needed) section below.
+This was addressed by implementing polling-based firmware loading, but a deeper issue (DMA path failure) was then discovered.
 
 ## Ways to Contribute
 
@@ -393,14 +410,13 @@ By contributing, you agree to:
 
 ## Thank You!
 
-Your contributions help make WiFi 7 support available on Linux. Whether you're implementing features, testing on hardware, improving documentation, or reporting bugs - every contribution matters!
+While this project is currently stalled, the documentation and investigation work may be valuable for future efforts. If you have insights into the DMA path issue, contributions are welcome.
 
 ---
 
-**Next Steps**:
-1. Read [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) for root cause
-2. Study `reference_zouyonghao_mt7927/mt7927_fw_load.c`
-3. Implement polling-based firmware loader
-4. Test and submit PR
+**Key Resources**:
+- [DEVELOPMENT_LOG.md](../DEVELOPMENT_LOG.md) - Complete 29-phase investigation
+- [ZOUYONGHAO_ANALYSIS.md](ZOUYONGHAO_ANALYSIS.md) - DMA debugging analysis
+- [MT6639_ANALYSIS.md](MT6639_ANALYSIS.md) - Architecture proof
 
-Let's get MT7927 working! 🚀
+*Project Status: Stalled (Phase 29c) - 2026-02-01*

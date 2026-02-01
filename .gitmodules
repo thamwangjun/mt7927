@@ -10,3 +10,10 @@
 [submodule "reference_mt76"]
 	path = reference_mt76
 	url = https://github.com/openwrt/mt76.git
+[submodule "reference_mt76_upstream"]
+	path = reference_mt76_upstream
+	url = https://github.com/openwrt/mt76.git
+[submodule "reference_rothko_kernel"]
+	path = reference_rothko_kernel
+	url = https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git
+	branch = bsp-rothko-u-oss
